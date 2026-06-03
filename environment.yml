@@ -1,0 +1,13 @@
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - PyQt5>=5.15.9
+      - akshare>=1.14.0
+      - mplfinance>=0.12.10a0
+      - matplotlib>=3.7.0
+      - pandas>=2.0.0
+      - numpy>=1.24.0
+      - pytest
