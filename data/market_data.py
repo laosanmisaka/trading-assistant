@@ -499,12 +499,11 @@ class IncrementalRefreshWorker(QThread):
         active_codes = [c for c in self.codes if c not in pending]
 
         if active_codes:
-            results = manager.refresh_quotes_batch(active_codes)
-
-        # 逐股发信号 (pending 中的也发 None，让 UI 知道在加载中)
-        for code in self.codes:
-            quote = results.get(code)
-            self.stock_done.emit(code, quote)
+            try:
+                results = manager.refresh_quotes_batch(active_codes)
+            except Exception:
+                from utils.logger import get_logger
+                get_logger(__name__).exception("增量刷新异常")
 
         self.data_ready.emit(results)
 

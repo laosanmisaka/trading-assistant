@@ -1,48 +1,127 @@
-"""K线/分时图组件 — mplfinance + matplotlib 嵌入 PyQt5"""
+"""K线/分时图组件 — matplotlib 嵌入 PyQt5"""
 
 import numpy as np
 import pandas as pd
-from datetime import datetime
 
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QTabWidget
-from PyQt5.QtCore import pyqtSignal
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-import mplfinance as mpf
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import matplotlib.font_manager as fm
 
-from config import CHART_STYLE, MA_PERIODS, CHART_COLORS
+from config import MA_PERIODS, CHART_COLORS
 from data.market_data import KLineWorker, IntradayWorker
 from data.models import KLineData
 
 
-# 设置中文字体
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
-plt.rcParams["axes.unicode_minus"] = False
+# ---- 中文字体配置 ----
+def _get_chinese_font():
+    """探测可用的中文字体，返回字体名"""
+    available = {f.name for f in fm.fontManager.ttflist}
+    candidates = ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei",
+                  "Noto Sans CJK SC", "Source Han Sans SC", "FangSong",
+                  "KaiTi", "SimSun", "AR PL UMing CN"]
+    for name in candidates:
+        if name in available:
+            return name
+    return "sans-serif"
 
-# mplfinance 样式
-mpf_color = mpf.make_marketcolors(
-    up=CHART_COLORS["up"],
-    down=CHART_COLORS["down"],
-    edge="inherit",
-    wick="inherit",
-    volume={"up": CHART_COLORS["volume_up"], "down": CHART_COLORS["volume_down"]},
-)
-mpf_style = mpf.make_mpf_style(
-    marketcolors=mpf_color,
-    gridstyle="--",
-    y_on_right=False,
-)
+
+_CHINESE_FONT = _get_chinese_font()
+plt.rcParams["font.sans-serif"] = [_CHINESE_FONT, "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 
 class MplCanvas(FigureCanvas):
-    """Matplotlib 画布"""
+    """Matplotlib 画布 — 支持鼠标滚轮缩放"""
 
     def __init__(self, figsize=(10, 6), dpi=100):
         self.fig = Figure(figsize=figsize, dpi=dpi, tight_layout=True)
         super().__init__(self.fig)
+        self.setFocusPolicy(3)  # Qt.StrongFocus
+
+    def wheelEvent(self, event):
+        """滚轮缩放 X 轴，以鼠标位置为中心；Y 轴根据可见数据自适应"""
+        axes = self.fig.get_axes()
+        if not axes:
+            return
+
+        ax = axes[0]  # 所有子图 sharex，改一个即可
+        xlim = ax.get_xlim()
+        x_center = xlim[0] + (xlim[1] - xlim[0]) / 2
+
+        # 将 Qt 鼠标坐标转为 matplotlib data 坐标
+        try:
+            x_display = event.pos().x()
+            y_display = self.height() - event.pos().y()
+            x_data, _ = ax.transData.inverted().transform((x_display, y_display))
+            if xlim[0] <= x_data <= xlim[1]:
+                x_center = x_data
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+        scale = 1.15
+        if event.angleDelta().y() > 0:
+            new_half = (xlim[1] - xlim[0]) / (2 * scale)
+        else:
+            new_half = (xlim[1] - xlim[0]) * scale / 2
+
+        new_x0 = x_center - new_half
+        new_x1 = x_center + new_half
+
+        # 钳制到数据范围（留 2% 边距防止缩小时无响应）
+        data_lim = ax.dataLim
+        if data_lim.x0 < data_lim.x1:
+            margin = max(1, (data_lim.x1 - data_lim.x0) * 0.02)
+            if new_x0 < data_lim.x0 - margin:
+                new_x0 = data_lim.x0 - margin
+            if new_x1 > data_lim.x1 + margin:
+                new_x1 = data_lim.x1 + margin
+
+        ax.set_xlim(new_x0, new_x1)
+
+        # Y 轴根据可见数据范围自适应
+        for a in axes:
+            self._autoscale_y(a, new_x0, new_x1)
+
+        self.draw_idle()
+
+    @staticmethod
+    def _autoscale_y(ax, x0, x1):
+        """根据 X 范围内可见数据的 Y 值自动调整 Y 轴"""
+        if not hasattr(ax, '_y_mode'):
+            return
+
+        x_arr = np.asarray(ax._x_data)
+        mask = (x_arr >= x0) & (x_arr <= x1)
+        if not mask.any():
+            return
+
+        if ax._y_mode == 'volume' and hasattr(ax, '_y_data'):
+            y_visible = np.asarray(ax._y_data)[mask]
+            ymax = y_visible.max()
+            ax.set_ylim(0, ymax * 1.2 if ymax > 0 else 1)
+        elif ax._y_mode == 'price' and hasattr(ax, '_y_highs') and hasattr(ax, '_y_lows'):
+            y_highs = np.asarray(ax._y_highs)[mask]
+            y_lows = np.asarray(ax._y_lows)[mask]
+            ymin, ymax = y_lows.min(), y_highs.max()
+            pad = max((ymax - ymin) * 0.05, 0.01)
+            ax.set_ylim(ymin - pad, ymax + pad)
+
+
+class ChartNavigationToolbar(NavigationToolbar):
+    """自定义导航工具栏 — 移除 Subplots 按钮避免误触弹窗"""
+
+    def __init__(self, canvas, parent=None):
+        super().__init__(canvas, parent)
+        # 移除 "Subplots" (configure_subplots) action，避免双击误触
+        for action in self.actions():
+            if action.text() == 'Subplots':
+                self.removeAction(action)
+                break
 
 
 class ChartTabWidget(QWidget):
@@ -59,7 +138,7 @@ class ChartTabWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.canvas = MplCanvas()
-        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar = ChartNavigationToolbar(self.canvas, self)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
 
@@ -125,7 +204,7 @@ class ChartTabWidget(QWidget):
     # ================================================================
 
     def _draw_intraday(self):
-        """绘制分时图 — X轴按天分组标注日期"""
+        """绘制分时图 — 价格/成交量上下合体，共用X轴，同步缩放"""
         self.canvas.fig.clear()
 
         if not self.intraday_data:
@@ -140,16 +219,18 @@ class ChartTabWidget(QWidget):
         n = len(prices)
 
         # 找出日期切换点 (day transition indices)
-        day_boundaries = [0]  # 每段开始的index
+        day_boundaries = [0]
         day_labels = [dates[0]] if dates else []
         for i in range(1, n):
             if dates[i] != dates[i - 1]:
                 day_boundaries.append(i)
                 day_labels.append(dates[i])
-        day_boundaries.append(n)  # 结束位置
+        day_boundaries.append(n)
 
-        # 上栏: 价格走势 (连续线，天之间用竖线分隔)
-        ax1 = self.canvas.fig.add_subplot(2, 1, 1)
+        # GridSpec 统一布局 — 上下子图共用X轴，缩放/平移同步
+        gs = GridSpec(2, 1, figure=self.canvas.fig, height_ratios=[3, 1], hspace=0.05)
+        ax1 = self.canvas.fig.add_subplot(gs[0])
+        ax2 = self.canvas.fig.add_subplot(gs[1], sharex=ax1)
 
         x_all = list(range(n))
         ax1.plot(x_all, prices, color="#333333", linewidth=1.0, label="价格")
@@ -164,8 +245,9 @@ class ChartTabWidget(QWidget):
             tick_positions.append(boundary)
             tick_labels.append(day_labels[di][5:])
             ax1.axvline(x=boundary - 0.5, color="#CCCCCC", linewidth=0.5, linestyle=":")
+            ax2.axvline(x=boundary - 0.5, color="#CCCCCC", linewidth=0.5, linestyle=":")
 
-        # 昨收线 (从日线取)
+        # 昨收线
         pre_close = 0
         if self.klines:
             pre_close = self.klines[-1].close
@@ -174,38 +256,49 @@ class ChartTabWidget(QWidget):
         if pre_close > 0:
             ax1.axhline(y=pre_close, color="#999999", linewidth=0.5, linestyle="-.")
 
-        ax1.set_ylabel("价格")
-        ax1.legend(loc="upper left", fontsize=8)
+        ax1.set_ylabel("价格", fontfamily=_CHINESE_FONT)
+        handles, labels = ax1.get_legend_handles_labels()
+        if handles:
+            ax1.legend(loc="upper left", fontsize=8,
+                      prop=fm.FontProperties(family=_CHINESE_FONT, size=8))
         ax1.grid(True, alpha=0.3)
-        ax1.set_xticks(tick_positions)
-        ax1.set_xticklabels(tick_labels, fontsize=8)
+        # 上栏隐藏X轴标签，统一下栏显示
+        ax1.tick_params(axis="x", labelbottom=False)
 
-        # 下栏: 成交量 (连续，天之间竖线分隔)
-        ax2 = self.canvas.fig.add_subplot(2, 1, 2)
+        # 下栏: 成交量
         colors_vol = ["#DC143C" if i > 0 and prices[i] >= prices[i - 1]
                       else "#008000" for i in range(n)]
         ax2.bar(range(n), volumes, color=colors_vol, width=1.0)
 
-        for di in range(1, len(day_labels)):
-            ax2.axvline(x=day_boundaries[di] - 0.5, color="#CCCCCC", linewidth=0.5, linestyle=":")
-
-        ax2.set_ylabel("成交量")
+        ax2.set_ylabel("成交量", fontfamily=_CHINESE_FONT)
         ax2.set_xticks(tick_positions)
-        ax2.set_xticklabels(tick_labels, fontsize=8)
+        ax2.set_xticklabels(tick_labels, fontsize=8, fontfamily=_CHINESE_FONT)
         ax2.grid(True, alpha=0.3)
 
-        ax1.set_title(f"{self.code} 分时图", fontsize=12, fontweight="bold")
+        ax1.set_title(f"{self.code} 分时图", fontsize=12, fontweight="bold",
+                      fontfamily=_CHINESE_FONT)
+
+        # 存储数据引用，供滚轮缩放时 Y 轴自适应使用
+        x_data = np.arange(n)
+        ax1._x_data = x_data
+        ax1._y_highs = np.array(prices)
+        ax1._y_lows = np.array(prices)  # 分时图 highs=lows=prices
+        ax1._y_mode = "price"
+        ax2._x_data = x_data
+        ax2._y_data = np.array(volumes)
+        ax2._y_mode = "volume"
+
         self.canvas.draw()
 
     def _draw_kline(self):
-        """绘制K线图 (日线/周线/月线)"""
+        """绘制K线图 (日线/周线/月线) — 纯手工绘制，无 mplfinance 依赖"""
         self.canvas.fig.clear()
 
         if not self.klines:
             self.canvas.draw()
             return
 
-        # 转换为DataFrame (mplfinance格式)
+        # 转换为DataFrame
         data = {
             "Date": pd.to_datetime([k.date for k in self.klines]),
             "Open": [k.open for k in self.klines],
@@ -217,99 +310,30 @@ class ChartTabWidget(QWidget):
         df = pd.DataFrame(data)
         df.set_index("Date", inplace=True)
 
-        # 计算MA
-        ma_lines = []
-        for period in MA_PERIODS:
-            if len(df) >= period:
-                ma = df["Close"].rolling(window=period).mean()
-                # 使用 mplfinance 的 addplot 添加MA
-                color_idx = MA_PERIODS.index(period) % len(CHART_COLORS["ma_colors"])
-                ma_lines.append(mpf.make_addplot(
-                    ma, color=CHART_COLORS["ma_colors"][color_idx],
-                    width=1.0, label=f"MA{period}"
-                ))
-
-        # 止损止盈线标注 (从外部设置)
-        stop_loss_line = None
-        take_profit_line = None
-        if hasattr(self, 'stop_loss_price') and self.stop_loss_price > 0:
-            sl_data = pd.Series(self.stop_loss_price, index=df.index)
-            stop_loss_line = mpf.make_addplot(
-                sl_data, color=CHART_COLORS["alert_stop_loss"],
-                linestyle="--", width=1.0, label="止损"
-            )
-            ma_lines.append(stop_loss_line)
-
-        if hasattr(self, 'take_profit_price') and self.take_profit_price > 0:
-            tp_data = pd.Series(self.take_profit_price, index=df.index)
-            take_profit_line = mpf.make_addplot(
-                tp_data, color=CHART_COLORS["alert_take_profit"],
-                linestyle="--", width=1.0, label="止盈"
-            )
-            ma_lines.append(take_profit_line)
-
-        # 周线底分型标注 (如果有)
-        if hasattr(self, 'bottom_fractal_dates') and self.bottom_fractal_dates:
-            markers = pd.Series(
-                [df.loc[d, "Low"] * 0.98 if d in df.index else np.nan
-                 for d in self.bottom_fractal_dates],
-            )
-            # 简单标注不通过mpf
-
         period_names = {
             "daily": "日线", "weekly": "周线", "monthly": "月线",
             "60min": "60分钟线",
         }
         title = f"{self.code} {period_names.get(self.period, self.period)}K线图"
 
-        try:
-            if ma_lines:
-                mpf.plot(
-                    df, type="candle", style=mpf_style,
-                    volume=True, addplot=ma_lines,
-                    title=title,
-                    ylabel="价格",
-                    ylabel_lower="成交量",
-                    figsize=(10, 6),
-                    panel_ratios=(3, 1),
-                    ax=self.canvas.fig.add_subplot(1, 1, 1) if ma_lines else None,
-                    returnfig=True,
-                )
-            else:
-                mpf.plot(
-                    df, type="candle", style=mpf_style,
-                    volume=True,
-                    title=title,
-                    ylabel="价格",
-                    ylabel_lower="成交量",
-                    figsize=(10, 6),
-                    panel_ratios=(3, 1),
-                )
-        except Exception:
-            # 降级: 使用默认样式
-            pass
-
-        # 直接在figure上绘制
-        self._draw_kline_manual(df, title, ma_lines)
-
+        self._draw_kline_manual(df, title)
         self.canvas.draw()
 
-    def _draw_kline_manual(self, df: pd.DataFrame, title: str, addplots: list):
-        """手动绘制K线图 (备用方式，更可控)"""
-        self.canvas.fig.clear()
+    def _draw_kline_manual(self, df: pd.DataFrame, title: str):
+        """手工绘制K线图 — 价格/成交量上下合体，共用X轴同步缩放"""
+        # GridSpec 统一布局 — 3:1 高度比，hspace=0 消除间隙
+        gs = GridSpec(2, 1, figure=self.canvas.fig, height_ratios=[3, 1], hspace=0.05)
+        ax1 = self.canvas.fig.add_subplot(gs[0])
+        ax2 = self.canvas.fig.add_subplot(gs[1], sharex=ax1)
 
-        # 创建上下两个子图
-        ax1 = self.canvas.fig.add_subplot(2, 1, 1)
-        ax2 = self.canvas.fig.add_subplot(2, 1, 2, sharex=ax1)
+        n = len(df)
+        # 自适应蜡烛宽度
+        width = max(0.3, min(0.8, 200.0 / max(n, 1)))
 
         # --- 上栏: K线 + MA ---
-        # 蜡烛图绘制
-        width = 0.6
-        for i, (idx, row) in enumerate(df.iterrows()):
+        for i, (_idx, row) in enumerate(df.iterrows()):
             color = CHART_COLORS["up"] if row["Close"] >= row["Open"] else CHART_COLORS["down"]
-            # 影线
             ax1.plot([i, i], [row["Low"], row["High"]], color=color, linewidth=0.8)
-            # 实体
             body_bottom = min(row["Open"], row["Close"])
             body_height = abs(row["Close"] - row["Open"])
             if body_height < 0.0001:
@@ -340,29 +364,51 @@ class ChartTabWidget(QWidget):
                     low = df.iloc[bf_idx]["Low"]
                     ax1.scatter(bf_idx, low * 0.98, marker="^", color="blue", s=80, zorder=5)
 
-        ax1.set_title(title, fontsize=12, fontweight="bold")
-        ax1.set_ylabel("价格")
-        ax1.legend(loc="upper left", fontsize=7, ncol=2)
+        ax1.set_title(title, fontsize=12, fontweight="bold", fontfamily=_CHINESE_FONT)
+        ax1.set_ylabel("价格", fontfamily=_CHINESE_FONT)
+        ax1.legend(loc="upper left", fontsize=7, ncol=2,
+                  prop=fm.FontProperties(family=_CHINESE_FONT, size=7))
         ax1.grid(True, alpha=0.3)
+        # 上栏隐藏X轴标签，统一下栏显示
+        ax1.tick_params(axis="x", labelbottom=False)
 
-        # x轴标签
-        step = max(1, len(df) // 10)
-        tick_idx = list(range(0, len(df), step))
-        tick_labels = [df.index[i].strftime("%Y-%m-%d") if hasattr(df.index[i], 'strftime')
-                       else str(df.index[i])[:10] for i in tick_idx]
-        ax1.set_xticks(tick_idx)
-        ax1.set_xticklabels(tick_labels, rotation=30, fontsize=7)
+        # x轴标签 — 根据周期选择日期格式
+        if self.period == "monthly":
+            date_fmt = "%Y-%m"
+        elif self.period == "weekly":
+            date_fmt = "%m-%d"
+        else:
+            date_fmt = "%Y-%m-%d"
+
+        step = max(1, n // 10)
+        tick_idx = list(range(0, n, step))
+        tick_labels = []
+        for i in tick_idx:
+            idx_val = df.index[i]
+            if hasattr(idx_val, 'strftime'):
+                tick_labels.append(idx_val.strftime(date_fmt))
+            else:
+                tick_labels.append(str(idx_val)[:10])
 
         # --- 下栏: 成交量 ---
         colors_vol = [CHART_COLORS["volume_up"] if row["Close"] >= row["Open"]
                       else CHART_COLORS["volume_down"] for _, row in df.iterrows()]
-        ax2.bar(range(len(df)), df["Volume"].values, color=colors_vol, width=width, alpha=0.7)
-        ax2.set_ylabel("成交量")
+        ax2.bar(range(n), df["Volume"].values, color=colors_vol, width=width, alpha=0.7)
+        ax2.set_ylabel("成交量", fontfamily=_CHINESE_FONT)
         ax2.set_xticks(tick_idx)
-        ax2.set_xticklabels(tick_labels, rotation=30, fontsize=7)
+        ax2.set_xticklabels(tick_labels, rotation=30, fontsize=7,
+                           fontfamily=_CHINESE_FONT)
         ax2.grid(True, alpha=0.3)
 
-        self.canvas.fig.tight_layout()
+        # 存储数据引用，供滚轮缩放时 Y 轴自适应使用
+        x_data = np.arange(n)
+        ax1._x_data = x_data
+        ax1._y_highs = df["High"].values
+        ax1._y_lows = df["Low"].values
+        ax1._y_mode = "price"
+        ax2._x_data = x_data
+        ax2._y_data = df["Volume"].values
+        ax2._y_mode = "volume"
 
     # 外部接口
     def set_alert_lines(self, stop_loss: float, take_profit: float):
@@ -370,10 +416,9 @@ class ChartTabWidget(QWidget):
         self.stop_loss_price = stop_loss
         self.take_profit_price = take_profit
 
-    def set_bottom_fractals(self, indices: list[int], dates: list[str]):
+    def set_bottom_fractals(self, indices: list[int]):
         """设置底分型位置"""
         self.bottom_fractal_indices = indices
-        self.bottom_fractal_dates = dates
 
 
 class ChartWidget(QWidget):

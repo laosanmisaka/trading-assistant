@@ -188,7 +188,7 @@ class BuyPointScanWorker(QThread):
             self.scan_done.emit(self.code, {
                 "code": self.code,
                 "triggered": False,
-                "error": str(e),
+                "error": traceback.format_exc(),
             })
 
     def _on_result(self, code: str, result: dict):

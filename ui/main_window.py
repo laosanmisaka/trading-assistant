@@ -282,7 +282,12 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _setup_timers(self):
-        # 实时行情刷新 (10秒)
+        # 表格缓存刷新 (3秒，仅读缓存不调API，保证表格实时)
+        self._table_display_timer = QTimer(self)
+        self._table_display_timer.timeout.connect(self._refresh_table_display)
+        self._table_display_timer.start(3000)
+
+        # 实时行情API刷新 (60秒)
         self._realtime_timer = QTimer(self)
         self._realtime_timer.timeout.connect(self._refresh_current_group_data)
         self._realtime_timer.start(REALTIME_REFRESH_MS)
@@ -292,7 +297,7 @@ class MainWindow(QMainWindow):
         self._buypoint_timer.timeout.connect(self._scan_buy_points)
         self._buypoint_timer.start(BUYPOINT_SCAN_INTERVAL_MS)
 
-        # K线数据刷新 (30秒)
+        # K线数据刷新 (60秒)
         self._kline_timer = QTimer(self)
         self._kline_timer.timeout.connect(self._refresh_kline_if_active)
         self._kline_timer.start(KLINE_REFRESH_MS)
@@ -360,9 +365,16 @@ class MainWindow(QMainWindow):
         if not refresh_codes:
             return
 
+        # 防止重复启动: 如果上一轮 worker 还在跑则跳过
+        prev = getattr(self, '_inc_worker', None)
+        if prev is not None and prev.isRunning():
+            logger.debug("上一轮增量刷新尚未完成，跳过")
+            return
+
         self._inc_worker = IncrementalRefreshWorker(refresh_codes)
-        self._inc_worker.stock_done.connect(self._on_stock_incremental_done)
         self._inc_worker.data_ready.connect(self._on_incremental_complete)
+        # 安全网: 无论 data_ready 是否触发，finished 一定触发
+        self._inc_worker.finished.connect(self._on_incremental_complete_safe)
         self._inc_worker.start()
 
     def _refresh_kline_if_active(self):
@@ -384,16 +396,18 @@ class MainWindow(QMainWindow):
         stocks = get_stocks_by_group(self._current_group_id)
         return [s.code for s in stocks]
 
-    def _on_stock_incremental_done(self, code: str, quote):
-        """单只股票增量数据到达 — 实时更新表格"""
-        if quote:
-            self._refresh_table_display()
-
     def _on_incremental_complete(self, quotes: dict[str, RealtimeQuote]):
         """本轮增量刷新全部完成"""
         # Manager 已自行更新内部缓存，此处只刷新UI
         self._refresh_table_display()
+        self._on_incremental_finished(quotes)
 
+    def _on_incremental_complete_safe(self):
+        """安全网: worker 异常退出时确保表格至少刷新一次（从缓存读取）"""
+        self._on_incremental_finished({})
+
+    def _on_incremental_finished(self, quotes: dict[str, RealtimeQuote]):
+        """增量刷新完成后的公共收尾逻辑"""
         now = datetime.now().strftime("%H:%M:%S")
         self._status_refresh_label.setText(f"上次刷新: {now}")
 
@@ -419,10 +433,16 @@ class MainWindow(QMainWindow):
         for code in codes:
             if code in quotes_cache and quotes_cache[code].price > 0:
                 q = quotes_cache[code]
-                # 增量行情不带名称，从 DB 补全
-                if not q.name:
-                    q.name = name_map.get(code, "")
-                merged[code] = q
+                name = q.name or name_map.get(code, "")
+                # 创建新对象，避免修改缓存中的原对象
+                merged[code] = RealtimeQuote(
+                    code=code, name=name,
+                    price=q.price, change_pct=q.change_pct,
+                    change_amt=q.change_amt, volume=q.volume,
+                    turnover=q.turnover, high=q.high, low=q.low,
+                    open=q.open, pre_close=q.pre_close,
+                    timestamp=q.timestamp,
+                )
             else:
                 merged[code] = RealtimeQuote(
                     code=code, name=name_map.get(code, ""),
@@ -677,18 +697,20 @@ class MainWindow(QMainWindow):
             else:
                 self.stock_table.highlight_rows(list(self._alert_triggered_codes), "alert")
 
-        # 如果有买点，弹出交易纪律弹窗
+        # 如果有买点，弹出交易纪律弹窗 (仅今日触发的有效)
         bp = self._buy_point_states.get(code, {})
         if bp.get("triggered"):
             from ui.discipline_dialog import DisciplineDialog
             dlg = DisciplineDialog(code, self)
             dlg.set_signal_info(bp.get("signal_details", ""))
             dlg.exec_()
-            # 弹窗关闭后也停止买点闪烁
+            # 弹窗关闭后清除买点状态，避免重复弹出
             self._bp_triggered_codes.discard(code)
+            self._buy_point_states.pop(code, None)
+            # 用 _refresh_table_display 统一刷新，确保 alert 和 buy_point 高亮正确合并
+            self._refresh_table_display()
             if not self._bp_triggered_codes and not self._alert_triggered_codes:
                 self.flash_tray(False)
-                self.stock_table.clear_highlights()
 
     def _on_stock_right_clicked(self, code: str, action: str):
         """股票右键菜单操作"""

@@ -95,7 +95,7 @@ trading_assistant.db
 | `GOLDEN_CROSS_LOOKBACK_DAYS` | MACD 金叉回溯天数。 |
 | `VOLUME_CONTRACTION_RATIO` | 缩量阈值。 |
 | `CENTER_LOOKBACK_WEEKS` | 中枢回溯配置。 |
-| `CHART_STYLE`, `MA_PERIODS`, `CHART_COLORS` | 图表样式配置。 |
+| `CHART_COLORS`, `MA_PERIODS` | 图表颜色和均线周期配置。 |
 | `PRESET_GROUPS` | 初始化数据库时创建的预设分组。 |
 | `WINDOW_*`, `SIDEBAR_WIDTH`, `STOCK_TABLE_COLUMNS` | UI 尺寸和表格列。 |
 
@@ -220,7 +220,7 @@ trading_assistant.db
 | `IntradayWorker(code)` | 代码 | QThread | 异步拉分时数据，信号 `data_ready(code, list)`。 |
 | `StockSearchWorker(keyword)` | 关键字 | QThread | 异步搜索股票，信号 `data_ready(list)`。 |
 | `fetch_single_stock_quote(code)` | 代码 | `RealtimeQuote` 或 `None` | 拉最近几天日线，提取最新价格和涨跌幅。 |
-| `IncrementalRefreshWorker(codes)` | 股票代码列表 | QThread | 批量增量刷新，信号 `stock_done(code, quote)` 和 `data_ready(dict)`。 |
+| `IncrementalRefreshWorker(codes)` | 股票代码列表 | QThread | 批量增量刷新。调用 `MarketDataManager.refresh_quotes_batch()` 并行拉取，完成后通过 `data_ready(dict)` 信号返回结果。内部包含 try/except 保护。 |
 | `InitialFetchWorker(code)` | 股票代码 | QThread | 新增股票时获取日/周/月初始 K 线并写 DB。 |
 
 ### `data/market_data_manager.py`
@@ -299,7 +299,7 @@ trading_assistant.db
 | `_check_daily_macd_golden_cross(code)` | 代码 | `bool` | 使用日线检测 MACD 金叉并检查成交量。 |
 | `_check_shallow_pullback(code)` | 代码 | `bool` | 使用短周期 K 线判断缩量回踩中枢。 |
 | `BuyPointScanWorker(code)` | 股票代码 | QThread | 后台扫描单只股票。 |
-| `BuyPointScanWorker.run()` | 无 | `None` | 调用 `BuyPointScanner.scan()`，通过 `scan_done` 发回结果。异常分支存在未定义变量 BUG。 |
+| `BuyPointScanWorker.run()` | 无 | `None` | 调用 `BuyPointScanner.scan()`，通过 `scan_done` 发回结果。异常时通过 `scan_done` 返回带有 `traceback.format_exc()` 的错误信息。 |
 | `BuyPointScanWorker._on_result(code, result)` | 代码、结果 dict | `None` | 把同步回调转发为 Qt 信号。 |
 
 ## 9. 做 T 模块
@@ -374,16 +374,17 @@ trading_assistant.db
 | `flash_tray(enable=True)` | 是否闪烁 | `None` | 启停托盘闪烁定时器。 |
 | `_toggle_tray_icon()` | 无 | `None` | 在普通和警告图标之间切换。 |
 | `_startup_initialize()` | 无 | `None` | 启动时从 DB 恢复行情，交易时段触发刷新。 |
-| `_setup_timers()` | 无 | `None` | 启动行情、买点、K 线、每日止损定时器。 |
+| `_setup_timers()` | 无 | `None` | 启动表格缓存（3s）、行情（60s）、买点、K 线、每日止损定时器。 |
 | `_load_groups()` | 无 | `None` | 从 DB 加载分组到左侧列表。 |
 | `_on_group_selected(current, previous)` | 当前/上一个 QListWidgetItem | `None` | 更新当前分组并刷新表格。 |
-| `_refresh_current_group_data()` | 无 | `None` | 刷新表格；交易时段启动增量行情 Worker。 |
+| `_refresh_current_group_data()` | 无 | `None` | 刷新表格；交易时段启动增量行情 Worker（若上一轮仍在跑则跳过）。 |
 | `_refresh_kline_if_active()` | 无 | `None` | 交易时段刷新当前查看股票的当前图表标签页。 |
 | `_get_all_tracked_codes()` | 无 | `list[str]` | 返回所有分组中的唯一股票代码。 |
 | `_get_current_group_codes()` | 无 | `list[str]` | 返回当前分组股票代码。 |
-| `_on_stock_incremental_done(code, quote)` | 代码、行情或 None | `None` | 单股刷新到达后刷新表格。 |
-| `_on_incremental_complete(quotes)` | 行情 dict | `None` | 一轮增量刷新结束后刷新 UI、flush 今日 bar、检查提醒和盈亏。 |
-| `_refresh_table_display()` | 无 | `None` | 合并 DB 股票和 Manager 行情，传给表格。 |
+| `_on_incremental_complete(quotes)` | 行情 dict | `None` | 一轮增量刷新结束后刷新 UI，然后调用 `_on_incremental_finished`。 |
+| `_on_incremental_complete_safe()` | 无 | `None` | 安全网：worker 异常退出时通过 `finished` 信号触发，确保至少从缓存刷新一次表格。 |
+| `_on_incremental_finished(quotes)` | 行情 dict | `None` | 公共收尾：更新状态栏时间、flush 今日 bar 到 DB、检查提醒和盈亏。 |
+| `_refresh_table_display()` | 无 | `None` | 合并 DB 股票和 Manager 行情，创建新 RealtimeQuote 对象（不修改缓存），传给表格。 |
 | `_update_profit_status(quotes)` | 行情 dict | `None` | 计算持仓分组总浮盈亏并更新状态栏。 |
 | `_check_daily_stop_loss()` | 无 | `None` | 到 15:05 后更新持仓股票每日止损。 |
 | `_get_holding_codes()` | 无 | `list[str]` | 返回持仓分组代码。 |
@@ -393,7 +394,7 @@ trading_assistant.db
 | `_scan_buy_points()` | 无 | `None` | 交易时段为所有跟踪代码启动买点扫描 Worker。 |
 | `_on_scan_worker_done(worker)` | Worker | `None` | 维护扫描 pending 数。 |
 | `_on_buy_point_result(code, result)` | 代码、结果 dict | `None` | 更新买点状态、表格高亮和托盘。 |
-| `_on_stock_double_clicked(code)` | 代码 | `None` | 加载图表，清理提醒，买点触发时弹交易纪律。 |
+| `_on_stock_double_clicked(code)` | 代码 | `None` | 加载图表，清理提醒，买点触发时弹交易纪律；弹窗关闭后清除买点状态并通过 `_refresh_table_display` 统一刷新高亮。 |
 | `_on_stock_right_clicked(code, action)` | 代码、动作 | `None` | 处理股票右键菜单。 |
 | `_move_to_cleared(code)` | 代码 | `None` | 把当前分组中的股票移动到已清仓。 |
 | `_on_manual_alert_settings(code)` | 代码 | `None` | 打开手动止盈止损对话框并应用结果。 |
@@ -435,23 +436,29 @@ trading_assistant.db
 
 ### `ui/chart_widget.py`
 
+图表组件基于纯 matplotlib 手工绘制（无 mplfinance 依赖）。中文字体通过 `_get_chinese_font()` 自动探测（优先 Microsoft YaHei > SimHei > 其他），并在所有文本元素上显式设置 `fontfamily`。`MplCanvas` 支持鼠标滚轮缩放（X 轴以光标为中心缩放，Y 轴根据可见数据自适应），数据范围外自动钳制避免空白区域。
+
 | 类/方法 | 输入 | 返回 | 说明 |
 | --- | --- | --- | --- |
-| `MplCanvas(figsize=(10,6), dpi=100)` | 图大小、DPI | FigureCanvas | Matplotlib 画布。 |
-| `ChartTabWidget(period="daily")` | 周期 | widget | 单个图表页。 |
+| `_get_chinese_font()` | 无 | `str` | 在 matplotlib 字体管理器中按优先级探测可用的中文字体名。 |
+| `MplCanvas(figsize=(10,6), dpi=100)` | 图大小、DPI | FigureCanvas | Matplotlib 画布，设置 `StrongFocus` 避免 PyQt 按键冲突。 |
+| `MplCanvas.wheelEvent(event)` | QWheelEvent | `None` | 滚轮缩放：X 轴以鼠标位置为中心缩放（1.15x），钳制到 `dataLim` + 2% 边距；调用 `_autoscale_y` 更新所有子图 Y 轴。 |
+| `MplCanvas._autoscale_y(ax, x0, x1)` | 子图、X 范围 | `None` | 根据 axes 上存储的 `_y_highs/_y_lows`（价格模式）或 `_y_data`（成交量模式）计算可见数据的 Y 范围并设置 ylim。价格留 5% 边距，成交量上限 ×1.2。 |
+| `ChartNavigationToolbar(canvas, parent)` | 画布、父组件 | 工具栏 | 继承 `NavigationToolbar2QT`，移除 Subplots 按钮避免误触弹窗。 |
+| `ChartTabWidget(period="daily")` | 周期 | widget | 单个图表页，使用 `ChartNavigationToolbar`。 |
 | `load_data(code, force_reload=False)` | 代码、是否强刷 | `None` | 根据周期启动分时或 K 线 Worker，已有数据时重绘。 |
 | `_load_intraday()` | 无 | `None` | 启动 `IntradayWorker`。 |
 | `_on_intraday_ready(code, data)` | 代码、分时数据 | `None` | 保存数据并绘图。 |
-| `_load_kline()` | 无 | `None` | 启动 `KLineWorker`。 |
+| `_load_kline()` | 无 | `None` | 启动 `KLineWorker`（优先走 Manager 缓存，缺失时回退 API）。 |
 | `_on_kline_ready(code, period, klines)` | 代码、周期、K 线 | `None` | 保存 K 线并绘图。 |
-| `_draw_intraday()` | 无 | `None` | 绘制分时价格、均价和成交量。 |
-| `_draw_kline()` | 无 | `None` | 准备 K 线 DataFrame，尝试 mplfinance，最终调用手动绘图。 |
-| `_draw_kline_manual(df, title, addplots)` | DataFrame、标题、附加图 | `None` | 手工绘制蜡烛图、均线、成交量、止损/止盈线。 |
-| `set_alert_lines(stop_loss, take_profit)` | 止损价、止盈价 | `None` | 设置该图表页止损/止盈线。当前主窗口未实际调用。 |
-| `set_bottom_fractals(indices, dates)` | 索引、日期 | `None` | 设置底分型标注。 |
+| `_draw_intraday()` | 无 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。上栏绘制分时价格/均价线，下栏绘制成交量柱状图，按天分隔并标注日期。上栏隐藏 X 轴刻度。绘图后将价格/成交量数组存储到 axes（`_y_highs/_y_lows/_y_data`）供滚轮 Y 轴自适应。 |
+| `_draw_kline()` | 无 | `None` | 将 K 线数据转为 DataFrame，设置标题后委托 `_draw_kline_manual`。 |
+| `_draw_kline_manual(df, title)` | DataFrame、标题 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。上栏手工绘制蜡烛图（自适应宽度）、MA 均线、止损/止盈线和底分型标注；下栏绘制成交量。上栏隐藏 X 轴刻度，x 轴日期格式根据周期自适应。绘图后将 OHLC/成交量数组存储到 axes 供滚轮 Y 轴自适应。 |
+| `set_alert_lines(stop_loss, take_profit)` | 止损价、止盈价 | `None` | 设置该图表页止损/止盈线。 |
+| `set_bottom_fractals(indices)` | 底分型索引列表 | `None` | 设置底分型标注位置。 |
 | `ChartWidget` | QWidget | widget | 包含分时/日/周/月四个标签页。 |
 | `load_stock(code)` | 代码 | `None` | 加载全部周期。 |
-| `refresh_current_tab(code)` | 代码 | `None` | 只刷新当前标签页。 |
+| `refresh_current_tab(code)` | 代码 | `None` | 只刷新当前标签页；分时强刷，K 线从 Manager 缓存取。 |
 | `set_alert_lines(stop_loss, take_profit)` | 止损价、止盈价 | `None` | 给所有标签页设置止损/止盈线。 |
 
 ### `ui/trade_dialog.py`
@@ -504,7 +511,7 @@ trading_assistant.db
 
 | 文件 | 覆盖内容 |
 | --- | --- |
-| `tests/conftest.py` | `temp_db` 和 `db_conn` fixture。注意 `temp_db` 删除项目根目录真实 DB。 |
+| `tests/conftest.py` | `temp_db` 和 `db_conn` fixture。`temp_db` 通过 `monkeypatch` 将 `data.database._get_path` 指向临时文件，不影响项目真实数据库。 |
 | `tests/test_database.py` | 分组、股票、交易、手动提醒、纪律、股票名称、K 线 DB 操作。 |
 | `tests/test_technical.py` | MA、EMA、MACD、分型、金叉、中枢、成交量、止损计算。 |
 | `tests/test_alert_engine.py` | 手动覆写、持久化、提醒触发和止盈限流。 |
@@ -516,6 +523,6 @@ trading_assistant.db
 - 业务计算尽量放在 `core/`，不要继续堆到 `ui/main_window.py`。
 - 所有 AKShare 调用都应集中在 `data.market_data`，上层优先通过 `MarketDataManager` 访问。
 - 新测试应避免依赖真实网络，AKShare 调用应 mock。
-- 测试数据库必须改为临时路径，不能复用项目根目录真实 `trading_assistant.db`。
+- 测试数据库通过 `conftest.py` 的 `monkeypatch` 自动使用临时路径，不影响项目真实数据库。新增 fixture 应沿用此模式。
 - QThread Worker 需要可靠持有引用，避免运行中对象被释放。
 - 做 T 模块投入 UI 或真实交易前，必须先修复 BUG 报告中的资金/仓位问题。
