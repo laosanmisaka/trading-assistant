@@ -169,20 +169,18 @@ class TestKLineFetch:
 class TestSingleStockQuote:
     """单股增量行情获取"""
 
-    def test_fetch_single_stock_returns_quote(self):
-        from data.market_data import fetch_single_stock_quote
-        quote = fetch_single_stock_quote("000001")
-        assert quote is not None
-        assert quote.code == "000001"
-        assert quote.price > 0
-        assert quote.high > 0
+    def test_fetch_kline_returns_data(self):
+        """日线数据可从数据库获取（不再调 API）"""
+        klines = fetch_kline("000001", "daily", days=5)
+        assert len(klines) > 0
+        assert klines[0].code == "000001"
+        assert klines[0].close > 0
 
-    def test_fetch_single_stock_invalid_code(self):
-        from data.market_data import fetch_single_stock_quote
-        quote = fetch_single_stock_quote("999999")
-        # 无效代码可能返回 None 或数据为空
-        # 不应崩溃
-        assert quote is None or quote.price == 0.0
+    def test_fetch_kline_invalid_code(self):
+        """无效代码返回空列表，不崩溃"""
+        klines = fetch_kline("999999", "daily", days=5)
+        # 无效代码可能返回空或数据
+        assert isinstance(klines, list)
 
 
 class TestIncrementalRefreshWorker:

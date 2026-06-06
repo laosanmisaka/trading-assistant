@@ -16,8 +16,7 @@ from datetime import datetime, timedelta
 
 from data.models import RealtimeQuote, KLineData
 from data.market_data import (
-    fetch_kline, fetch_single_stock_quote,
-    fetch_intraday_data, fetch_1min_kline_history,
+    fetch_kline, fetch_1min_kline_history,
     fetch_60min_kline_history, fetch_today_1min_bars,
 )
 from data.database import (
@@ -389,65 +388,6 @@ class MarketDataManager:
 
         finally:
             self.unmark_pending(code)
-
-        return results
-
-    # ================================================================
-    # 盘中增量刷新 (每60s)
-    # ================================================================
-
-    def refresh_quote(self, code: str) -> RealtimeQuote | None:
-        """
-        增量刷新单只股票：
-        1. 调API获取最新日线（start_date=今天）
-        2. 更新 _today_bars 和 _quotes
-        返回 RealtimeQuote 或 None
-        """
-        quote = fetch_single_stock_quote(code)
-        if quote is None:
-            return None
-
-        # 构建今日bar dict
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        today_bar = {
-            "code": code,
-            "date": today_str,
-            "open": quote.open,
-            "high": quote.high,
-            "low": quote.low,
-            "close": quote.price,
-            "volume": quote.volume,
-            "period": "daily",
-        }
-
-        # 更新内存
-        self.update_today_bar(code, "daily", today_bar)
-        with self._quotes_lock:
-            self._quotes[code] = quote
-
-        return quote
-
-    def refresh_quotes_batch(self, codes: list[str]) -> dict[str, RealtimeQuote]:
-        """
-        批量增量刷新 (ThreadPool并行)
-        返回: {code: RealtimeQuote}
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        results = {}
-
-        if not codes:
-            return results
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(self.refresh_quote, c): c for c in codes}
-            for future in as_completed(futures):
-                code = futures[future]
-                try:
-                    quote = future.result()
-                    if quote:
-                        results[code] = quote
-                except Exception as e:
-                    logger.warning(f"刷新 {code} 失败: {e}")
 
         return results
 

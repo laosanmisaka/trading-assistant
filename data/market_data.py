@@ -1,8 +1,7 @@
 """AKShare数据接口封装 - 异步获取通过QThread + pyqtSignal，集成缓存防封IP"""
 
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -140,51 +139,6 @@ def _df_to_klines(df, code: str, period: str) -> list[KLineData]:
             period=period,
         ))
     return result
-
-
-def fetch_30min_kline(code: str, days: int = 60) -> list[KLineData]:
-    """
-    获取短周期K线数据 (用于30分钟级别分析)
-    优先使用东方财富源60分钟线，失败时返回空
-    返回: list[KLineData]
-    """
-    import time
-    cache = get_30min_cache()
-    cache_key = f"kline_60min:{code}:{days}"
-
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    for attempt in range(2):
-        try:
-            import akshare as ak
-            logger.debug(f"获取60分钟K线: {code} (第{attempt+1}次)")
-
-            df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
-            if df is None or df.empty:
-                return []
-
-            col_map = {
-                "时间": "date", "开盘": "open", "收盘": "close",
-                "最高": "high", "最低": "low", "成交量": "volume",
-            }
-            df = df.rename(columns=col_map)
-            limit = days * 8
-            if len(df) > limit:
-                df = df.tail(limit)
-
-            result = _df_to_klines(df, code, "60min")
-            cache.set(cache_key, result, ttl=120.0)
-            logger.info(f"获取 {code} 60min K线 {len(result)} 条")
-            return result
-
-        except Exception as e:
-            logger.warning(f"获取分钟K线失败 ({code}, 第{attempt+1}次): {e}")
-            if attempt < 1:
-                time.sleep(2)
-
-    return []
 
 
 def fetch_1min_kline_history(code: str) -> list[dict]:
@@ -618,53 +572,6 @@ def _search_stock_from_api(keyword: str) -> list[dict]:
 # 异步数据工作线程
 # ============================================================
 
-class KLineWorker(QThread):
-    """K线数据获取工作线程"""
-    data_ready = pyqtSignal(str, str, list)  # (code, period, list[KLineData])
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, code: str, period: str = "daily", days: int = 250, parent=None):
-        super().__init__(parent)
-        self.code = code
-        self.period = period
-        self.days = days
-
-    def run(self):
-        try:
-            if self.period == "30min":
-                result = fetch_30min_kline(self.code, self.days)
-            else:
-                # 优先走 Manager (DB+内存)，没有则回退到 API
-                from data.market_data_manager import get_data_manager
-                manager = get_data_manager()
-                result = manager.get_klines(self.code, self.period, self.days)
-                if not result:
-                    # DB 无数据时回退到直接 API
-                    result = fetch_kline(self.code, self.period, self.days)
-            self.data_ready.emit(self.code, self.period, result)
-        except Exception:
-            logger.error(f"KLineWorker异常:\n{traceback.format_exc()}")
-            self.error_occurred.emit(traceback.format_exc())
-
-
-class IntradayWorker(QThread):
-    """分时数据获取工作线程"""
-    data_ready = pyqtSignal(str, list)  # (code, [{time, price, volume, avg_price}])
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, code: str, parent=None):
-        super().__init__(parent)
-        self.code = code
-
-    def run(self):
-        try:
-            result = fetch_intraday_data(self.code)
-            self.data_ready.emit(self.code, result)
-        except Exception:
-            logger.error(f"IntradayWorker异常:\n{traceback.format_exc()}")
-            self.error_occurred.emit(traceback.format_exc())
-
-
 class StockSearchWorker(QThread):
     """股票搜索工作线程"""
     data_ready = pyqtSignal(list)  # [{code, name, price}]
@@ -684,53 +591,12 @@ class StockSearchWorker(QThread):
 
 
 # ============================================================
-# 单股行情获取 (增量更新用)
-# ============================================================
-
-def fetch_single_stock_quote(code: str) -> Optional[RealtimeQuote]:
-    """获取单只股票的最新行情 (从日K线最后一条提取)
-    只拉取最近几天的数据（通过 start_date 参数），避免获取全量历史
-    """
-    import akshare as ak
-    from datetime import datetime, timedelta
-    sina_code = _add_market_prefix(code)
-    try:
-        # 只拉最近2天，取最后一行即可
-        start = (datetime.now() - timedelta(days=2)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_daily(symbol=sina_code, adjust="qfq", start_date=start)
-        if df is None or df.empty:
-            return None
-        last = df.iloc[-1]
-        # 计算涨跌幅 (相对于前一日收盘)
-        pre_close = _safe_float(df.iloc[-2]["close"]) if len(df) >= 2 else _safe_float(last["close"])
-        price = _safe_float(last["close"])
-        change_pct = ((price - pre_close) / pre_close * 100) if pre_close > 0 else 0.0
-        return RealtimeQuote(
-            code=code,
-            name="",  # 名称由DB提供
-            price=price,
-            change_pct=round(change_pct, 2),
-            change_amt=round(price - pre_close, 2),
-            volume=_safe_int(last.get("volume")),
-            turnover=_safe_float(last.get("amount")) if "amount" in df.columns else 0.0,
-            high=_safe_float(last.get("high")),
-            low=_safe_float(last.get("low")),
-            open=_safe_float(last.get("open")),
-            pre_close=round(pre_close, 2),
-            timestamp=datetime.now().strftime("%H:%M:%S"),
-        )
-    except Exception as e:
-        logger.warning(f"获取单股行情失败 ({code}): {type(e).__name__}")
-        return None
-
-
-# ============================================================
-# 并行增量刷新 Worker (每30s, 所有已追踪股票)
+# 并行增量刷新 Worker (每60s, 所有已追踪股票)
 # ============================================================
 
 class IncrementalRefreshWorker(QThread):
-    """并行增量刷新 — 通过 MarketDataManager 获取最新行情并更新内存层
-    manager.refresh_quotes_batch 内部并行拉取 + 更新 today_bars + quotes
+    """并行增量刷新 — 通过 refresh_minute_bars_batch 拉取 TDX 1min 数据，
+    从分钟线派生日线 OHLCV + 现价，一次 API 调用完成全部更新
     """
     data_ready = pyqtSignal(dict)       # {code: RealtimeQuote}
     stock_done = pyqtSignal(str, object) # (code, RealtimeQuote or None)

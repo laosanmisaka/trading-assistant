@@ -13,7 +13,6 @@ from matplotlib.gridspec import GridSpec
 import matplotlib.font_manager as fm
 
 from config import MA_PERIODS, CHART_COLORS
-from data.market_data import KLineWorker, IntradayWorker
 from data.models import KLineData
 
 
@@ -143,8 +142,11 @@ class ChartTabWidget(QWidget):
         layout.addWidget(self.canvas)
 
     def load_data(self, code: str, force_reload: bool = False):
-        """加载指定股票的图表数据（优先内存，同股票不重复拉取）"""
-        # 同股票且已有数据 → 直接重绘，不走 Worker
+        """加载股票图表数据 — 直接从 Manager(DB+内存) 同步读取，不调 API"""
+        from data.market_data_manager import get_data_manager
+        manager = get_data_manager()
+
+        # 同股票且已有数据 → 直接重绘
         if code == self.code and not force_reload:
             if self.period == "intraday" and self.intraday_data:
                 self._draw_intraday()
@@ -156,48 +158,26 @@ class ChartTabWidget(QWidget):
         self.code = code
         self.klines = []
         self.intraday_data = []
+
         if self.period == "intraday":
-            self._load_intraday()
+            # 从 klines_minute 表读最近 5 天的 1min 数据
+            rows = manager.get_minute_klines_from_db(code, "1min")
+            if rows:
+                self.intraday_data = [
+                    {"time": r["timestamp"], "date": r["timestamp"][:10],
+                     "price": r["close"], "volume": r["volume"],
+                     "avg_price": r["close"]}
+                    for r in rows
+                ]
+                self._draw_intraday()
         else:
-            self._load_kline()
-
-    def _load_intraday(self):
-        """加载分时数据"""
-        self.worker = IntradayWorker(self.code)
-        self.worker.data_ready.connect(self._on_intraday_ready)
-        self.worker.start()
-
-    def _on_intraday_ready(self, code: str, data: list[dict]):
-        """分时数据到达"""
-        if code != self.code:
-            return
-        self.intraday_data = data
-        try:
-            self._draw_intraday()
-        except Exception:
-            import traceback
-            from utils.logger import get_logger
-            get_logger(__name__).warning(f"绘制分时图失败 ({code}):\n{traceback.format_exc()}")
-
-    def _load_kline(self):
-        """加载K线数据"""
-        days_map = {"daily": 250, "weekly": 100, "monthly": 60}
-        days = days_map.get(self.period, 250)
-        self.worker = KLineWorker(self.code, self.period, days)
-        self.worker.data_ready.connect(self._on_kline_ready)
-        self.worker.start()
-
-    def _on_kline_ready(self, code: str, period: str, klines: list[KLineData]):
-        """K线数据到达"""
-        if code != self.code or period != self.period:
-            return
-        self.klines = klines
-        try:
-            self._draw_kline()
-        except Exception:
-            import traceback
-            from utils.logger import get_logger
-            get_logger(__name__).warning(f"绘制K线图失败 ({code}, {period}):\n{traceback.format_exc()}")
+            # 从 Manager 读 K 线 (DB + 今日 bar)
+            days_map = {"daily": 250, "weekly": 100, "monthly": 60}
+            days = days_map.get(self.period, 250)
+            klines = manager.get_klines(code, self.period, days)
+            if klines:
+                self.klines = klines
+                self._draw_kline()
 
     # ================================================================
     # 图表绘制

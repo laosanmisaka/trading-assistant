@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 import numpy as np
 
 from data.models import AlertState, RealtimeQuote, KLineData
-from data.market_data import fetch_30min_kline
 from data.market_data_manager import get_data_manager
 from data.database import (
     get_position_summary, get_first_buy_date, is_alert_disabled,
@@ -198,10 +197,16 @@ class AlertEngine:
             return state.take_profit_price, None
         state._last_fractal_check = now_ts
 
-        # 检查是否有30分钟级别顶分型
-        klines_30min = fetch_30min_kline(code, days=10)
-        if klines_30min:
-            arr = kline_to_arrays(klines_30min)
+        # 检查是否有30分钟级别顶分型（从入库的 60min 数据读取）
+        manager = get_data_manager()
+        rows = manager.get_minute_klines_from_db(code, "60min")
+        if rows:
+            klines_60min = [KLineData(
+                code=code, date=r["timestamp"][:10],
+                open=r["open"], high=r["high"], low=r["low"],
+                close=r["close"], volume=r["volume"], period="60min",
+            ) for r in rows]
+            arr = kline_to_arrays(klines_60min)
             has_top, idx, top_high = get_latest_top_fractal(arr["highs"], arr["lows"])
             if has_top:
                 state.top_fractal_detected = True

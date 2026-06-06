@@ -212,8 +212,7 @@ trading_assistant.db
 | `_add_market_prefix(code)` | 股票代码 | `str` | 给 A 股代码加新浪前缀：`sz`/`sh`/`bj`。 |
 | `fetch_kline(code, period="daily", days=250)` | 代码、周期、条数 | `list[KLineData]` | 从 AKShare 获取日线；周线/月线由日线 resample 聚合。带 TTL 缓存。 |
 | `_df_to_klines(df, code, period)` | DataFrame、代码、周期 | `list[KLineData]` | 将行情 DataFrame 转为模型对象。 |
-| `fetch_30min_kline(code, days=60)` | 代码、天数 | `list[KLineData]` | 名称为 30min，但当前实际请求 AKShare `period="60"` 并返回 `period="60min"`。 |
-| `fetch_intraday_data(code)` | 代码 | `list[dict]` | Sina 分时数据（仅当日），返回 time/date/price/volume/avg_price。仅用于图表绘制，盘中增量刷新用 `fetch_today_1min_bars`。 |
+| `fetch_intraday_data(code)` | 代码 | `list[dict]` | Sina 分时数据（仅当日），图表绘制和 TDX 回退时使用。 |
 | `fetch_1min_kline_history(code)` | 代码 | `list[dict]` | TDX(MOOTDX) 1min K线，分页拉取约 4.5 个月历史。TDX 不可用时回退到东方财富。 |
 | `fetch_60min_kline_history(code)` | 代码 | `list[dict]` | 东方财富 60min K线历史。 |
 | `fetch_today_1min_bars(code)` | 代码 | `list[dict]` | TDX 当日 1min K线（含完整 OHLCV），用于盘中增量刷新，一次调用替代日线+分时两次 API。 |
@@ -221,11 +220,8 @@ trading_assistant.db
 | `_ensure_stock_names_table()` | 无 | `None` | 兼容旧 DB，确保 `stock_names` 表存在。 |
 | `search_stock(keyword)` | 关键字 | `list[dict]` | 本地搜索优先；本地缺失时回退 API 搜索。 |
 | `_search_stock_from_api(keyword)` | 关键字 | `list[dict]` | 实时拉全市场名称后过滤；失败三次抛 `RuntimeError`。 |
-| `KLineWorker(code, period="daily", days=250)` | 代码、周期、条数 | QThread | 异步拉 K 线，信号 `data_ready(code, period, list)` 或 `error_occurred(str)`。 |
-| `IntradayWorker(code)` | 代码 | QThread | 异步拉分时数据，信号 `data_ready(code, list)`。 |
 | `StockSearchWorker(keyword)` | 关键字 | QThread | 异步搜索股票，信号 `data_ready(list)`。 |
-| `fetch_single_stock_quote(code)` | 代码 | `RealtimeQuote` 或 `None` | 拉最近几天日线，提取最新价格和涨跌幅。 |
-| `IncrementalRefreshWorker(codes)` | 股票代码列表 | QThread | 批量增量刷新。通过 `refresh_minute_bars_batch()` 拉取 TDX 1min 数据，从分钟线派生日线 OHLCV 和现价（一次 API 替代两次调用）。完成后通过 `data_ready(dict)` 返回当前缓存中的所有现价。 |
+| `IncrementalRefreshWorker(codes)` | 股票代码列表 | QThread | 批量增量刷新。调用 `refresh_minute_bars_batch` 拉取 TDX 1min 数据，从分钟线派生日线 OHLCV 和现价。 |
 | `InitialFetchWorker(code)` | 股票代码 | QThread | 新增股票时获取日/周/月初始 K 线并写 DB。 |
 
 ### `data/market_data_manager.py`
@@ -248,8 +244,6 @@ trading_assistant.db
 | `mark_pending(code)` | 代码 | `None` | 标记初始获取中。 |
 | `unmark_pending(code)` | 代码 | `None` | 移除 pending 标记。 |
 | `fetch_and_store_initial(code)` | 代码 | `dict` | 并行拉取日/周/月 + 1min + 60min 数据，串行写 DB，从 1min 数据聚合现价缓存。 |
-| `refresh_quote(code)` | 代码 | `RealtimeQuote` 或 `None` | 拉最新日线行情，更新今日 bar 和现价缓存。 |
-| `refresh_quotes_batch(codes)` | 代码列表 | `dict[str, RealtimeQuote]` | 并行刷新多只股票日线行情。 |
 | `refresh_minute_bars(code)` | 代码 | `int` | 拉当日 1min K线 (TDX)，派生日线 OHLCV + 现价，写入 `klines_minute` 表。 |
 | `refresh_minute_bars_batch(codes)` | 代码列表 | `dict[str, int]` | 并行调用 `refresh_minute_bars`。 |
 | `get_minute_bars(code)` | 代码 | `list[dict]` | 获取内存中的分钟数据。 |
@@ -293,7 +287,7 @@ trading_assistant.db
 | `set_manual_tp(code, price)` | 代码、价格 | `None` | 设置内存状态并持久化手动止盈。 |
 | `clear_manual(code, field="all")` | 代码、`sl`/`tp`/`all` | `None` | 清除手动设置并恢复自动模式。 |
 | `calc_stop_loss(code, current_daily_low)` | 代码、当前日低点 | `(float, dict|None)` | 计算自动止损；手动模式直接返回手动值。 |
-| `calc_take_profit(code, current_price)` | 代码、当前价 | `(float, dict|None)` | 计算自动止盈；含 60 秒分钟线顶分型检测限流。 |
+| `calc_take_profit(code, current_price)` | 代码、当前价 | `(float, dict|None)` | 计算自动止盈；从 `klines_minute` 表读 60min 数据检测顶分型（不调 API）。 |
 | `check_alerts(code, quote)` | 代码、`RealtimeQuote` | `dict` | 判断止损/止盈是否触发，返回触发状态、类型、价格、消息。 |
 | `update_daily_stop_loss(code)` | 代码 | `(float, dict|None)` | 收盘后用日线更新止损。 |
 
@@ -306,8 +300,8 @@ trading_assistant.db
 | `scan(code, callback=None)` | 股票代码、可选回调 | `BuyPointState` | 计算三项买点条件，满足两项触发。 |
 | `_check_weekly_bottom_fractal(code)` | 代码 | `bool` | 使用周线 K 线检测底分型。 |
 | `_check_daily_macd_golden_cross(code)` | 代码 | `bool` | 使用日线检测 MACD 金叉并检查成交量。 |
-| `_check_shallow_pullback(code)` | 代码 | `bool` | 使用短周期 K 线判断缩量回踩中枢。 |
-| `BuyPointScanWorker(code)` | 股票代码 | QThread | 后台扫描单只股票。 |
+| `_check_shallow_pullback(code)` | 代码 | `bool` | 从 `klines_minute` 表读 60min 数据，判断缩量回踩中枢（不调 API）。 |
+| `BuyPointScanWorker(code)` | 股票代码 | QThread | 后台扫描单只股票，全部数据从本地 DB 读取。 |
 | `BuyPointScanWorker.run()` | 无 | `None` | 调用 `BuyPointScanner.scan()`，通过 `scan_done` 发回结果。异常时通过 `scan_done` 返回带有 `traceback.format_exc()` 的错误信息。 |
 | `BuyPointScanWorker._on_result(code, result)` | 代码、结果 dict | `None` | 把同步回调转发为 Qt 信号。 |
 
@@ -454,11 +448,7 @@ trading_assistant.db
 | `MplCanvas._autoscale_y(ax, x0, x1)` | 子图、X 范围 | `None` | 根据 axes 上存储的 `_y_highs/_y_lows`（价格模式）或 `_y_data`（成交量模式）计算可见数据的 Y 范围并设置 ylim。价格留 5% 边距，成交量上限 ×1.2。 |
 | `ChartNavigationToolbar(canvas, parent)` | 画布、父组件 | 工具栏 | 继承 `NavigationToolbar2QT`，移除 Subplots 按钮避免误触弹窗。 |
 | `ChartTabWidget(period="daily")` | 周期 | widget | 单个图表页，使用 `ChartNavigationToolbar`。 |
-| `load_data(code, force_reload=False)` | 代码、是否强刷 | `None` | 根据周期启动分时或 K 线 Worker，已有数据时重绘。 |
-| `_load_intraday()` | 无 | `None` | 启动 `IntradayWorker`。 |
-| `_on_intraday_ready(code, data)` | 代码、分时数据 | `None` | 保存数据并绘图。 |
-| `_load_kline()` | 无 | `None` | 启动 `KLineWorker`（优先走 Manager 缓存，缺失时回退 API）。 |
-| `_on_kline_ready(code, period, klines)` | 代码、周期、K 线 | `None` | 保存 K 线并绘图。 |
+| `load_data(code, force_reload=False)` | 代码、是否强刷 | `None` | 同步读取：K 线走 `manager.get_klines()`（DB+内存），分时走 `klines_minute` 表。不启动 Worker，不调 API。 |
 | `_draw_intraday()` | 无 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。固定只显示最近 5 个交易日，按天分隔标注日期，上栏隐藏 X 轴刻度。绘图后存储价格/成交量数组到 axes 供滚轮 Y 轴自适应。 |
 | `_draw_kline()` | 无 | `None` | 将 K 线数据转为 DataFrame，设置标题后委托 `_draw_kline_manual`。 |
 | `_draw_kline_manual(df, title)` | DataFrame、标题 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。上栏手工绘制蜡烛图（自适应宽度）、MA 均线、止损/止盈线和底分型标注；下栏绘制成交量。上栏隐藏 X 轴刻度，x 轴日期格式根据周期自适应。绘图后将 OHLC/成交量数组存储到 axes 供滚轮 Y 轴自适应。 |

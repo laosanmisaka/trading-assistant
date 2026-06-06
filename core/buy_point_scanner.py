@@ -8,8 +8,7 @@ import numpy as np
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from data.models import BuyPointState
-from data.market_data import fetch_30min_kline
+from data.models import BuyPointState, KLineData
 from data.market_data_manager import get_data_manager
 from core.technical import (
     kline_to_arrays,
@@ -140,12 +139,19 @@ class BuyPointScanner:
         return False
 
     def _check_shallow_pullback(self, code: str) -> bool:
-        """检查缩量回踩中枢"""
-        min30_klines = fetch_30min_kline(code, days=30)
-        if not min30_klines:
+        """检查缩量回踩中枢 — 使用已入库的 60min K线"""
+        manager = get_data_manager()
+        rows = manager.get_minute_klines_from_db(code, "60min")
+        if not rows:
             return False
 
-        m_arr = kline_to_arrays(min30_klines)
+        klines = [KLineData(
+            code=code, date=r["timestamp"][:10],
+            open=r["open"], high=r["high"], low=r["low"],
+            close=r["close"], volume=r["volume"], period="60min",
+        ) for r in rows]
+
+        m_arr = kline_to_arrays(klines)
         if len(m_arr["closes"]) == 0:
             return False
 
