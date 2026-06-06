@@ -227,12 +227,29 @@ class ChartTabWidget(QWidget):
                 day_labels.append(dates[i])
         day_boundaries.append(n)
 
+        # 只保留最近 5 天
+        if len(day_labels) > 5:
+            day_labels = day_labels[-5:]
+            day_boundaries = day_boundaries[-5:]
+            # 重切片数据
+            start_idx = day_boundaries[0]
+            times = times[start_idx:]
+            dates = dates[start_idx:]
+            prices = prices[start_idx:]
+            avg_prices = avg_prices[start_idx:]
+            volumes = volumes[start_idx:]
+            n = len(prices)
+            # 平移索引到从 0 开始
+            day_boundaries = [b - start_idx for b in day_boundaries]
+            x_all = list(range(n))
+        else:
+            x_all = list(range(n))
+
         # GridSpec 统一布局 — 上下子图共用X轴，缩放/平移同步
         gs = GridSpec(2, 1, figure=self.canvas.fig, height_ratios=[3, 1], hspace=0.05)
         ax1 = self.canvas.fig.add_subplot(gs[0])
         ax2 = self.canvas.fig.add_subplot(gs[1], sharex=ax1)
 
-        x_all = list(range(n))
         ax1.plot(x_all, prices, color="#333333", linewidth=1.0, label="价格")
         ax1.plot(x_all, avg_prices, color="#FFA500",
                  linewidth=0.8, linestyle="--", label="均价")

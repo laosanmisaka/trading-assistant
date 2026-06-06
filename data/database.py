@@ -101,6 +101,21 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_klines_code_date
             ON klines(code, period, date);
+
+        CREATE TABLE IF NOT EXISTS klines_minute (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            open REAL DEFAULT 0,
+            high REAL DEFAULT 0,
+            low REAL DEFAULT 0,
+            close REAL DEFAULT 0,
+            volume INTEGER DEFAULT 0,
+            period TEXT NOT NULL DEFAULT '1min',
+            UNIQUE(code, timestamp, period)
+        );
+        CREATE INDEX IF NOT EXISTS idx_klines_minute_code_period
+            ON klines_minute(code, period, timestamp);
     """)
 
     # 预设分组 — 先建唯一索引防止重复
@@ -648,3 +663,96 @@ def get_kline_count(code: str = "", period: str = "daily") -> int:
         ).fetchone()
     conn.close()
     return row["cnt"] if row else 0
+
+
+# ============================================================
+# 分钟K线 (klines_minute) — 1min / 60min 级别
+# ============================================================
+
+def save_klines_minute_batch(klines: list) -> int:
+    """批量 upsert 分钟K线 [{code, timestamp, open, high, low, close, volume, period}, ...]
+    UNIQUE(code, timestamp, period) 去重
+    返回写入行数
+    """
+    if not klines:
+        return 0
+    conn = _connect()
+    count = 0
+    for k in klines:
+        cur = conn.execute(
+            "INSERT OR REPLACE INTO klines_minute "
+            "(code, timestamp, open, high, low, close, volume, period) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (k["code"], k["timestamp"], k.get("open", k.get("price", 0)),
+             k.get("high", k.get("price", 0)), k.get("low", k.get("price", 0)),
+             k.get("close", k.get("price", 0)), k.get("volume", 0),
+             k.get("period", "1min")),
+        )
+        count += cur.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+def get_klines_minute(
+    code: str,
+    period: str = "1min",
+    minutes: int | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[dict]:
+    """从DB获取分钟K线，按时间升序返回
+    返回: [{code, timestamp, open, high, low, close, volume, period}, ...]
+    """
+    conn = _connect()
+    query = (
+        "SELECT code, timestamp, open, high, low, close, volume, period "
+        "FROM klines_minute WHERE code=? AND period=? "
+    )
+    params = [code, period]
+
+    if start:
+        query += "AND timestamp >= ? "
+        params.append(start)
+    if end:
+        query += "AND timestamp <= ? "
+        params.append(end)
+
+    query += "ORDER BY timestamp ASC"
+
+    if minutes is not None:
+        query += " LIMIT ?"
+        params.append(minutes)
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [{
+        "code": r["code"], "timestamp": r["timestamp"],
+        "open": r["open"], "high": r["high"],
+        "low": r["low"], "close": r["close"],
+        "volume": r["volume"], "period": r["period"],
+    } for r in rows]
+
+
+def get_latest_minute_timestamp(code: str, period: str = "1min") -> str | None:
+    """获取某股票分钟K线的最新时间戳"""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT MAX(timestamp) as latest FROM klines_minute WHERE code=? AND period=?",
+        (code, period),
+    ).fetchone()
+    conn.close()
+    return row["latest"] if row else None
+
+
+def delete_old_minute_klines(code: str, before_date: str) -> int:
+    """删除指定日期之前的分钟K线（数据清理用）"""
+    conn = _connect()
+    cur = conn.execute(
+        "DELETE FROM klines_minute WHERE code=? AND timestamp < ?",
+        (code, before_date),
+    )
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted

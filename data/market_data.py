@@ -187,10 +187,260 @@ def fetch_30min_kline(code: str, days: int = 60) -> list[KLineData]:
     return []
 
 
+def fetch_1min_kline_history(code: str) -> list[dict]:
+    """
+    获取历史 1min K 线数据（通达信 MOOTDX，分页拉取）
+    覆盖约 4~5 个月（~21,000 条），远超东方财富的 5 天
+    返回: [{code, timestamp, open, high, low, close, volume, period}, ...]
+    """
+    import time
+    cache = get_kline_cache()
+    cache_key = f"kline_1min_tdx:{code}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    for attempt in range(2):
+        try:
+            from mootdx.quotes import Quotes
+            from config import TDX_HOST, TDX_PORT, TDX_TIMEOUT
+
+            logger.debug(f"TDX获取1分钟K线: {code} (第{attempt+1}次)")
+            client = Quotes.factory(
+                market="std", host=TDX_HOST, port=TDX_PORT,
+                timeout=TDX_TIMEOUT,
+            )
+
+            # freq=8 → 1分钟K线, 分页拉取全部历史
+            result = []
+            start = 0
+            while True:
+                df = client.bars(symbol=code, frequency=8, start=start, offset=800)
+                if df is None or df.empty:
+                    break
+
+                for _, row in df.iterrows():
+                    ts = str(row.get("datetime", ""))
+                    result.append({
+                        "code": code,
+                        "timestamp": ts,
+                        "open": _safe_float(row.get("open")),
+                        "high": _safe_float(row.get("high")),
+                        "low": _safe_float(row.get("low")),
+                        "close": _safe_float(row.get("close")),
+                        "volume": _safe_int(row.get("volume", row.get("vol"))),
+                        "period": "1min",
+                    })
+
+                start += len(df)
+                if len(df) < 800:
+                    break
+
+            if result:
+                # 分页拉取得到的是从新到旧，反转为时间升序
+                result.reverse()
+                cache.set(cache_key, result, ttl=600.0)
+                dates = sorted(set(r["timestamp"][:10] for r in result))
+                logger.info(f"TDX获取 {code} 1min 历史K线 {len(result)} 条 "
+                           f"({dates[0]} ~ {dates[-1]}, {len(dates)}天)")
+            return result
+
+        except ImportError:
+            logger.warning("mootdx 未安装，回退到东方财富源")
+            return _fetch_1min_kline_em_fallback(code)
+
+        except Exception as e:
+            logger.warning(f"TDX 1分钟K线失败 ({code}, 第{attempt+1}次): {e}")
+            if attempt < 1:
+                time.sleep(3)
+
+    # TDX 完全失败时回退到东方财富
+    logger.info(f"TDX 不可用，回退东方财富 1min 源 ({code})")
+    return _fetch_1min_kline_em_fallback(code)
+
+
+def _fetch_1min_kline_em_fallback(code: str) -> list[dict]:
+    """东方财富 1min K线 (回退方案, ~5天数据)"""
+    import time
+    cache = get_30min_cache()
+    cache_key = f"kline_1min_em:{code}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    for attempt in range(2):
+        try:
+            import akshare as ak
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="qfq")
+            if df is None or df.empty:
+                return []
+
+            col_map = {
+                "时间": "timestamp", "开盘": "open", "收盘": "close",
+                "最高": "high", "最低": "low", "成交量": "volume",
+            }
+            df = df.rename(columns=col_map)
+
+            result = []
+            for _, row in df.iterrows():
+                result.append({
+                    "code": code,
+                    "timestamp": str(row.get("timestamp", "")),
+                    "open": _safe_float(row.get("open")),
+                    "high": _safe_float(row.get("high")),
+                    "low": _safe_float(row.get("low")),
+                    "close": _safe_float(row.get("close")),
+                    "volume": _safe_int(row.get("volume")),
+                    "period": "1min",
+                })
+
+            cache.set(cache_key, result, ttl=300.0)
+            logger.info(f"东方财富 1min 回退: {code} {len(result)} 条")
+            return result
+        except Exception as e:
+            if attempt < 1:
+                time.sleep(2)
+
+    return []
+
+
+def fetch_60min_kline_history(code: str) -> list[dict]:
+    """
+    获取历史 60min K 线数据（东方财富源），覆盖时间远长于 1min
+    返回: [{code, timestamp, open, high, low, close, volume, period='60min'}, ...]
+    """
+    import time
+    cache = get_kline_cache()
+    cache_key = f"kline_60min_history:{code}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    for attempt in range(2):
+        try:
+            import akshare as ak
+            logger.debug(f"获取历史60分钟K线: {code} (第{attempt+1}次)")
+
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
+            if df is None or df.empty:
+                return []
+
+            col_map = {
+                "时间": "timestamp", "开盘": "open", "收盘": "close",
+                "最高": "high", "最低": "low", "成交量": "volume",
+            }
+            df = df.rename(columns=col_map)
+
+            result = []
+            for _, row in df.iterrows():
+                ts = str(row.get("timestamp", ""))
+                result.append({
+                    "code": code,
+                    "timestamp": ts,
+                    "open": _safe_float(row.get("open")),
+                    "high": _safe_float(row.get("high")),
+                    "low": _safe_float(row.get("low")),
+                    "close": _safe_float(row.get("close")),
+                    "volume": _safe_int(row.get("volume")),
+                    "period": "60min",
+                })
+
+            cache.set(cache_key, result, ttl=600.0)
+            logger.info(f"获取 {code} 60min 历史K线 {len(result)} 条")
+            return result
+
+        except Exception as e:
+            logger.warning(f"获取60分钟K线失败 ({code}, 第{attempt+1}次): {e}")
+            if attempt < 1:
+                time.sleep(3)
+
+    return []
+
+
+def fetch_today_1min_bars(code: str) -> list[dict]:
+    """
+    获取当日 1min K线 (TDX源，含完整 OHLCV)
+    返回: [{code, timestamp, open, high, low, close, volume, period}, ...]
+    用于盘中增量刷新，一次调用替代日线+分时两次调用
+    """
+    import time
+    cache = get_30min_cache()
+    cache_key = f"today_1min_tdx:{code}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    for attempt in range(2):
+        try:
+            from mootdx.quotes import Quotes
+            from config import TDX_HOST, TDX_PORT, TDX_TIMEOUT
+
+            client = Quotes.factory(
+                market="std", host=TDX_HOST, port=TDX_PORT,
+                timeout=TDX_TIMEOUT,
+            )
+            # 拉最近 300 条 1min (覆盖当天的全部分钟 + 前一天的尾盘)
+            df = client.bars(symbol=code, frequency=8, start=0, offset=300)
+            if df is None or df.empty:
+                return []
+
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            result = []
+            for _, row in df.iterrows():
+                ts = str(row.get("datetime", ""))
+                if not ts.startswith(today_str):
+                    continue  # 只要当天数据
+                result.append({
+                    "code": code,
+                    "timestamp": ts,
+                    "open": _safe_float(row.get("open")),
+                    "high": _safe_float(row.get("high")),
+                    "low": _safe_float(row.get("low")),
+                    "close": _safe_float(row.get("close")),
+                    "volume": _safe_int(row.get("volume", row.get("vol"))),
+                    "period": "1min",
+                })
+
+            if result:
+                result.reverse()  # TDX 返回从新到旧，反转为时间升序
+                cache.set(cache_key, result, ttl=30.0)
+
+            return result
+
+        except ImportError:
+            break
+        except Exception as e:
+            logger.warning(f"TDX 今日1min失败 ({code}, 第{attempt+1}次): {e}")
+            if attempt < 1:
+                time.sleep(2)
+
+    # TDX 不可用时回退到 Sina 分时
+    return _fetch_today_1min_sina_fallback(code)
+
+
+def _fetch_today_1min_sina_fallback(code: str) -> list[dict]:
+    """Sina 分时数据回退 (只有 price+volume，无完整 OHLC)"""
+    bars = fetch_intraday_data(code)
+    return [{
+        "code": code,
+        "timestamp": b["time"],
+        "open": b["price"],
+        "high": b["price"],
+        "low": b["price"],
+        "close": b["price"],
+        "volume": b.get("volume", 0),
+        "period": "1min",
+    } for b in bars]
+
+
 def fetch_intraday_data(code: str) -> list[dict]:
     """
-    获取当日分时数据 (缓存1分钟)
+    获取当日分时数据 (Sina源, 缓存1分钟)
     返回: [{time, price, volume, avg_price}, ...]
+    注意: 仅用于图表绘制，盘中增量刷新请用 fetch_today_1min_bars
     """
     cache = get_30min_cache()
     cache_key = f"intraday:{code}"
@@ -492,7 +742,6 @@ class IncrementalRefreshWorker(QThread):
     def run(self):
         from data.market_data_manager import get_data_manager
         manager = get_data_manager()
-        results = {}
         pending = manager.get_pending_codes()
 
         # 跳过正在初始获取中的股票
@@ -500,11 +749,14 @@ class IncrementalRefreshWorker(QThread):
 
         if active_codes:
             try:
-                results = manager.refresh_quotes_batch(active_codes)
+                # 一次 TDX 1min 调用 = 日线 OHLCV + 现价 + 分钟线存储
+                manager.refresh_minute_bars_batch(active_codes)
             except Exception:
                 from utils.logger import get_logger
                 get_logger(__name__).exception("增量刷新异常")
 
+        # 返回当前缓存中的所有现价（供 UI 刷新表格）
+        results = manager.get_all_quotes() if active_codes else {}
         self.data_ready.emit(results)
 
 
@@ -529,10 +781,11 @@ class InitialFetchWorker(QThread):
         manager = get_data_manager()
 
         try:
-            manager.fetch_and_store_initial(
-                self.code,
-                kline_callback=self.kline_ready.emit,
-            )
+            results = manager.fetch_and_store_initial(self.code)
+            # 从返回结果发各周期信号（测试用例使用）
+            for key, data in results.items():
+                if data and key in ("daily", "weekly", "monthly"):
+                    self.kline_ready.emit(self.code, key, data)
             self.all_done.emit(self.code)
         except Exception:
             logger.error(f"InitialFetchWorker异常 ({self.code}):\n{traceback.format_exc()}")

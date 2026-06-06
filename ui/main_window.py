@@ -858,25 +858,10 @@ class MainWindow(QMainWindow):
 
         # 启动独立的全量数据 Worker (与增量刷新互不阻塞)
         self._init_worker = InitialFetchWorker(code)
-        self._init_worker.kline_ready.connect(self._on_new_stock_kline_ready)
         self._init_worker.all_done.connect(self._on_new_stock_init_done)
         self._init_worker.error_occurred.connect(
             lambda e: logger.error(f"新股 {code} 全量数据获取失败: {e}"))
         self._init_worker.start()
-
-    def _on_new_stock_kline_ready(self, code: str, period: str, klines: list):
-        """新股某周期K线到达 → 更新图表 (如果正在查看该股票)"""
-        if not klines or code != self._current_stock_code:
-            return
-        try:
-            for i in range(self.chart_widget.tabs.count()):
-                tab = self.chart_widget.tabs.widget(i)
-                if hasattr(tab, 'period') and tab.period == period and tab.code == code:
-                    tab.klines = klines
-                    tab._draw_kline()
-                    break
-        except Exception:
-            logger.warning(f"新股K线绘图失败 ({code}, {period}):\n{traceback.format_exc()}")
 
     def _on_new_stock_init_done(self, code: str):
         """新股全量数据获取完成 → 刷新表格显示（现价已由Manager写入）"""

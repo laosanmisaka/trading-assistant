@@ -188,22 +188,32 @@ class TestSingleStockQuote:
 class TestIncrementalRefreshWorker:
     """并行增量刷新 — 多只股票并行获取"""
 
-    def test_worker_fetches_multiple_codes(self):
+    def test_worker_fetches_multiple_codes(self, monkeypatch):
         from data.market_data import IncrementalRefreshWorker
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import QEventLoop, QTimer
         import sys
         app = QApplication.instance() or QApplication(sys.argv)
 
+        # mock TDX 数据：返回模拟的当日 1min bars
+        def _mock_today_bars(code):
+            return [
+                {"code": code, "timestamp": f"2026-06-06 {h:02d}:{m:02d}:00",
+                 "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.3,
+                 "volume": 1000, "period": "1min"}
+                for h, m in [(9, 30), (9, 31), (9, 32)]
+            ]
+        # 补丁 market_data_manager 中的引用（QThread 内会用到）
+        monkeypatch.setattr("data.market_data_manager.fetch_today_1min_bars", _mock_today_bars)
+
         results = {}
         loop = QEventLoop()
 
         worker = IncrementalRefreshWorker(["000001", "600519"])
         worker.data_ready.connect(lambda q: (results.update(q), loop.quit()))
-        # 超时保护
-        QTimer.singleShot(60000, loop.quit)
+        QTimer.singleShot(15000, loop.quit)
         worker.start()
-        loop.exec_()  # 进入事件循环等待信号
+        loop.exec_()
 
         assert len(results) >= 1
         for code in results:
