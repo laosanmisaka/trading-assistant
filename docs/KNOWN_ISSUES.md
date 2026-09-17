@@ -5,6 +5,7 @@
 
 - 完整分析见 `docs/PROJECT_ASSESSMENT.md`
 - 任务清单复核意见见 `docs/TASK_LIST_REVIEW.md`
+- **待原开发者回复的业务口径确认清单见 `docs/BUSINESS_RULES_CONFIRMATION.md`**
 - 最后更新：2026-09-17
 
 ---
@@ -14,9 +15,10 @@
 | 项 | 内容 |
 | --- | --- |
 | 位置 | `core/trading/t_trader.py`：`open()` 第 156 / 162 行，`check_close()` 第 219 / 224 行 |
-| 状态 | **未修** |
+| 状态 | **决定不修 —— 2026-09-17 定案：做 T 暂不实现** |
 | 当前影响 | **无** —— `ui/` 层零引用 `TTrader`，仅 `core/trading/simulator.py` 与测试使用 |
-| 阻塞条件 | **接线做 T 界面之前必修** |
+| 曾阻塞 | 「接线做 T 界面之前必修」；现定案不接，**不再阻塞任何工作** |
+| 防误接 | `core/trading/t_trader.py` 模块 docstring 顶部已加醒目警告块 |
 
 **缺陷**：`BUY_FIRST` 路径开仓扣资金、平仓却不回补；`SELL_FIRST` 路径卖出所得从未入账、平仓却把资金加回。即「卖出所得」在两条路径上都被记漏，且方向相反。
 
@@ -68,7 +70,19 @@ SELL_FIRST 单轮:     资金 50000 -> 60000    底仓 5000 -> 4000
 
 另一条独立路径：所有日线日期都早于买入日时（典型为当日买入、日线尚未更新），`buy_idx` 保持 `-1`，退化为今日最低价——该分支结果恰好合理。
 
-**两条路径现在都会打 warning**，但不会自动放宽窗口：因为「止损只上移不下移」这条业务口径本身尚未经确认（见 KI-005）。
+**两条路径现在都会打 warning**，但不会自动放宽窗口：因为「止损只上移不下移」这条业务口径本身尚未经确认。
+
+> 已列入确认清单 Q2（`docs/BUSINESS_RULES_CONFIRMATION.md`），含「是否要有回撤容忍」「120 天窗口是否够」两个具问。
+
+**补充：止损共三条调用路径，数学上自洽**（此前未记录全）
+
+| 时机 | 调用链 | 计算方式 |
+| --- | --- | --- |
+| 首次设置 | `ui/main_window.py:544` → `alert_engine.py:83` | `max(lows[买入日:])`（`alert_engine.py:139-142`） |
+| 盘中每轮刷新 | 同上 | `max(当前止损, 今日最低)`（`alert_engine.py:159`） |
+| 每日 15:05 后 | `ui/main_window.py:501` → `alert_engine.py:315` | `max(前一止损, 今日最低)`（`core/technical.py:395-407`） |
+
+三条路径共同构成「首次追赶 + 逐日抬升」的移动止损，彼此等价，**不存在实现错误**，问题只在口径。
 
 ---
 
@@ -91,17 +105,51 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 
 上方注释却写「确认: 第三K线收盘 > 底分型最低价」。按 `idx` = 中间 K 线的语义，注释意图应写作 `lows[idx]` 与 `closes[idx+1]` —— **代码与自己的注释不自洽，整体后移了一根**。
 
-**注意**：改动前必须先确认缠论二买的正确确认规则，**不要按注释字面直接改**。
+**2026-09-17 更新：已按注释口径修正，但发现该条件恒成立。**
+
+老三在确认清单 Q4 中选了「按注释修正代码」，已改成 `lows[idx]` + `closes[idx+1]`。
+改完后发现一个比索引偏移本身更值得注意的事实：**该条件在底分型定义下恒为真** ——
+
+- 底分型定义保证 `lows[idx] < lows[idx+1]`
+- 收盘价恒 `>= 当日最低价`，即 `closes[idx+1] >= lows[idx+1]`
+- 故 `closes[idx+1] > lows[idx]` **必然成立**
+
+也就是说，这个「二买确认」是个**空条件**，`_check_weekly_bottom_fractal` 实际退化成
+「最近 4 根周线内存在底分型」。反倒是**原代码** `closes[idx+2] > lows[idx+1]`
+（要求分型后第二根不破右腿低点）**有真实约束**，只是它的注释写错了。
+
+**后果**：修正后买点第三个条件的触发会变多。
+
+**后续**：若按新方案改用 czsc（见 `docs/CZSC_INTEGRATION.md`），本函数将被
+`chan.fractals()` 取代；真正需要重新定义的其实是「什么样的确认才算二买」，
+而不是「索引该取哪一根」。
 
 ---
 
 ## KI-005 需要业务口径才能继续的三项
 
+> **确认清单已起草，可直接转发原开发者：`docs/BUSINESS_RULES_CONFIRMATION.md`**（Q1~Q4，含代码事实、行号与勾选项）
+
 | 项 | 代码现状 | 需要确认 |
 | --- | --- | --- |
-| 缠论分型周期 | 止盈检测走 **30 分钟**分型（`tests/test_alert_engine.py` 有对应限流测试） | 30min 还是 60min |
-| 止损规则 | 实现为「只上移不下移」的移动止损 | 是否为有意设计（见 KI-003） |
-| 做 T 资金模型 | 见 KI-001 | 真实记账口径 |
+| 缠论分型周期 | **全项目只采集 `1min` / `60min` 两种分钟数据，分型检测读的是 `60min` 表**；但代码、注释、配置、UI 文案共 14 处写「30min」 | 本意是 60min（改文案）还是 30min（需补数据源，属功能变更） |
+| 止损规则 | 实现为「只上移不下移」的移动止损，三条路径数学自洽；取数窗口 120 天 | 是否为有意设计（见 KI-003） |
+| 做 T 资金模型 | 见 KI-001 | 真实记账口径（见确认清单 Q3） |
+
+**修正（2026-09-17）**：此前记作「止盈检测走 30 分钟分型（有对应限流测试）」**不准确**。实测读代码：`core/alert_engine.py:226` 取的是 `"60min"`，`core/buy_point_scanner.py:144` 同样取 `"60min"`；`tests/test_alert_engine.py:137` 那个测试只覆盖**限流**，不涉及周期。
+
+**即：项目不具备 30 分钟数据源，「30min」是纯文案残留。** 问题性质因此从「30min 还是 60min」变为「当年是否少做了一套 30min 数据源」——两种答案的修复成本差一个数量级，必须先确认。
+
+证据分布（14 处文案）：
+
+| 位置 | 内容 |
+| --- | --- |
+| `core/alert_engine.py:188/190/215/224/239` | docstring 与日志「检测到30min顶分型」 |
+| `core/buy_point_scanner.py:1` | 模块 docstring「30分钟缩量回踩中枢」 |
+| `config.py:30` | `TOP_FRACTAL_LOOKBACK = 10  # 30分钟顶分型回溯K线数`（该常量全项目无引用） |
+| `data/models.py:103/114/129` | `period` 注释、`top_fractal_detected`、`shallow_pullback_center` |
+| `utils/cache.py:80/81/92/93` | `_kline_30min_cache`（实际被 `fetch_60min_kline_history` 使用） |
+| `ui/main_window.py:550` | 注释「计算止盈线 (检查30min顶分型)」 |
 
 ---
 
@@ -138,6 +186,45 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 
 ---
 
+## KI-007 止损/止盈的 UI 展示未接线
+
+| 项 | 内容 |
+| --- | --- |
+| 位置 | `ui/stock_table.py:141-144`；`ui/chart_widget.py:439/497/500` |
+| 状态 | **未接线** |
+| 当前影响 | **不影响风控**，只影响「看得见」 |
+| 阻塞条件 | 需产品决策（是否要展示） |
+
+**澄清一点**：`docs/USER_GUIDE.md` 第 6.3 节原写「详见 BUG 报告」，容易被读成提醒功能没做。**提醒本身是工作的** —— `AlertEngine` 每轮刷新都在跑，触发后表格行高亮、托盘闪烁均正常。缺的只是价位的**展示**：
+
+1. 股票表格的 `止损价` / `止盈价` 两列直接 `return "--"`（占位符），从未被赋值。
+2. 图表的止损/止盈线能力已具备（`ChartWidget.set_alert_lines` 已实现并会转发到各 Tab），但**全项目无任何调用方**。
+
+**注意**：展示一接线，就会**暴露** KI-003（止损口径）与 KI-005（周期）—— 用户会立刻看到那条「贴着历史最高 low」的止损线。建议口径确认完成后再接。
+
+---
+
+## KI-008 盘中刷新路径仍以空列表表示失败
+
+| 项 | 内容 |
+| --- | --- |
+| 位置 | `data/market_data.py` `fetch_today_1min_bars()`、`fetch_intraday_data()` |
+| 状态 | **有意保留**（2026-09-17） |
+| 当前影响 | 盘中拉数失败时表现为「本轮无新数据」，与「今日无成交」仍不可区分 |
+
+**背景**：同日已引入 `DataSourceError`，把「数据源故障」与「确实无数据」分开，覆盖了
+`fetch_kline`（日/周/月）与 `fetch_1min_kline_history` / `fetch_60min_kline_history`。
+**这两个函数没有一起改**，原因：
+
+它们的调用方是刷新循环（`MarketDataManager.refresh_minute_bars()` → `IncrementalRefreshWorker`），
+链路里**没有 local 的 try/except**，只在 Worker 的 `run()` 最外层兜底。若在这里抛异常，
+**单只股票的取数失败会中断整轮刷新**（其余股票也刷不到），比「静默返回空」更糟。
+
+**触发重估条件**：把 `refresh_minute_bars()` 的调用方改造成逐股容错
+（即：单股失败只记录并跳过，不中断整轮）之后，这两个函数应一并改为抛 `DataSourceError`。
+
+---
+
 ## 附表：已修复并有测试保护的项
 
 | 缺陷 | 位置 | 保护测试 |
@@ -149,9 +236,29 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 | 回测 O(n²) | `core/backtest/strategy.py` `WeeklyAggregator` | `tests/test_backtest.py::TestWeeklyAggregatorEquivalence` |
 | DB 连接重复设 journal_mode | `data/database.py` `_connect()` / `init_db()` | 无断言，仅实测数据（见 KI-006） |
 
-**仍缺测试保护的两项**（本次已修复代码，但断言尚未落地）：
+**第二批补齐（2026-09-17，测试总数 140 → 204）**：
 
-| 缺陷 | 位置 | 缺口 |
-| --- | --- | --- |
-| UI 线程同步网络请求 | `ui/main_window.py` `_try_add_by_code` | 需断言「DB 未命中时不同步调用同步函数、而是启动 worker」 |
-| 买点扫描线程泄漏 | `core/buy_point_scanner.py` `BuyPointScanWorker` | 需断言「单轮只创建一个 worker、且不随轮次累积」 |
+| 缺陷 | 位置 | 保护测试 | 断言要点 |
+| --- | --- | --- | --- |
+| UI 线程同步网络请求 | `ui/main_window.py` `_try_add_by_code` | `tests/test_ui_threading.py::TestAddByCodeIsAsync` | 5 条：不起同步调用 / 走 worker / 防重入 / 信号全接 / DB 命中不同步 |
+| 买点扫描线程泄漏 | `core/buy_point_scanner.py` `BuyPointScanWorker` | `tests/test_ui_threading.py::TestBuyPointScanSingleWorker` | 7 条：单轮单 worker / 运行中跳过 / 不累积引用 / 容忍已销毁对象 / batch_finished 接上 |
+| `is_trading_time()` 硬编码时段 | `utils/__init__.py` | `tests/test_trading_time.py` | 26 条：改 `config.TRADING_*` 必须立即生效（原实现改配置无效） |
+| 图表逐根绘制 | `ui/chart_widget.py` `_draw_kline_manual` | `tests/test_chart_candles.py` | 15 条：与逐根绘制逐坐标等价 / artist 数量与根数解耦 / dataLim 未退化 |
+| 数据源故障与无数据不可区分 | `data/market_data.py` | `tests/test_data_source_errors.py` | 11 条：源故障抛 `DataSourceError`、无数据返回 `[]`、异常带代码与原因、重试语义 |
+
+**两处批量改造都做过变异验证**（把实现改回旧写法，确认断言会失败）：
+
+- 回退 `_try_add_by_code` 为同步调用 → 3 条失败，且测试耗时从 0.53s 涨到 12.7s（复现了那次 UI 冻结）
+- 回退买点扫描为每股票一个 worker → 4 条失败
+- 回退交易时段为硬编码 → 5 条失败
+
+**改造量化**：
+
+| 项 | 改前 | 改后 | 倍数 |
+| --- | --- | --- | --- |
+| K 线绘制 250 根 | 225.0 ms | 17.6 ms | 12.8x |
+| K 线绘制 1000 根 | 1978.0 ms | 93.0 ms | 21.3x |
+| K 线绘制 2000 根 | 3970.4 ms | 170.1 ms | 23.3x |
+| 250 根的 candle artist 数 | 254 lines + 250 patches = 504 | 4 lines + 2 collections = 6 | 84x |
+
+（环境：本机 Win + matplotlib 3.11.2，取 5 次中位数）
