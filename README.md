@@ -61,13 +61,19 @@ python main.py
 python -m pytest -q
 ```
 
-本次接手审阅时，在 `py312` Conda 环境安装依赖后执行结果为：
+当前（2026-09-17 接手后）在本机 Python 3.13 + venv 下执行结果为：
 
 ```txt
-114 passed in 52.77s
+204 passed, 8 skipped in 29.25s
 ```
 
-注意：当前测试包含真实 AKShare 网络请求，也会删除项目根目录的 `trading_assistant.db`。运行测试前请确认没有重要本地数据。
+两点说明：
+
+- 依赖真实外网的测试已统一打 `network` 标记并**默认跳过**，离线与 CI 环境可稳定运行。
+  需要验证真实数据源时用 `python -m pytest -q --run-network`。
+- 测试通过 `tests/conftest.py` 的 `monkeypatch` + `tempfile` 把数据库指向临时文件，
+  **不会碰项目根目录的 `trading_assistant.db`**。
+  （早期版本确实会直接操作真实库，相关警告已过期，此处更正。）
 
 ## 项目结构
 

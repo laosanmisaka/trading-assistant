@@ -523,4 +523,6 @@ trading_assistant.db
 - 新测试应避免依赖真实网络，AKShare 调用应 mock。
 - 测试数据库通过 `conftest.py` 的 `monkeypatch` 自动使用临时路径，不影响项目真实数据库。新增 fixture 应沿用此模式。
 - QThread Worker 需要可靠持有引用，避免运行中对象被释放。
-- 做 T 模块投入 UI 或真实交易前，必须先修复 BUG 报告中的资金/仓位问题。
+- 做 T 模块投入 UI 或真实交易前，必须先修复资金/仓位双向不守恒问题
+  （`core/trading/t_trader.py`，见 `docs/KNOWN_ISSUES.md` KI-001）。
+  该缺陷当前不影响真实行为（`ui/` 层零引用），但接线即事故。

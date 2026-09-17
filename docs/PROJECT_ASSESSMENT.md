@@ -152,10 +152,22 @@ for i in range(buy_idx, len(arr["lows"])):
 
 ## 6. 一致性与卫生（P2）
 
-- **悬空引用**：`docs/USER_GUIDE.md` 第 170、261 行两处写「详见 BUG 报告」「请以 BUG 报告为准继续补测试」，但仓库中不存在任何 BUG 报告文件。接手人会直接卡在这里。
-- **文档与代码不同步**：README 第 70 行与 USER_GUIDE 第 235 行均称「测试会删除项目根目录的 `trading_assistant.db`」，但 `tests/conftest.py` 已通过 `monkeypatch` + `tempfile` 把 `_get_path` 指向临时文件，**实际不会碰真实库**。这条警告已经过期，会误导接手人不敢跑测试。
-- **未使用的依赖**：`mplfinance` 列在依赖里，但 `ui/chart_widget.py` 是纯 matplotlib 手绘实现，明确「无 mplfinance 依赖」。
-- **未被引用的配置常量**：`TDX_HOST/PORT/TIMEOUT`、`TOP_FRACTAL_LOOKBACK`、`TRADING_START_*/END_*`、`KLINE_INITIAL_MONTHS` 在代码中均无引用。
+- ~~**悬空引用**~~ **（已修复）**：`docs/USER_GUIDE.md` 第 170、261 行两处写「详见 BUG 报告」「请以 BUG 报告为准继续补测试」，但仓库中不存在任何 BUG 报告文件。**实际共三处**——第三处在 `docs/TECHNICAL_REFERENCE.md:526`「必须先修复 BUG 报告中的资金/仓位问题」，前两次核对均漏掉。三处已改为指向 `docs/KNOWN_ISSUES.md` 的具体条目。
+- ~~**文档与代码不同步（测试删库）**~~ **（已修复）**：README 第 70 行与 USER_GUIDE 第 235 行均称「测试会删除项目根目录的 `trading_assistant.db`」，但 `tests/conftest.py` 已通过 `monkeypatch` + `tempfile` 把 `_get_path` 指向临时文件，**实际不会碰真实库**。这条警告已经过期，且**被三份外部材料连续误引**（README → 外部评估 → 他人任务清单）。两处已更正，并附上 `--run-network` 的说明。
+- **未使用的依赖（已修复）**：`mplfinance` 曾列在依赖里，但 `ui/chart_widget.py` 是纯 matplotlib 手绘实现。已在 `d24bb9e` 从两份清单删除，并补上漏声明的 `mootdx`。
+- **未被引用的配置常量（已核实修正）**：原表述「`TDX_HOST/PORT/TIMEOUT`、`TOP_FRACTAL_LOOKBACK`、`TRADING_START_*/END_*`、`KLINE_INITIAL_MONTHS` 均无引用」**有两处错误**，全量核实后更正如下：
+
+  | 常量 | 原判断 | 实际 |
+  | --- | --- | --- |
+  | `TDX_HOST` / `TDX_PORT` / `TDX_TIMEOUT` | 无引用 | **有引用**，`data/market_data.py:182-187` 与 `:363-367` |
+  | `TRADING_START_*` / `TRADING_END_*` | 无引用 | **有引用**（曾错在 `is_trading_time()` 硬编码未接），现已接入 `utils/__init__.py` |
+  | `KLINE_CACHE_TTL_SEC` | 未提及 | **无引用**，本轮新发现 |
+  | `KLINE_INITIAL_MONTHS` | 无引用 | 无引用；实际取数窗口写死在 `market_data_manager.py:271` 的 `days_map`（`daily: 126` ≈ 6 个月） |
+  | `STOP_LOSS_DEFAULT` | 未提及 | **无引用**，本轮新发现 |
+  | `TOP_FRACTAL_LOOKBACK` | 无引用 | 无引用；且原注释「30分钟顶分型」与实现（读 60min）不符，已列入 `BUSINESS_RULES_CONFIRMATION.md` Q1 |
+  | `CHART_STYLE` | 未提及 | **无引用**；随 `mplfinance` 移除而失效，本轮新发现 |
+
+  处理方式：**标注而非删除**（`config.py` 中标记 `[未接线]`）。理由是这些常量可能是原作者预留的未完成功能，删除是破坏信息的；现已把「哪些无引用、实际取值写在哪里」记录下来，确认无用后可安全清理。
 - **工作区已收口（v2）**：`core/technical.py`、`data/market_data_manager.py`、`ui/main_window.py` 三个修复已连同 `tests/test_market_data_manager.py` 一起提交（`6f54be0`）。此项已关闭。
 
 ## 7. 建议的接手顺序
