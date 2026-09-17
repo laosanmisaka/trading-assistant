@@ -3,9 +3,10 @@ import argparse
 
 from core.backtest.strategy import BuyPointStrategy
 from core.backtest.engine import BacktestEngine
+from data.market_data import DataSourceError
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="回测单只股票")
     parser.add_argument("code", help="6位股票代码，如 000001")
     parser.add_argument("--days", type=int, default=500, help="回测历史天数")
@@ -15,12 +16,19 @@ def main():
 
     if args.strategy != "buypoint":
         print(f"未知策略: {args.strategy}，当前仅支持 buypoint")
-        return
+        return 2
 
     engine = BacktestEngine(initial_capital=args.capital)
-    report = engine.run(BuyPointStrategy(), args.code, days=args.days)
+    try:
+        report = engine.run(BuyPointStrategy(), args.code, days=args.days)
+    except DataSourceError as e:
+        # 数据源故障 → 明确报错并非零退出，而不是打印一份空报告
+        print(f"数据源错误：{e}")
+        return 1
+
     print(report.format())
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -18,6 +18,7 @@ from data.models import RealtimeQuote, KLineData
 from data.market_data import (
     fetch_kline, fetch_1min_kline_history,
     fetch_60min_kline_history, fetch_today_1min_bars,
+    DataSourceError,
 )
 from data.database import (
     save_klines_batch, save_klines_minute_batch,
@@ -292,8 +293,13 @@ class MarketDataManager:
                     try:
                         result_data = future.result()
                         klines_by_period[key] = result_data
+                    except DataSourceError as e:
+                        # 数据源故障 —— 与「该股确实无数据」区分开，必须报错
+                        logger.error(
+                            f"{code} {key} 数据源故障，本轮该周期无数据: {e}")
+                        klines_by_period[key] = []
                     except Exception as e:
-                        logger.error(f"初始获取 {code} {key} 数据失败: {e}")
+                        logger.error(f"初始获取 {code} {key} 数据异常: {e}")
                         klines_by_period[key] = []
 
             # 第二阶段: 串行写 DB (避免并发写冲突)

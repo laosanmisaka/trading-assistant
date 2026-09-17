@@ -20,6 +20,25 @@ from utils.cache import (
 logger = get_logger(__name__)
 
 
+class DataSourceError(RuntimeError):
+    """行情数据源故障 —— 网络不可达、接口报错、依赖缺失、返回结构异常
+
+    与「该股确实没有数据」严格区分，两者此前都是 `return []`：
+
+      - 抛 DataSourceError → 数据源出问题了，应提示用户 / 重试 / 换源
+      - 返回 []            → 数据源正常应答，但此刻确实没有数据
+                            （停牌、代码不存在、该区间无交易）
+
+    没有这个区分时，两者都渲染成空图表，使用者看不出是「没数据」还是「坏了」。
+
+    注意：目前只覆盖日/周/月线（`fetch_kline`）与 1min / 60min 历史
+    （`fetch_1min_kline_history` / `fetch_60min_kline_history`）。盘中刷新路径
+    （`fetch_today_1min_bars`、`fetch_intraday_data`）仍返回空列表 ——
+    它们的调用方是「拉不到就跳过本轮」的刷新循环，改成抛异常会让单只股票
+    的故障中断整轮刷新，需先把调用方改造成可容忍失败（见 KNOWN_ISSUES.md）。
+    """
+
+
 # ============================================================
 # 数据安全转换工具
 # ============================================================
@@ -120,8 +139,10 @@ def fetch_kline(
         return result
 
     except Exception as e:
+        # 数据源故障 → 抛出，不再伪装成「无数据」的空列表
         logger.error(f"获取K线失败 ({code}, {period}): {e}")
-        return []
+        raise DataSourceError(
+            f"获取 {code} {period} K线失败（数据源不可用）: {e}") from e
 
 
 def _df_to_klines(df, code: str, period: str) -> list[KLineData]:
@@ -223,12 +244,13 @@ def _fetch_1min_kline_em_fallback(code: str) -> list[dict]:
     if cached is not None:
         return cached
 
+    last_error: Exception | None = None
     for attempt in range(2):
         try:
             import akshare as ak
             df = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="qfq")
             if df is None or df.empty:
-                return []
+                return []          # 源正常应答，只是没有数据
 
             col_map = {
                 "时间": "timestamp", "开盘": "open", "收盘": "close",
@@ -253,10 +275,14 @@ def _fetch_1min_kline_em_fallback(code: str) -> list[dict]:
             logger.info(f"东方财富 1min 回退: {code} {len(result)} 条")
             return result
         except Exception as e:
+            last_error = e
+            logger.warning(f"东方财富 1min 回退失败 ({code}, 第{attempt+1}次): {e}")
             if attempt < 1:
                 time.sleep(2)
 
-    return []
+    # TDX 与东方财富都失败 → 数据源故障，不再伪装成「无数据」
+    raise DataSourceError(
+        f"获取 {code} 1min 历史K线失败（通达信与东方财富均不可用）: {last_error}")
 
 
 def fetch_60min_kline_history(code: str) -> list[dict]:
@@ -272,6 +298,7 @@ def fetch_60min_kline_history(code: str) -> list[dict]:
     if cached is not None:
         return cached
 
+    last_error: Exception | None = None
     for attempt in range(2):
         try:
             import akshare as ak
@@ -279,7 +306,7 @@ def fetch_60min_kline_history(code: str) -> list[dict]:
 
             df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
             if df is None or df.empty:
-                return []
+                return []          # 源正常应答，只是没有数据
 
             col_map = {
                 "时间": "timestamp", "开盘": "open", "收盘": "close",
@@ -306,11 +333,14 @@ def fetch_60min_kline_history(code: str) -> list[dict]:
             return result
 
         except Exception as e:
+            last_error = e
             logger.warning(f"获取60分钟K线失败 ({code}, 第{attempt+1}次): {e}")
             if attempt < 1:
                 time.sleep(3)
 
-    return []
+    # 重试耗尽 → 数据源故障，不再伪装成「无数据」
+    raise DataSourceError(
+        f"获取 {code} 60min 历史K线失败（重试 {2} 次仍失败）: {last_error}")
 
 
 def fetch_today_1min_bars(code: str) -> list[dict]:

@@ -186,9 +186,17 @@ class TestSingleStockQuote:
         assert klines[0].close > 0
 
     def test_fetch_kline_invalid_code(self):
-        """无效代码返回空列表，不崩溃"""
-        klines = fetch_kline("999999", "daily", days=5)
-        # 无效代码可能返回空或数据
+        """无效代码：源正常应答但无数据 → 空列表；源报错 → DataSourceError
+
+        两者必须可区分（见 tests/test_data_source_errors.py 的离线覆盖）。
+        """
+        from data.market_data import DataSourceError
+
+        try:
+            klines = fetch_kline("999999", "daily", days=5)
+        except DataSourceError as e:
+            assert "999999" in str(e), "数据源异常必须带上代码，便于定位"
+            return
         assert isinstance(klines, list)
 
 

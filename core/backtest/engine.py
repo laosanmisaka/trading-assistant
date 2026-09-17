@@ -86,11 +86,17 @@ class BacktestEngine:
         self.min_commission = min_commission
 
     def run(self, strategy: Strategy, code: str, days: int = 500) -> BacktestReport:
-        """拉取历史日线并回测"""
+        """拉取历史日线并回测
+
+        两种"空"必须区分（`fetch_kline` 已改为按此契约）：
+          - **数据源故障** → 向上抛 `DataSourceError`，调用方应提示/重试，
+            绝不能拿一份空报告当做"回测跑完了"
+          - **源正常但无数据** → 返回空报告，并在日志中写明是停牌/代码不存在
+        """
         from data.market_data import fetch_kline
         daily = fetch_kline(code, "daily", days=days)
         if not daily:
-            logger.warning(f"{code} 无日线数据")
+            logger.warning(f"{code} 数据源正常应答但无日线数据（停牌或代码不存在）")
         return self.run_on_data(strategy, code, daily)
 
     def run_on_data(self, strategy: Strategy, code: str, daily: list[KLineData]) -> BacktestReport:
