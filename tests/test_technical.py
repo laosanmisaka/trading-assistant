@@ -96,6 +96,38 @@ class TestFractal:
         if has_top:
             assert top_high == highs[idx], f"top_high={top_high} != highs[{idx}]={highs[idx]}"
 
+    def test_top_fractal_index_after_containment_merge(self):
+        """发生多根嵌套包含合并时，顶分型索引必须指向极值实际所在的原始K线"""
+        # 前4根逐级嵌套包含 → 合并为1根；第5根(索引4, high=15)是顶分型高点所在K线，
+        # 随后又被索引5、6两根包含合并。合并序列:
+        #   [(7,5), (15,11), (10,7), (6,4)]  → 顶分型在合并索引1
+        # 旧的 mi*2 近似会错误地得到索引2 (highs[2]=8 != 15)
+        highs = np.array([10, 9, 8, 7, 15, 14, 13, 10, 6], dtype=float)
+        lows  = np.array([5, 6, 5.5, 5.2, 9, 10, 11, 7, 4], dtype=float)
+        tops = detect_top_fractal(highs, lows)
+        assert tops == [4]
+        assert highs[tops[0]] == 15.0  # 分型高点所在原始K线
+        # get_latest_top_fractal 的索引与价格必须一致
+        has_top, idx, top_high = get_latest_top_fractal(highs, lows)
+        assert has_top
+        assert idx == 4
+        assert top_high == 15.0
+
+    def test_bottom_fractal_index_after_containment_merge(self):
+        """发生多根嵌套包含合并时，底分型索引必须指向极值实际所在的原始K线"""
+        # 前4根逐级嵌套包含 → 合并为1根；索引4(low=1)是底分型低点所在K线，
+        # 随后与索引5发生包含合并。合并序列:
+        #   [(7,5), (2.5,1), (2.8,1.2), (5,3)]  → 底分型在合并索引1
+        # 旧的 mi*2 近似会错误地得到索引2 (lows[2]=5.5 != 1)
+        highs = np.array([10, 9, 8, 7, 3, 2.5, 2.8, 5], dtype=float)
+        lows  = np.array([5, 6, 5.5, 5.8, 1, 1.5, 1.2, 3], dtype=float)
+        bottoms = detect_bottom_fractal(highs, lows)
+        assert bottoms == [4]
+        assert lows[bottoms[0]] == 1.0  # 分型低点所在原始K线
+        has_bottom, idx = get_latest_bottom_fractal(highs, lows)
+        assert has_bottom
+        assert idx == 4
+
 
 class TestGoldenCross:
     def test_sma_golden_cross(self):

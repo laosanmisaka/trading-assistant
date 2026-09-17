@@ -262,7 +262,7 @@ trading_assistant.db
 | `calc_ma(closes, period)` | 收盘价数组、周期 | `np.ndarray` | 简单移动平均线，不足周期的位置为 NaN。 |
 | `calc_ema(closes, period)` | 收盘价数组、周期 | `np.ndarray` | 指数移动平均线。 |
 | `calc_macd(closes, fast=12, slow=26, signal=9)` | 收盘价数组、参数 | `(dif, dea, macd_bar)` | 计算 MACD；长度不足 slow 时返回 NaN 数组。 |
-| `_merge_contains(highs, lows)` | 最高价、最低价数组 | `(list, list)` | 缠论 K 线包含处理。 |
+| `_merge_contains(highs, lows)` | 最高价、最低价数组 | `(list, list, list)` | 缠论 K 线包含处理；第三个返回值是"合并索引 → 原始索引列表"的映射。 |
 | `detect_top_fractal(highs, lows)` | 最高价、最低价数组 | `list[int]` | 检测顶分型索引。 |
 | `detect_bottom_fractal(highs, lows)` | 最高价、最低价数组 | `list[int]` | 检测底分型索引。 |
 | `get_latest_top_fractal(highs, lows)` | 最高价、最低价数组 | `(bool, int, float)` | 返回最近顶分型是否存在、索引、最高价。 |

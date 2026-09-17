@@ -69,7 +69,8 @@ class MainWindow(QMainWindow):
         self._tray_flash_on: bool = False
         self._alert_triggered_codes: set[str] = set()
         self._bp_triggered_codes: set[str] = set()
-        self._daily_stop_loss_done: set[str] = set()  # 今日已执行每日止损更新的代码
+        self._daily_stop_loss_done: set[tuple[str, str]] = set()  # 已执行每日止损更新的 (代码, 日期)
+        self._quitting: bool = False  # 真正退出应用标志 (区分窗口关闭与退出)
 
         # 构建UI
         self._setup_menu()
@@ -96,7 +97,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_add_stock)
         file_menu.addSeparator()
         act_exit = QAction("退出(&X)", self)
-        act_exit.triggered.connect(self.close)
+        act_exit.triggered.connect(self._quit_app)
         file_menu.addAction(act_exit)
 
         group_menu = menubar.addMenu("分组(&G)")
@@ -206,7 +207,7 @@ class MainWindow(QMainWindow):
         tray_menu.addAction(act_hide)
         tray_menu.addSeparator()
         act_quit = QAction("退出", self)
-        act_quit.triggered.connect(self.close)
+        act_quit.triggered.connect(self._quit_app)
         tray_menu.addAction(act_quit)
 
         self.tray_icon.setContextMenu(tray_menu)
@@ -486,9 +487,9 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _check_daily_stop_loss(self):
-        """检查是否到达每日止损更新时间 (15:05)"""
+        """检查是否到达每日止损更新时间 (15:05之后且今日尚未执行，容忍卡顿迟到)"""
         now = datetime.now()
-        if now.hour != DAILY_STOP_LOSS_HOUR or now.minute != DAILY_STOP_LOSS_MINUTE:
+        if (now.hour, now.minute) < (DAILY_STOP_LOSS_HOUR, DAILY_STOP_LOSS_MINUTE):
             return
         if now.weekday() >= 5:
             return
@@ -496,19 +497,21 @@ class MainWindow(QMainWindow):
         today_str = now.strftime("%Y-%m-%d")
         holding_codes = self._get_holding_codes()
         for code in holding_codes:
-            if code not in self._daily_stop_loss_done:
+            if (code, today_str) not in self._daily_stop_loss_done:
                 new_stop, conflict = self.alert_engine.update_daily_stop_loss(code)
                 if conflict:
                     # 手动止损与自动计算冲突 → 弹窗确认
+                    # 同样标记今日已处理，避免每分钟重复弹窗
+                    self._daily_stop_loss_done.add((code, today_str))
                     self._show_alert_conflict(code, conflict)
                 else:
-                    self._daily_stop_loss_done.add(code)
+                    self._daily_stop_loss_done.add((code, today_str))
                     logger.info(f"[{today_str}] {code} 收盘止损更新: {new_stop:.2f}")
 
-        # 如果日期变了，清空标记
+        # 跨天时旧日期记录自动失效，只保留今日
         self._daily_stop_loss_done = {
-            c for c in self._daily_stop_loss_done
-            if c in holding_codes
+            (c, d) for c, d in self._daily_stop_loss_done
+            if d == today_str
         }
 
     def _get_holding_codes(self) -> list[str]:
@@ -983,9 +986,45 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def closeEvent(self, event):
-        """关闭窗口事件"""
+        """窗口X按钮 → 最小化到托盘，不退出应用 (真正退出走 _quit_app)"""
+        if self._quitting:
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.showMessage(
+                "A股交易辅助系统",
+                "程序已最小化到托盘，仍在后台运行。\n右键托盘图标选择「退出」可完全关闭。",
+                QSystemTrayIcon.Information,
+                3000,
+            )
+        logger.info("窗口关闭，最小化到托盘")
+
+    def _quit_app(self):
+        """托盘/菜单「退出」→ 清理后真正退出应用"""
+        if self._quitting:
+            return  # 防重入，收尾逻辑只执行一次
+        self._quitting = True
         logger.info("系统退出")
+
         self.flash_tray(False)
+
+        # 停止所有定时器
+        for timer in (self._table_display_timer, self._realtime_timer,
+                      self._buypoint_timer, self._kline_timer,
+                      self._daily_sl_timer):
+            timer.stop()
+
+        # 退出前最后flush一次今日bar到DB
+        try:
+            flushed = self.data_manager.flush_today_bars()
+            if flushed > 0:
+                logger.info(f"退出前flush: {flushed} 条今日bar写入DB")
+        except Exception as e:
+            logger.error(f"退出前flush失败: {e}")
+
         if hasattr(self, 'tray_icon'):
             self.tray_icon.hide()
-        event.accept()
+
+        QApplication.instance().quit()

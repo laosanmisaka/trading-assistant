@@ -499,8 +499,10 @@ class MarketDataManager:
 
     def flush_today_bars(self) -> int:
         """
-        将内存中的今日bar + 分钟K线批量flush到DB
+        将内存中的今日日线bar批量flush到DB
         返回写入条数
+
+        分钟K线不在此flush：refresh_minute_bars 拉取时已实时写入 klines_minute。
         """
         # 日线 bar
         with self._today_bars_lock:
@@ -511,25 +513,6 @@ class MarketDataManager:
             count += save_klines_batch(bars)
             if count > 0:
                 logger.debug(f"Flush {count} 条今日bar到DB")
-
-        # 分钟K线 (从内存 flush)
-        with self._minute_bars_lock:
-            minute_list = list(self._minute_bars.items())
-
-        for code, bars in minute_list:
-            kline_dicts = []
-            for b in bars:
-                price = b.get("price", 0)
-                kline_dicts.append({
-                    "code": code,
-                    "timestamp": b["time"],
-                    "open": price, "high": price,
-                    "low": price, "close": price,
-                    "volume": b.get("volume", 0),
-                    "period": "1min",
-                })
-            if kline_dicts:
-                count += save_klines_minute_batch(kline_dicts)
 
         self._last_flush_time = datetime.now()
         return count
