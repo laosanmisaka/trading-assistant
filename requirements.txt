@@ -17,5 +17,13 @@ numpy>=1.24.0
 # 原清单漏声明，干净环境会走 ImportError 回退路径并静默降级。
 mootdx>=0.11.0
 
+# 缠论计算（core/chan.py）。1.0.1 起核心算法改为 Rust 实现，PyPI 提供
+# 预编译 wheel（cp310-abi3），因此无需 Rust 工具链；要求 Python >= 3.10。
+# 接入代价：新增约 29 个包 / 约 300MB（polars、pyarrow、scipy、statsmodels、
+# plotly 等），并会把 requests 升到 2.3x。
+# 实测坑（amount 必需列、输入必须排序、max_bi_num 截断、FX.mark 是枚举）
+# 见 core/chan.py 模块 docstring，改之前先读。
+czsc>=1.0.1
+
 # ---- 开发/测试依赖 ----
 pytest>=8.0
