@@ -1,13 +1,17 @@
+# 依赖清单（与 requirements.txt 保持同步，改这里请同步改那边）
 channels:
   - defaults
 dependencies:
   - python=3.12
   - pip
   - pip:
+      # ---- 运行依赖 ----
       - PyQt5>=5.15.9
       - akshare>=1.14.0
-      - mplfinance>=0.12.10a0
       - matplotlib>=3.7.0
       - pandas>=2.0.0
       - numpy>=1.24.0
-      - pytest
+      # 通达信行情接口，1min 数据主数据源；原清单漏声明
+      - mootdx>=0.11.0
+      # ---- 开发/测试依赖 ----
+      - pytest>=8.0

@@ -87,10 +87,17 @@ class AlertEngine:
     ) -> Tuple[float, Optional[dict]]:
         """
         计算止损价（自动逻辑）
-        规则:
-        - 初始止损 = 买入当日最低价
-        - 每日更新: max(昨日止损, 今日最低价)  → 只上移不下移
+
+        规则 (只上移不下移的移动止损):
+        - 首次计算时, 一次性取「买入日起所有日线最低价的最大值」作为起始值。
+          这与「从买入日起逐日执行 max(昨日止损, 今日最低价)」的累积结果等价,
+          即首次计算就直接追赶到位, 而不是从买入当日最低价重新开始。
+        - 此后每日更新: max(当前止损, 今日最低价)
         - 如果存在手动设置，返回冲突信息而不自动更新
+
+        注意: 起始值基于最近 120 个交易日的日线窗口。若首次买入日早于该窗口
+        （长线持仓），起始值只覆盖窗口内的极值，会漏掉更早的历史高点，止损线
+        因此低于「买入日至今」的应有值(即更宽松)。这种情况会记录 warning。
 
         返回: (当前止损价, 冲突信息或None)
               冲突信息 = {field: 'sl', auto_value: float, manual_value: float}
@@ -119,6 +126,16 @@ class AlertEngine:
                             buy_idx = i
                             break
                     if buy_idx >= 0:
+                        # 窗口覆盖性检查: 若窗口第一根K线仍晚于买入日,
+                        # 说明买入日在 120 天窗口之外, 起始值会漏掉更早的极值
+                        window_start = str(arr["dates"][0])[:10]
+                        if window_start > first_buy_date[:10]:
+                            logger.warning(
+                                f"{code} 日线取数窗口({window_start} 起, "
+                                f"{len(arr['dates'])} 根) 未覆盖首次买入日 "
+                                f"{first_buy_date[:10]}，初始止损按窗口内极值计算，"
+                                f"可能低于应有值(更宽松)，请人工复核"
+                            )
                         initial_stop = float(arr["lows"][buy_idx])
                         for i in range(buy_idx, len(arr["lows"])):
                             initial_stop = max(initial_stop, float(arr["lows"][i]))
@@ -126,6 +143,13 @@ class AlertEngine:
                         logger.info(
                             f"{code} 初始止损={new_sl:.2f} "
                             f"(买入日{buy_idx}最低{arr['lows'][buy_idx]:.2f} → 买入后最低价最大值)"
+                        )
+                    else:
+                        logger.warning(
+                            f"{code} 首次买入日 {first_buy_date[:10]} 晚于全部日线数据"
+                            f"(共 {len(arr['dates'])} 根, 最新 "
+                            f"{str(arr['dates'][-1])[:10]})，"
+                            f"初始止损退化为今日最低价"
                         )
 
         # 用今日最低价更新

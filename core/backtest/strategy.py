@@ -1,5 +1,6 @@
 """回测策略接口 + 当前买点策略（点内时间计算，无未来函数）"""
 from abc import ABC, abstractmethod
+from datetime import date, timedelta
 from enum import Enum
 from dataclasses import dataclass
 
@@ -58,6 +59,70 @@ def _resample_weekly(daily_prefix: list[KLineData]):
     )
 
 
+class WeeklyAggregator:
+    """增量维护周线 OHLC — 结果与 _resample_weekly(daily[:i+1]) 完全一致
+
+    回测主循环需要逐日判断「周线底分型」。原先每天都对前缀做一次 pandas
+    resample，实测占回测总耗时的 86.9%（1000 天约 2.6s / 3.0s），是 O(n^2) 的主因。
+
+    这里改为增量维护：每根日线并入「当前周」，跨周时把上一周定稿。
+    与 pandas 的等价性依赖两点（已由 tests/test_backtest.py 逐日对比锁定）：
+      1. 周边界取「所在周的周日」，对应 resample("W") 的 W-SUN + closed="right"；
+      2. 无交易的周不会产生记录，对应 resample 后的 dropna()。
+    """
+
+    def __init__(self):
+        self._done: list[list[float]] = []      # 已定稿的周: [open, high, low, close]
+        self._cur: list[float] | None = None    # 当前未完成的周
+        self._cur_key: str | None = None
+        self._upto: int = -1                    # 已并入的日线索引
+
+    @staticmethod
+    def week_key(date_str) -> str:
+        """日期所属周的周日（ISO 字符串）"""
+        d = date.fromisoformat(str(date_str)[:10])
+        return (d + timedelta(days=(6 - d.weekday()) % 7)).isoformat()
+
+    def add(self, k: KLineData):
+        """并入一根日线"""
+        key = self.week_key(k.date)
+        if key != self._cur_key:
+            if self._cur is not None:
+                self._done.append(self._cur)
+            self._cur_key = key
+            self._cur = [float(k.open), float(k.high), float(k.low), float(k.close)]
+        else:
+            cur = self._cur
+            if float(k.high) > cur[1]:
+                cur[1] = float(k.high)
+            if float(k.low) < cur[2]:
+                cur[2] = float(k.low)
+            cur[3] = float(k.close)
+
+    def advance(self, daily: list[KLineData], target: int):
+        """把聚合推进到第 target 根日线（含）
+
+        允许跳跃推进：主循环在买入成交后会 i += 2 跳过一根，因此不能假设
+        每次只前进一格。
+        """
+        while self._upto < target:
+            self._upto += 1
+            self.add(daily[self._upto])
+
+    def arrays(self):
+        """返回 (highs, lows, closes, opens)，与 _resample_weekly 同序同形"""
+        if self._upto + 1 < 3:
+            # 对齐 _resample_weekly 的 len(daily_prefix) < 3 早退
+            return (np.array([]), np.array([]), np.array([]), np.array([]))
+        rows = list(self._done)
+        if self._cur is not None:
+            rows.append(self._cur)
+        if not rows:
+            return (np.array([]), np.array([]), np.array([]), np.array([]))
+        a = np.asarray(rows, dtype=float)
+        return a[:, 1], a[:, 2], a[:, 3], a[:, 0]
+
+
 class Strategy(ABC):
     """策略抽象基类 — 换策略只需继承并实现 generate_signals，引擎不动。"""
 
@@ -100,12 +165,13 @@ class BuyPointStrategy(Strategy):
         entry_price = 0.0
         stop = 0.0
         target = 0.0
+        weekly = WeeklyAggregator()
 
         i = 0
         while i < n:
             if not holding:
                 # 入场：T 日收盘确认，T+1 日开盘成交
-                if i >= 35 and self._entry_triggered(daily, i, closes, volumes):
+                if i >= 35 and self._entry_triggered(daily, i, closes, volumes, weekly):
                     if i + 1 < n:
                         fill_date = daily[i + 1].date
                         fill_price = round(float(opens[i + 1]), 2)
@@ -143,10 +209,19 @@ class BuyPointStrategy(Strategy):
 
         return signals
 
-    def _entry_triggered(self, daily, i, closes, volumes) -> bool:
-        """入场条件：周线底分型 且 日线 MACD 金叉（仅用 daily[0..i]）"""
+    def _entry_triggered(self, daily, i, closes, volumes, weekly=None) -> bool:
+        """入场条件：周线底分型 且 日线 MACD 金叉（仅用 daily[0..i]）
+
+        weekly 为增量周线聚合器，由 generate_signals 持有并跨日复用。
+        不传时回退到逐次前缀重采样 —— 两者语义完全一致（见
+        tests/test_backtest.py 的逐日一致性对比），保留此分支便于单测直接调用。
+        """
         # 条件一：周线底分型（复用 get_latest_bottom_fractal）
-        w_highs, w_lows, w_closes, _ = _resample_weekly(daily[:i + 1])
+        if weekly is not None:
+            weekly.advance(daily, i)
+            w_highs, w_lows, w_closes, _ = weekly.arrays()
+        else:
+            w_highs, w_lows, w_closes, _ = _resample_weekly(daily[:i + 1])
         cond1 = False
         if len(w_highs) >= 3:
             has_bottom, idx = get_latest_bottom_fractal(w_highs, w_lows)

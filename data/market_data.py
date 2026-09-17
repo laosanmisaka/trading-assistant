@@ -590,6 +590,34 @@ class StockSearchWorker(QThread):
             self.error_occurred.emit(traceback.format_exc())
 
 
+class StockNameSyncWorker(QThread):
+    """股票名称库同步工作线程
+
+    本地名称库未命中某代码时，用纯代码添加股票需要先触发全市场名称同步。
+    该同步含 3 次重试 + 递增 sleep（最坏 6 秒）与 3 次 AKShare 请求，
+    在 UI 线程直接调用会冻结界面，故移到此工作线程执行。
+
+    同步完成后顺带回查一次目标代码的名称，避免主线程再查一次 DB。
+    """
+    sync_done = pyqtSignal(str, str)   # (code, name)  name 为空串表示同步后仍未找到
+    sync_failed = pyqtSignal(str)      # 同步过程异常（网络等）
+
+    def __init__(self, code: str, parent=None):
+        super().__init__(parent)
+        self.code = code
+
+    def run(self):
+        try:
+            count = sync_stock_names_from_api()
+            logger.info(f"名称库同步完成: {count} 条, 回查 {self.code}")
+            from data.database import get_stock_name
+            name = get_stock_name(self.code) or ""
+            self.sync_done.emit(self.code, name)
+        except Exception:
+            logger.error(f"StockNameSyncWorker异常:\n{traceback.format_exc()}")
+            self.sync_failed.emit(traceback.format_exc())
+
+
 # ============================================================
 # 并行增量刷新 Worker (每60s, 所有已追踪股票)
 # ============================================================

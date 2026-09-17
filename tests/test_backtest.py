@@ -4,7 +4,10 @@ import datetime as dt
 import pytest
 
 from data.models import KLineData
-from core.backtest.strategy import Strategy, Action, Signal, BuyPointStrategy
+from core.backtest.strategy import (
+    Strategy, Action, Signal, BuyPointStrategy,
+    WeeklyAggregator, _resample_weekly,
+)
 from core.backtest.engine import BacktestEngine
 
 
@@ -150,3 +153,103 @@ def test_buypoint_strategy_sell_after_buy():
         assert s.action in (Action.BUY, Action.SELL)
         if s.action == Action.BUY:
             assert s.price > 0
+
+
+# ============================================================
+# 周线增量聚合 — 与 pandas 前缀重采样的等价性
+# ============================================================
+
+class TestWeeklyAggregatorEquivalence:
+    """增量周线必须与 _resample_weekly(daily[:i+1]) 逐日完全一致
+
+    generate_signals 复用同一个 WeeklyAggregator 以避免 O(n^2) 重采样，
+    前提是两者语义完全等价。回测是策略验证工具，结果失真比跑得慢危险得多，
+    所以这层等价性必须在测试里钉死。
+    """
+
+    @staticmethod
+    def random_daily(n, seed):
+        import random
+        from datetime import date, timedelta
+
+        rng = random.Random(seed)
+        out, d, price = [], date(2024, 1, 1), 10.0
+        while len(out) < n:
+            d += timedelta(days=1)
+            if d.weekday() >= 5:
+                continue
+            price *= (1 + rng.uniform(-0.03, 0.03))
+            o = price * (1 + rng.uniform(-0.01, 0.01))
+            h = max(o, price) * (1 + rng.uniform(0, 0.02))
+            l = min(o, price) * (1 - rng.uniform(0, 0.02))
+            out.append(KLineData(code="000001", date=d.isoformat(), open=o,
+                                 high=h, low=l, close=price, volume=1000,
+                                 period="daily"))
+        return out
+
+    def test_equivalent_to_prefix_resample(self):
+        """对每个前缀位置，增量结果必须等于前缀重采样结果"""
+        import numpy as np
+
+        names = ("highs", "lows", "closes", "opens")
+        for seed in range(3):
+            daily = self.random_daily(300, seed)
+            agg = WeeklyAggregator()
+            for i in range(len(daily)):
+                agg.advance(daily, i)
+                inc = agg.arrays()
+                ref = _resample_weekly(daily[:i + 1])
+                for name, a, b in zip(names, inc, ref):
+                    assert a.shape == b.shape, (
+                        f"seed={seed} i={i} {name} 长度不一致: {a.shape} vs {b.shape}")
+                    assert np.allclose(a, b, equal_nan=True), (
+                        f"seed={seed} i={i} {name} 数值不一致")
+
+    def test_advance_handles_skipped_bars(self):
+        """主循环买入后会 i += 2 跳步，advance 必须支持跳跃推进"""
+        import numpy as np
+
+        daily = self.random_daily(120, 5)
+
+        jumped = WeeklyAggregator()
+        jumped.advance(daily, 80)          # 一次性跳到第 80 根
+
+        stepwise = WeeklyAggregator()
+        for k in range(81):                # 逐根推进
+            stepwise.advance(daily, k)
+
+        assert jumped._upto == 80
+        for a, b in zip(jumped.arrays(), stepwise.arrays()):
+            assert np.allclose(a, b, equal_nan=True), "跳跃推进与逐根推进结果不一致"
+
+    def test_week_boundary_is_sunday(self):
+        """周边界取所在周的周日（对齐 pandas resample('W') 的 W-SUN / closed=right）"""
+        # 2026-09-17 为周四 → 本周周日是 09-20
+        assert WeeklyAggregator.week_key("2026-09-17") == "2026-09-20"
+        # 周日当天属于本周
+        assert WeeklyAggregator.week_key("2026-09-20") == "2026-09-20"
+        # 次周一属于下一周 → 周日是 09-27
+        assert WeeklyAggregator.week_key("2026-09-21") == "2026-09-27"
+
+
+class TestBacktestPerformance:
+    """性能基准 — 防复杂度退化
+
+    优化前为 O(n^2)（逐日对前缀做 pandas resample），实测 1000 天 3.02s；
+    改为增量周线后约 0.44s。这里用宽松上限守住量级，避免有人无意间去掉
+    增量复用或 _entry_triggered 的持仓短路。
+    """
+
+    def test_1000_days_under_budget(self):
+        import time
+
+        daily = TestWeeklyAggregatorEquivalence.random_daily(1000, 42)
+        strat = BuyPointStrategy()
+
+        t0 = time.perf_counter()
+        strat.generate_signals(daily)
+        elapsed = time.perf_counter() - t0
+
+        # 优化后实测约 0.44s；上限 2.0s 仍能在退回 O(n^2)（3.0s+）时报警
+        assert elapsed < 2.0, (
+            f"1000 天回测耗时 {elapsed:.2f}s，疑似复杂度退化回 O(n^2)")

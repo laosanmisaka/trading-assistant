@@ -178,24 +178,38 @@ class BuyPointScanner:
 # ============================================================
 
 class BuyPointScanWorker(QThread):
-    """买点扫描后台线程 — 不阻塞UI"""
-    scan_done = pyqtSignal(str, dict)  # (code, result_dict)
+    """买点扫描后台线程 — 批量串行扫描，不阻塞UI
 
-    def __init__(self, code: str, parent=None):
+    原实现为每只股票各起一个 QThread：无并发上限、无 deleteLater 回收，
+    且靠主线程计数归零来复位扫描状态（任一 worker 异常退出即永久停摆）。
+    改为单线程串行扫描：
+    - 复用同一个 BuyPointScanner（其状态按 code 分键，可安全共享）
+    - scan_done 每只股票发一次，UI 仍能逐只刷新
+    - batch_finished 在 run() 末尾必然触发，复位不依赖计数
+    """
+    scan_done = pyqtSignal(str, dict)   # (code, result_dict)
+    batch_finished = pyqtSignal(int)    # 本轮成功扫描的只数
+
+    def __init__(self, codes: list[str], parent=None):
         super().__init__(parent)
-        self.code = code
+        self.codes = list(codes)
 
     def run(self):
-        try:
-            scanner = BuyPointScanner()
-            scanner.scan(self.code, callback=self._on_result)
-        except Exception:
-            logger.error(f"BuyPointScanWorker异常 ({self.code}):\n{traceback.format_exc()}")
-            self.scan_done.emit(self.code, {
-                "code": self.code,
-                "triggered": False,
-                "error": traceback.format_exc(),
-            })
+        scanner = BuyPointScanner()
+        done = 0
+        for code in self.codes:
+            try:
+                scanner.scan(code, callback=self._on_result)
+                done += 1
+            except Exception:
+                logger.error(
+                    f"买点扫描异常 ({code}):\n{traceback.format_exc()}")
+                self.scan_done.emit(code, {
+                    "code": code,
+                    "triggered": False,
+                    "error": traceback.format_exc(),
+                })
+        self.batch_finished.emit(done)
 
     def _on_result(self, code: str, result: dict):
         """扫描完成回调（在子线程中，通过信号发回主线程）"""

@@ -26,7 +26,7 @@ from data.database import (
     is_alert_disabled, disable_alert, enable_alert,
 )
 from data.market_data import (
-    StockSearchWorker,
+    StockSearchWorker, StockNameSyncWorker,
     IncrementalRefreshWorker, InitialFetchWorker,
 )
 from data.market_data_manager import get_data_manager
@@ -629,34 +629,37 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _scan_buy_points(self):
-        """异步扫描所有跟踪股票的买点 — 仅交易时段运行"""
+        """异步扫描所有跟踪股票的买点 — 仅交易时段运行
+
+        单 worker 串行扫描。原实现为每只股票各起一个 QThread：无并发上限、
+        无回收，且靠主线程计数归零复位（任一 worker 异常退出即永久停摆）。
+        """
         if not is_trading_time():
             return
         codes = self._get_all_tracked_codes()
         if not codes:
             return
 
-        # 防止重复触发
-        if getattr(self, '_bp_scanning', False):
-            logger.debug("上一轮买点扫描尚未完成，跳过")
-            return
-        self._bp_scanning = True
-        self._bp_scan_pending = 0
+        # 防止重复触发：以上一轮 worker 是否仍在运行作为唯一判据
+        prev = getattr(self, '_bp_worker', None)
+        if prev is not None:
+            try:
+                if prev.isRunning():
+                    logger.debug("上一轮买点扫描尚未完成，跳过")
+                    return
+            except RuntimeError:
+                pass  # 底层对象已随 deleteLater 销毁
 
-        logger.info(f"开始异步买点扫描: {len(codes)} 只股票")
-        for i, code in enumerate(codes):
-            worker = BuyPointScanWorker(code)
-            worker.scan_done.connect(self._on_buy_point_result)
-            worker.scan_done.connect(lambda c, r, w=worker: self._on_scan_worker_done(w))
-            worker.start()
-            self._bp_scan_pending += 1
+        logger.info(f"开始异步买点扫描: {len(codes)} 只股票（单线程串行）")
+        self._bp_worker = BuyPointScanWorker(codes)
+        self._bp_worker.scan_done.connect(self._on_buy_point_result)
+        self._bp_worker.batch_finished.connect(self._on_buy_point_scan_finished)
+        self._bp_worker.finished.connect(self._bp_worker.deleteLater)
+        self._bp_worker.start()
 
-    def _on_scan_worker_done(self, worker):
-        """单个买点扫描worker完成"""
-        self._bp_scan_pending -= 1
-        if self._bp_scan_pending <= 0:
-            self._bp_scan_pending = 0
-            self._bp_scanning = False
+    def _on_buy_point_scan_finished(self, done: int):
+        """一轮买点扫描结束 — 无论是否有个股异常，run() 末尾都会触发"""
+        logger.info(f"买点扫描轮次结束: 成功扫描 {done} 只")
 
     def _on_buy_point_result(self, code: str, result: dict):
         """买点扫描结果回调（主线程）"""
@@ -815,9 +818,8 @@ class MainWindow(QMainWindow):
             self._search_worker.start()
 
     def _try_add_by_code(self, code: str):
-        """纯代码添加: DB有→弹窗确认→添加; DB没有→全量同步→再查"""
+        """纯代码添加: DB有→弹窗确认→添加; DB没有→异步同步名称库→回查后再添加"""
         from data.database import get_stock_name
-        from data.market_data import sync_stock_names_from_api
 
         name = get_stock_name(code)
         if name:
@@ -833,15 +835,42 @@ class MainWindow(QMainWindow):
                 logger.info(f"用户取消添加 {code}")
             return
 
-        # DB中没有 → 触发全量同步
-        logger.info(f"本地无 {code}，触发全量名称同步...")
-        self.status_bar.showMessage("正在同步股票名称库...")
-        sync_stock_names_from_api()
-        name = get_stock_name(code)
+        # DB中没有 → 异步全量同步
+        # (该同步含 3 次 AKShare 请求 + 递增 sleep，同步执行会冻结 UI 十秒以上)
+        prev = getattr(self, '_name_sync_worker', None)
+        if prev is not None and prev.isRunning():
+            self.status_bar.showMessage("股票名称库正在同步中，请稍候...", 3000)
+            logger.debug(f"{code} 添加请求跳过: 上一轮名称库同步尚未完成")
+            return
+
+        logger.info(f"本地无 {code}，触发异步全量名称同步...")
+        self.status_bar.showMessage(
+            f"本地无 {code}，正在同步股票名称库（可能需要数十秒）...")
+
+        self._name_sync_worker = StockNameSyncWorker(code)
+        self._name_sync_worker.sync_done.connect(self._on_name_sync_done)
+        self._name_sync_worker.sync_failed.connect(self._on_name_sync_failed)
+        self._name_sync_worker.finished.connect(self._name_sync_worker.deleteLater)
+        self._name_sync_worker.start()
+
+    def _on_name_sync_done(self, code: str, name: str):
+        """名称库同步完成 → 按回查结果添加或提示"""
         if name:
+            self.status_bar.showMessage(f"名称库已同步: {code} {name}", 5000)
             self._do_add_stock(code, name)
         else:
+            self.status_bar.showMessage(f"未找到代码 {code}", 5000)
             QMessageBox.warning(self, "未找到", f"未找到代码 {code}，请检查后重试。")
+
+    def _on_name_sync_failed(self, err: str):
+        """名称库同步异常 → 明确告知调用方，不再静默"""
+        logger.error(f"股票名称库同步失败: {err}")
+        self.status_bar.showMessage("股票名称库同步失败", 5000)
+        QMessageBox.warning(
+            self, "同步失败",
+            "股票名称库同步失败（通常是网络问题）。\n"
+            "请稍后重试，或改用名称搜索添加。",
+        )
 
     def _do_add_stock(self, code: str, name: str):
         """添加股票到DB，启动独立全量数据获取 (不阻塞增量刷新)"""

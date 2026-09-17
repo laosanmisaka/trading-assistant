@@ -9,6 +9,40 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+# ============================================================
+# 网络测试开关
+# ------------------------------------------------------------
+# 依赖真实外网（AKShare / 通达信）的测试统一打 @pytest.mark.network，
+# 默认跳过，保证测试套件在离线与 CI 环境可稳定运行。
+# 需要验证真实数据源时: pytest --run-network
+# ============================================================
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-network",
+        action="store_true",
+        default=False,
+        help="运行标记为 network 的测试（需要真实外网访问）",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "network: 需要真实网络访问（默认跳过，用 --run-network 启用）",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-network"):
+        return
+    skip_network = pytest.mark.skip(
+        reason="需要真实网络访问；用 --run-network 启用")
+    for item in items:
+        if "network" in item.keywords:
+            item.add_marker(skip_network)
+
+
 @pytest.fixture
 def temp_db(monkeypatch):
     """使用临时数据库，测试后自动清理（不影响项目真实数据库）"""
@@ -39,3 +73,15 @@ def db_conn(temp_db):
     conn = _connect()
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def no_network(monkeypatch):
+    """切断网络名称同步，使测试不依赖外网
+
+    用于「测试意图与网络无关、但间接触发全市场名称同步」的用例，
+    避免 3 次重试 + 递增 sleep 把测试拖到超时。
+    """
+    import data.market_data as md
+    monkeypatch.setattr(md, "sync_stock_names_from_api", lambda: 0)
+    return 0

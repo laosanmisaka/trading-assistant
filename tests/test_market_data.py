@@ -49,11 +49,18 @@ class TestSearchLocalDB:
         assert "000001" in codes
         assert "601318" in codes
 
-    def test_search_no_match(self, temp_db):
+    def test_search_no_match(self, temp_db, monkeypatch):
+        """本地库无匹配 → 走 API 回退 → 回退无结果时返回空列表
+
+        显式切断 API 回退，避免依赖外网（原实现联网时才能通过）。
+        """
+        import data.market_data as md
+        monkeypatch.setattr(md, "_search_stock_from_api", lambda kw: [])
         save_stock_names_batch([{"code": "000001", "name": "平安银行"}])
         results = search_stock("ZZZZZ")
         assert len(results) == 0
 
+    @pytest.mark.network
     def test_search_empty_db_falls_back_to_api(self, temp_db):
         """本地数据库为空时尝试API (可能因网络失败但不应崩溃)"""
         # 确保DB为空
@@ -142,6 +149,7 @@ class TestFallbackWhenQuotesUnavailable:
         assert merged["600519"].price == 0.0     # stub
 
 
+@pytest.mark.network
 class TestKLineFetch:
     """测试K线获取 (需要网络)"""
 
@@ -166,6 +174,7 @@ class TestKLineFetch:
         assert klines[0].period == "monthly"
 
 
+@pytest.mark.network
 class TestSingleStockQuote:
     """单股增量行情获取"""
 
@@ -186,7 +195,10 @@ class TestSingleStockQuote:
 class TestIncrementalRefreshWorker:
     """并行增量刷新 — 多只股票并行获取"""
 
-    def test_worker_fetches_multiple_codes(self, monkeypatch):
+    def test_worker_fetches_multiple_codes(self, temp_db, monkeypatch):
+        """注意 temp_db: 原实现未隔离数据库，worker 会写真实库
+        （真实库中残留的空 stock_names 表即是该痕迹），
+        且在真实库未初始化时报 'no such table: klines'。"""
         from data.market_data import IncrementalRefreshWorker
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import QEventLoop, QTimer
@@ -234,6 +246,7 @@ class TestIncrementalRefreshWorker:
         assert len(results) == 0
 
 
+@pytest.mark.network
 class TestInitialFetchWorker:
     """新股全量数据获取 — 独立于增量刷新"""
 
@@ -298,25 +311,47 @@ class TestExceptionHandling:
         finally:
             sys.excepthook = orig
 
-    def test_worker_exception_logs_traceback(self, tmp_path):
-        """Worker 异常时打印完整堆栈"""
+    def test_worker_exception_logs_traceback(self, tmp_path, monkeypatch):
+        """Worker 异常时打印完整堆栈
+
+        直接让 search_stock 抛异常，确认 worker 吞掉异常并通过 error_occurred
+        把 traceback 送回主线程，而不是崩溃或静默。
+        （原实现依赖 search_stock 的真实网络失败路径：离线时会被 API 回退的
+          3 次重试 + 递增 sleep 拖过下方 5 秒等待窗口，导致误报失败。）
+        """
         from data.market_data import StockSearchWorker
+        import data.market_data as md
         import traceback as tb
 
-        # 创建一个必然失败的 worker (search_stock 内部会抛异常)
+        def _boom(keyword):
+            raise RuntimeError("模拟数据源故障")
+
+        monkeypatch.setattr(md, "search_stock", _boom)
+
         # 只验证 worker 不会因异常而崩溃
         from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtCore import QEventLoop, QTimer
         import sys
         app = QApplication.instance() or QApplication(sys.argv)
 
         error_msgs = []
         worker = StockSearchWorker("ZZZZ_NONEXISTENT_KEYWORD_99999")
-        worker.error_occurred.connect(lambda m: error_msgs.append(m))
+
+        # 必须用事件循环等待：error_occurred 是跨线程排队投递的信号，
+        # 主线程若被 wait() 阻塞，信号永远得不到处理，error_msgs 会一直是空的。
+        loop = QEventLoop()
+        worker.error_occurred.connect(
+            lambda m: (error_msgs.append(m), loop.quit()))
+        worker.finished.connect(loop.quit)
+        QTimer.singleShot(5000, loop.quit)
         worker.start()
-        worker.wait(5000)
+        loop.exec_()
+        worker.wait(2000)
 
         # Worker应正常结束不崩溃，error_occurred信号携带了traceback
         assert not worker.isRunning()
+        assert error_msgs, "worker 异常后应通过 error_occurred 返回 traceback"
+        assert "模拟数据源故障" in error_msgs[0]
 
 
 class TestChartRefresh:

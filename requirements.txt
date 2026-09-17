@@ -1,6 +1,21 @@
+# 依赖清单（与 environment.yml 保持同步，改这里请同步改那边）
+#
+# 版本策略: 使用 >= 下限而非锁死，避免阻碍安全更新。
+#           akshare 历史上存在频繁的不兼容变更，升级后请先跑 tests/ 再提交。
+#           需要完全可复现的环境时，用 pip freeze > requirements-lock.txt 生成锁文件。
+#
+# 已验证可用的组合 (2026-09-17):
+#   PyQt5 5.15.11 / pandas 3.0.5 / numpy 2.5.3 / pytest 9.1.1
+
+# ---- 运行依赖 ----
 PyQt5>=5.15.9
 akshare>=1.14.0
-mplfinance>=0.12.10a0
 matplotlib>=3.7.0
 pandas>=2.0.0
 numpy>=1.24.0
+# 通达信行情接口，1min 数据主数据源（data/market_data.py）。
+# 原清单漏声明，干净环境会走 ImportError 回退路径并静默降级。
+mootdx>=0.11.0
+
+# ---- 开发/测试依赖 ----
+pytest>=8.0
