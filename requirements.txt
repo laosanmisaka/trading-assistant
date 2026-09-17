@@ -27,3 +27,8 @@ czsc>=1.0.1
 
 # ---- 开发/测试依赖 ----
 pytest>=8.0
+
+# ---- 随仓库的静态资源 ----
+# resources/echarts.min.js（ECharts 5.6.0，约 1.0MB）供 core/chan_viz.py 内联生成
+# 离线可看的缠论标注图（python visualize_chan.py sh688981）。已入库，
+# 不需要通过包管理器安装；不依赖 CDN，断网也能打开生成结果。
