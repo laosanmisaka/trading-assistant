@@ -108,10 +108,19 @@ class BuyPointScanner:
         has_bottom, idx = get_latest_bottom_fractal(w_arr["highs"], w_arr["lows"])
 
         if has_bottom and idx >= len(weekly_klines) - 4:
-            # 确认: 底分型第三K线收盘 > 底分型最低价
-            if idx + 2 < len(w_arr["closes"]):
-                bottom_low = w_arr["lows"][idx + 1]
-                confirm_close = w_arr["closes"][idx + 2]
+            # 确认: 底分型第三K线(右侧K线)收盘 > 底分型最低价
+            #
+            # idx 的语义见 core/technical.py:detect_bottom_fractal ——
+            # 它是「分型最低价实际所在的原始K线」，即三根中的中间那根。
+            # 故「第三K线」= idx + 1，「底分型最低价」= lows[idx]。
+            #
+            # 注意(2026-09-17)：在底分型定义下 lows[idx+1] > lows[idx]，
+            # 且收盘价恒 >= 当日最低价，因此本条件恒成立 ——
+            # 该函数实际等价于「最近 4 根周线内存在底分型」。
+            # 若需要更严格的二买确认规则，见 docs/KNOWN_ISSUES.md KI-004。
+            if idx + 1 < len(w_arr["closes"]):
+                bottom_low = w_arr["lows"][idx]
+                confirm_close = w_arr["closes"][idx + 1]
                 return confirm_close > bottom_low
             return True
         return False
