@@ -10,6 +10,7 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.collections import LineCollection, PolyCollection
 import matplotlib.font_manager as fm
 
 from config import MA_PERIODS, CHART_COLORS
@@ -328,14 +329,36 @@ class ChartTabWidget(QWidget):
         width = max(0.3, min(0.8, 200.0 / max(n, 1)))
 
         # --- 上栏: K线 + MA ---
-        for i, (_idx, row) in enumerate(df.iterrows()):
-            color = CHART_COLORS["up"] if row["Close"] >= row["Open"] else CHART_COLORS["down"]
-            ax1.plot([i, i], [row["Low"], row["High"]], color=color, linewidth=0.8)
-            body_bottom = min(row["Open"], row["Close"])
-            body_height = abs(row["Close"] - row["Open"])
-            if body_height < 0.0001:
-                body_height = max(row["High"] - row["Low"], 0.001)
-            ax1.bar(i, body_height, width=width, bottom=body_bottom, color=color, alpha=0.9)
+        # 批量绘制: 影线用 LineCollection、实体用 PolyCollection，各只产出 1 个 artist。
+        # 原实现逐根 ax1.plot(...) + ax1.bar(...)：250 根 ≈ 500 个 artist，
+        # 缩放/重绘时 matplotlib 要逐个 artist 走一遍布局与变换，是滚轮卡顿的主因。
+        # add_collection 会把几何纳入 dataLim，因此自动缩放行为与逐根绘制一致。
+        opens = df["Open"].to_numpy(dtype=float)
+        highs = df["High"].to_numpy(dtype=float)
+        lows = df["Low"].to_numpy(dtype=float)
+        closes = df["Close"].to_numpy(dtype=float)
+        x = np.arange(n)
+        is_up = closes >= opens
+        candle_colors = np.where(is_up, CHART_COLORS["up"], CHART_COLORS["down"])
+
+        # 影线: 每根一条竖线
+        ax1.add_collection(LineCollection(
+            [((xi, lo), (xi, hi)) for xi, lo, hi in zip(x, lows, highs)],
+            colors=candle_colors, linewidths=0.8))
+
+        # 实体: 平开平收时高度退化为整根高低区间（与原先逐根绘制的处理保持一致）
+        body_bottom = np.minimum(opens, closes)
+        body_height = np.abs(closes - opens)
+        flat = body_height < 0.0001
+        if flat.any():
+            body_height = np.where(flat, np.maximum(highs - lows, 0.001), body_height)
+        half = width / 2.0
+        ax1.add_collection(PolyCollection(
+            [((xi - half, b), (xi + half, b),
+              (xi + half, b + h), (xi - half, b + h))
+             for xi, b, h in zip(x, body_bottom, body_height)],
+            facecolors=candle_colors, edgecolors=candle_colors,
+            linewidths=0.0, alpha=0.9))
 
         # MA线
         for period in MA_PERIODS:
@@ -388,9 +411,14 @@ class ChartTabWidget(QWidget):
                 tick_labels.append(str(idx_val)[:10])
 
         # --- 下栏: 成交量 ---
-        colors_vol = [CHART_COLORS["volume_up"] if row["Close"] >= row["Open"]
-                      else CHART_COLORS["volume_down"] for _, row in df.iterrows()]
-        ax2.bar(range(n), df["Volume"].values, color=colors_vol, width=width, alpha=0.7)
+        # 同样批量绘制: 250 个矩形 → 1 个 PolyCollection
+        vol = df["Volume"].to_numpy(dtype=float)
+        vol_colors = np.where(is_up, CHART_COLORS["volume_up"], CHART_COLORS["volume_down"])
+        ax2.add_collection(PolyCollection(
+            [((xi - half, 0.0), (xi + half, 0.0), (xi + half, v), (xi - half, v))
+             for xi, v in zip(x, vol)],
+            facecolors=vol_colors, edgecolors=vol_colors,
+            linewidths=0.0, alpha=0.7))
         ax2.set_ylabel("成交量", fontfamily=_CHINESE_FONT)
         ax2.set_xticks(tick_idx)
         ax2.set_xticklabels(tick_labels, rotation=30, fontsize=7,
