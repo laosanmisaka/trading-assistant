@@ -102,6 +102,10 @@ def _load_czsc():
     return czsc
 
 
+# 公开别名：其它模块（如 core/chan_strategy.py）需要自行加载 czsc 时用这个
+load_czsc = _load_czsc
+
+
 def _freq_of(period: str):
     czsc = _load_czsc()
     name = _FREQ_NAMES.get(period)
