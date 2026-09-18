@@ -1,6 +1,7 @@
 """缠论计算桥接层 — 基于 czsc（缠中说禅技术分析工具）
 
-本模块把项目的 `KLineData` 适配到 czsc，并统一暴露「分型 / 笔 / 中枢」。
+本模块把项目的 `KLineData` 适配到 czsc，并统一暴露「分型 / 笔 / 中枢」，
+另提供日线合成（`resample_daily` / `df_to_klines`）供策略与可视化共用。
 
 --------------------------------------------------------------------
 czsc 1.0.1 实测约束（改这个文件之前先读完）
@@ -162,6 +163,38 @@ def klines_to_df(klines: Iterable[KLineData]):
             .drop_duplicates(subset=["dt"], keep="last")
             .reset_index(drop=True))
     return df[_DF_COLUMNS]
+
+
+def resample_daily(df):
+    """分钟 K 线 DataFrame → 日线 DataFrame（dt/open/high/low/close/vol）
+
+    按自然日 `resample("1D")` 后 `dropna`，因此非交易日不产出行 —— A 股
+    非交易日无成交，与交易所日历等价。
+
+    2026-09-18 从 `core/chan_viz.py` 上移到这里：几何买卖点策略需要
+    「日线 czsc 对象」（算日线一买/二买），可视化层也要，两处共用一份
+    实现，避免各自维护。
+    """
+    return (df.set_index("dt")
+              .resample("1D")
+              .agg(open=("open", "first"), high=("high", "max"),
+                   low=("low", "min"), close=("close", "last"),
+                   vol=("vol", "sum"))
+              .dropna()
+              .reset_index())
+
+
+def df_to_klines(df, period: str = "30min", code: str = "") -> list[KLineData]:
+    """DataFrame → KLineData 序列（`klines_to_df` 的逆向）
+
+    供「拿合成出来的日线 DataFrame 再建一个 czsc 对象」这类场景使用
+    （2026-09-18 从 `core/chan_viz.py::_to_klines` 上移）。
+    行序原样保留 —— `build()` 内部会按 dt 排序去重。
+    """
+    return [KLineData(code=code or "UNKNOWN", date=str(r.dt), open=float(r.open),
+                      high=float(r.high), low=float(r.low), close=float(r.close),
+                      volume=int(r.vol), period=period)
+            for r in df.itertuples()]
 
 
 @dataclass

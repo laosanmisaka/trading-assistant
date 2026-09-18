@@ -16,8 +16,8 @@
 | 分型 | `CZSC.fx_list` | 顶/底分型散点（默认收起） |
 | 日线买卖点 | `chan_points` 几何 | **主图层**：一/二/三 买与卖，位置在笔端点 |
 | 30 分钟买卖点 | `chan_points` 几何 | 次图层，默认关闭（数量多、噪声大） |
-| 策略日线条件 | `chan_strategy` 信号 | 竖线：日线一买 / 日线二买「生效日」 |
-| 策略买卖点 | `chan_strategy.scan` | 三重共振触发 + 均线卖出 |
+| 策略日线条件 | `chan_points` 几何 | 竖线：日线一买 / 日线二买「生效日」（笔终点次日） |
+| 策略买卖点 | `chan_strategy.scan` | 三重共振触发 + 均线卖出（几何源，默认） |
 | 策略命中二买 | `chan_strategy` | 被策略真正用到的那个 30 分钟二买 bar |
 
 ======================================================================
@@ -45,18 +45,22 @@
    几何定义见 `core/chan_points.py`。卖点位置就是笔的端点（分型极值），
    所以图上的标记与笔的折线拐点严格重合。
 
-2. **日线信号取「当日首根 bar 的值」，策略日线条件因此滞后 1 个交易日。**
+2. **策略层与买卖点标记同源（都是几何判定）。**
 
-   实测 418 个交易日中有 45 天，czsc 的日线二买会在**同一交易日内翻转**
-   （当天日线 bar 未走完）。本图对日线信号按交易日取首根 bar 的值，
-   它等价于「上一交易日收盘确认」的状态：实盘开盘即可读，无未来函数。
+   2026-09-18 老三定：策略不再用 czsc 的 `cxt_*` 择时信号，改用上面那套
+   几何买卖点。所以图上的「策略买点/卖点」和「几何买卖点」现在是**同一个人
+   算出来的**，不会再出现两套口径各标一套点的情况。
 
-   注意这只影响**策略的日线条件**（竖线）；几何买卖点不受此限制。
+   日线点的**生效日延后一个交易日**（`chan_strategy._effective_day`）：
+   日线笔的终点落在交易日 T 的收盘价上，而「它成立」要等 T 收盘才知道 ——
+   直接拿 T 当生效日就是 1 个交易日的未来函数。图上那两条竖线（紫=一买、
+   橙=二买）画的就是这个生效日。
 
-3. **前 `init_n` 根（默认 500）是策略信号的预热区间。**
+3. **没有预热区间了。**
 
-   只有 czsc 信号（策略用）需要预热；几何买卖点由全量笔/中枢算出，
-   在全图上都有。图上用浅灰底纹标出预热区间。
+   早期版本的浅灰底纹标的是 czsc 信号源前 `init_n`（默认 500）根的预热区
+   —— 那段里 `cxt_*` 不出信号。策略改几何源后没有这个截断（几何点由全量
+   笔/中枢算出），底纹已删除，`--init-n` 参数一并去掉。
 
 ======================================================================
 性能（"拖着拖着就卡住"的处理）
@@ -94,7 +98,7 @@ import pandas as pd
 
 from core import chan as chan_mod
 from core import chan_points
-from core.chan_strategy import DEFAULT_INIT_N, scan as scan_strategy
+from core import chan_strategy
 from data.models import KLineData
 from utils.logger import get_logger
 
@@ -127,7 +131,6 @@ STYLE = {
             "一卖": "#4db6ac", "二卖": "#81c784", "三卖": "#a5d6a7"},
     "strategy_buy": "#d32f2f", "strategy_sell": "#2e7d32",
     "strategy_hit": "#1565c0",
-    "warmup": "rgba(0,0,0,0.04)",
 }
 
 # 图例顺序
@@ -273,22 +276,13 @@ def _find_column(columns: Iterable[str], prefix: str, *tokens: str) -> Optional[
 
 
 def _resample_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """30 分钟 → 日线（open/high/low/close/vol）"""
-    d = (df.set_index("dt")
-           .resample("1D")
-           .agg(open=("open", "first"), high=("high", "max"),
-                low=("low", "min"), close=("close", "last"),
-                vol=("vol", "sum"))
-           .dropna()
-           .reset_index())
-    return d
+    """30 分钟 → 日线（实现已上移到 `core.chan.resample_daily`，此处保留旧名）"""
+    return chan_mod.resample_daily(df)
 
 
 def _to_klines(df: pd.DataFrame, period: str, code: str) -> list[KLineData]:
-    return [KLineData(code=code or "UNKNOWN", date=str(r.dt), open=float(r.open),
-                      high=float(r.high), low=float(r.low), close=float(r.close),
-                      volume=int(r.vol), period=period)
-            for r in df.itertuples()]
+    """DataFrame → KLineData（实现已上移到 `core.chan.df_to_klines`）"""
+    return chan_mod.df_to_klines(df, period=period, code=code)
 
 
 def _daily_point_to_bar(day, price: float, side: str,
@@ -321,7 +315,6 @@ def build_payload(
     *,
     period: str = "30min",
     name: str = "",
-    init_n: int = DEFAULT_INIT_N,
     ma_short: int = 5,
     ma_long: int = 10,
 ) -> dict:
@@ -450,8 +443,18 @@ def build_payload(
     ma10 = tmp["day"].map(ma_l).tolist()
 
     # ---- 5. 策略结果 ----
-    strat = scan_strategy(klines, code=code, init_n=init_n,
-                          ma_short=ma_short, ma_long=ma_long)
+    # 策略层 2026-09-18 起默认走**几何源**（`chan_points` 的判定），不再用
+    # czsc 的 `cxt_*` 择时信号。这里复用本函数已经建好的两套缠论结构
+    # （cr / cr_d）直接推点事件，不再让策略层重建一遍 czsc 对象 ——
+    # 建对象是全链路最慢的一步。
+    geo = chan_strategy.points_from_structures(
+        bis_raw, centers_raw,
+        chan_mod.bis(cr_d) if cr_d else [],
+        chan_mod.centers(cr_d) if cr_d else [],
+        days, sorted(set(days)), dt_list)
+    strat = chan_strategy.scan_from_frame(
+        df, code=code, source=chan_strategy.SOURCE_GEOMETRY, points=geo,
+        ma_short=ma_short, ma_long=ma_long)
 
     def _day_first_idx(day) -> int:
         rng = day_range.get(pd.Timestamp(day).date())
@@ -522,8 +525,6 @@ def build_payload(
             "period_label": PERIOD_LABEL.get(period, period),
             "bars": n,
             "trading_days": int(len(day_close)),
-            "init_n": init_n,
-            "warmup": min(init_n, n),
             "ma_short": ma_short,
             "ma_long": ma_long,
             "first_dt": dates[0],
@@ -534,7 +535,6 @@ def build_payload(
             "m30_points": {k: len(v) for k, v in pack(pts_m30).items()},
         },
         "style": STYLE,
-        "warmup": min(init_n, n),
         "price_min": round(min(lo), 3),
         "price_max": round(max(h), 3),
         "dates": dates,
@@ -649,20 +649,17 @@ POINT_KEYS.forEach(function (k) {
   (isBuy ? dailyBuy : dailySell).push([k, pts]);
 });
 
-// ---- 区域标注：预热底纹 + 两级中枢（都用 markArea，silent 不参与 hover） ----
+// ---- 区域标注：两级中枢（markArea，silent 不参与 hover） ----
 // 注意 xAxis 用类目值（日期字符串）而不是下标数字：category 轴上类目值
 // 是确定可匹配的，数字下标在不同 ECharts 版本里解释不一致。
+// （旧版这里还有「预热底纹」—— 那是给 czsc `cxt_*` 信号源画的前 init_n 根
+//  禁区。策略改几何源后没有预热截断，底纹已删除。）
 function boxes(src) {
   return (src || []).map(function (z) {
     return [{xAxis: dates[z[0]], yAxis: z[2]},
             {xAxis: dates[z[1]], yAxis: z[3]}];
   });
 }
-var warmupArea = CFG.warmup > 1 ? [[
-  {xAxis: dates[0], yAxis: CFG.price_min,
-   itemStyle: {color: ST.warmup, borderWidth: 0}},
-  {xAxis: dates[CFG.warmup - 1], yAxis: CFG.price_max}
-]] : [];
 
 // 中枢分两层（日线级别 / 30 分钟笔中枢），各挂在一个「无数据的散点系列」上。
 // markArea 属于 series —— 挂到 K 线上就只能有一个开关，分不了层。
@@ -697,12 +694,8 @@ var series = [
     data: bars.map(function (b) { return [b[O], b[C], b[L], b[H]]; }),
     itemStyle: {color: ST.up, color0: ST.down,
       borderColor: ST.up, borderColor0: ST.down},
-    // 中枢改用 markArea 挂在 K 线上（原实现用 custom 系列 + renderItem，
-    // dataZoom 每帧重跑 renderItem，是拖动卡顿的主因）。
-    // 这里只剩「预热底纹」—— 中枢已拆成上面两个独立图层。
-    markArea: warmupArea.length ? {
-      silent: true, animation: false, data: warmupArea
-    } : undefined,
+    // 中枢用 markArea 挂在「无数据的散点系列」上（原实现用 custom 系列 +
+    // renderItem，dataZoom 每帧重跑 renderItem，是拖动卡顿的主因）。
     markLine: lineData.length ? {
       silent: true, symbol: 'none', animation: false, label: {show: false},
       data: lineData
@@ -1005,22 +998,20 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
         "交替、笔序号在 9→5→11 间跳），按关键字计数会把状态抖动数成买点。</li>"
         "<li><b>日线级别是主图层</b>（大三角），<b>30 分钟级别默认关闭</b>"
         "（图例点开）。</li>"
-        "<li><b>紫色/橙色竖线</b>是策略用的日线条件「生效日」，取"
-        "「当日首根 bar 上的日线值」，等价于上一交易日收盘确认的状态。"
-        "实测日线信号在日内会翻转（418 个交易日中 45 天），所以不能取"
-        "当天任意时点的值。这个取法实盘开盘即可读，<b>无未来函数</b>，"
-        "代价是滞后 1 个交易日。</li>"
+        "<li><b>紫色/橙色竖线</b>是策略用的日线条件「生效日」：日线一买 / "
+        "二买落在笔的终点（某交易日 T 的收盘价），而「它成立」这件事要等"
+        "T 收盘才知道 —— 生效日因此取 <b>T 的次一交易日</b>，直接拿 T 当"
+        "生效日就是 1 个交易日的未来函数。</li>"
         "<li><b>蓝色虚线方框</b>是策略真正命中的那个 30 分钟二买 bar；"
-        "<b>策略买点</b>＝日线一买 → 15 个交易日内日线二买 → 2 个交易日内 "
-        "该二买 bar 收盘确认，成交顺延 1 根 bar；<b>策略卖点</b>＝收盘破"
-        "日线 MA5 后改用 MA10、两条都被跌破后卖出，成交顺延 1 个交易日。</li>"
+        "<b>策略买点</b>＝日线一买 → 40 个交易日内出现日线二买 → 该二买"
+        "前后各 10 个交易日内出现 30 分钟二买；三条<b>全部确认</b>后才成交，"
+        "再顺延 1 根 bar（等 bar 收盘）。<b>策略卖点</b>＝收盘破日线 MA5 后"
+        "改用 MA10、两条都被跌破后卖出，成交顺延 1 个交易日。</li>"
         "<li><b>每笔买点独立成一笔交易，允许重叠持仓</b>（前一笔没平仓，"
         "新买点照开）。所以上方的 胜率 / 平均收益 是<b>按笔统计</b>，"
         "<b>不是资金曲线</b> —— 同一时刻多笔持仓时，这些收益不能相加成"
         "组合收益。顶部「最大同时持仓」标出实际重叠了几笔，大于 1 时标红。"
         "这是为了先把「信号本身对不对」验清楚，资金约束留到组合回测再接。</li>"
-        f"<li>左侧浅灰底纹是 <b>czsc 预热区间（前 {payload['warmup']} 根）</b>："
-        "只有策略用的信号需要预热，几何买卖点由全量笔/中枢算出，不受影响。</li>"
         "</ol>"
         "<div style='margin-top:6px;color:#888'>"
         "行情：新浪财经前复权分钟 K 线；缠论：czsc 1.0.1 "
@@ -1045,7 +1036,7 @@ def save_html(html: str, out_path) -> Path:
 
 
 def generate(code: str, out_path=None, *, period: str = "30min",
-             init_n: int = DEFAULT_INIT_N, ma_short: int = 5,
+             ma_short: int = 5,
              ma_long: int = 10, echarts_path: Optional[str] = None,
              name: Optional[str] = None,
              klines: Optional[Sequence[KLineData]] = None) -> Path:
@@ -1055,7 +1046,7 @@ def generate(code: str, out_path=None, *, period: str = "30min",
     if not name:
         name = stock_name(code)
     payload = build_payload(klines, code=code, period=period, name=name,
-                            init_n=init_n, ma_short=ma_short, ma_long=ma_long)
+                            ma_short=ma_short, ma_long=ma_long)
     html = render_html(payload, echarts_path=echarts_path)
     if out_path is None:
         out_path = Path("outputs") / f"chan_{payload['meta']['code']}_{period}.html"
@@ -1076,14 +1067,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out", default=None, help="输出 HTML 路径")
     ap.add_argument("--name", default=None,
                     help="股票简称（默认联网取，取不到就用代码）")
-    ap.add_argument("--init-n", type=int, default=DEFAULT_INIT_N,
-                    help=f"czsc 预热根数（默认 {DEFAULT_INIT_N}）")
     ap.add_argument("--ma-short", type=int, default=5)
     ap.add_argument("--ma-long", type=int, default=10)
     args = ap.parse_args(argv)
 
     path = generate(args.code, args.out, period=args.period,
-                    init_n=args.init_n, ma_short=args.ma_short,
+                    ma_short=args.ma_short,
                     ma_long=args.ma_long, name=args.name)
     print(path)
     return 0

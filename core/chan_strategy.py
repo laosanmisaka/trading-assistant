@@ -1,22 +1,57 @@
 """缠论多周期共振策略 —— 日线一买 → 日线二买 → 30 分钟二买，均线卖出
 
 ======================================================================
-策略定义（老三 2026-09-17 确认）
+策略定义（老三 2026-09-18 重定，窗口按实测重标定）
 ======================================================================
 
-**买点**：三重条件，有顺序、有时间窗
+**买点**：三重条件，有时间窗
 
-1. 日线出现**一买**
-2. 一买之后 **15 个交易日内**出现**日线二买**
-3. 日线二买之后 **2 个交易日内**出现 **30 分钟二买**
+1. 日线出现**一买**（几何判定，见 `core/chan_points.py`）
+2. 一买之后 **40 个交易日内**出现**日线二买**
+3. 日线二买**前后各 10 个交易日内**出现 **30 分钟二买**
 
-三条依次满足的那一刻（30 分钟 bar 收盘）即为买点。
+三条**全部确认**的那一刻即为买点，成交再顺延 `entry_delay_bars` 根
+30 分钟 bar（等 bar 收盘）。
 
 **卖点**：买入后以日线均线作移动止损
 
 默认 MA5；若收盘价跌破 MA5 但 MA10 仍完好，则改用 MA10 继续持有；
 MA5、MA10 **双双被跌破**后卖出。
 即"智能选取那条一直沿着上涨、没有被跌破的 5 日或 10 日均线"。
+
+----------------------------------------------------------------------
+窗口为什么是 40 / ±10（2026-09-18 实测重标定，改之前先看这组数字）
+----------------------------------------------------------------------
+
+原口径是「一买后 15 个交易日内出二买 → 二买后 2 个交易日内出 30 分钟二买」，
+那是为 czsc `cxt_*` 的**密集 bar 状态**设计的（一次"日线二买"状态连续覆盖
+几十上百根 bar，随便一个窗口都能捞到）。换成**稀疏的点事件**后原参数失效 ——
+8 只标的在原口径下 **0 笔**。实测重标定：
+
+- **一买→二买**：实测间隔 **6 / 17 / 27 / 33 / 34 / 34 / 50+ 个交易日**
+  （中位数 ≈ 33），15 日卡掉 7/8 → 取 **40**（中位数 + 余量）。
+- **二买→30 分钟二买**：原参数「之后 2 日内」**方向是反的** —— 几何法的
+  30 分钟买点常**早于**日线二买（次级别先转势；紫金矿业早 5 个交易日）。
+  改为**双向 ±10 个交易日**。
+
+⚠️ 允许 30 分钟买点早于日线二买，**不等于**可以在日线二买确认前买入。
+成交时点取「所有条件都确认之后」—— 若触发 bar 早于日线二买，成交推迟到
+日线二买所在交易日的首根 bar 之后（见 `scan_from_frame` 的 `confirm_pos`），
+否则就是在用还没发生的信息交易（1 个交易日尺度的未来函数）。
+
+----------------------------------------------------------------------
+信号源：默认几何判定，`cxt_*` 信号保留为备选
+----------------------------------------------------------------------
+
+`scan(source=...)` 两个取点方式（下游匹配/卖出两条纯逻辑完全共用）：
+
+- ``SOURCE_GEOMETRY``（**默认**）：`points_from_chan()` —— 用 `core.chan_points`
+  的几何判定在 czsc 的笔/中枢上推买卖点。老三 2026-09-18 定的口径：
+  「策略也用图上那套几何买卖点，弃用 `cxt_*`」。
+- ``SOURCE_SIGNAL``：原实现，用 czsc 的 `cxt_*` 择时信号（状态跃迁）。
+  保留用于对比与回归，见 `docs/PLAN_BUYSELL_GEOMETRY.md`。
+
+两者的**笔与中枢都来自 czsc**，差别只在「哪里算买点」这一层。
 
 ======================================================================
 三条硬约束（都有实测依据，改代码前先读）
@@ -121,18 +156,23 @@ czsc 的 `日线_D1B_BUY1` / `..._BS2辅助V230320` 输出的不是 0/1，
 数据量要求（两个门槛，别混为一谈）
 ======================================================================
 
-**代码硬门槛**：`scan()` 要求 30 分钟 bar 数 > `init_n + 60`（默认 560 根，
-按一天 8 根折合约 70 个交易日）。低于此直接返回空结果并记一条日志。
-这个门槛只防"无意义的计算"，本身很低 —— 560 根里 czsc 前 500 根不产
-信号，实际只有 60 根可用（≈7.5 个交易日）。
+**代码硬门槛**：`scan(source="signal")` 要求 30 分钟 bar 数 > `init_n + 60`
+（默认 560 根，按一天 8 根折合约 70 个交易日）。低于此直接返回空结果并记
+一条日志。这个门槛只防"无意义的计算"，本身很低 —— 560 根里 czsc 前 500
+根不产信号，实际只有 60 根可用（≈7.5 个交易日）。
 
-**有效下限**：要真正跑出买点，实测需要 **150 个交易日以上**（≈1200 根）。
-依据：20 只流动性标的、每只 1970 根 / 247 个交易日，其中 16 只零买点，
-命中的 4 只也只有 1~2 笔。门槛低不等于能出结果。
+`scan(source="geometry")` 的门槛是 `GEO_MIN_BARS` 根（480 ≈ 60 个交易日）。
+几何法**没有 `init_n` 预热**，但日线要能形成中枢（= 至少 3 笔）才谈得上
+一买，太短的数据算不出结构，所以门槛反而更高。
+
+**有效下限**：两个源都远高于代码门槛。历史 cxt_* 版的实测 —— 20 只流动性
+标的、每只 1970 根 / 247 个交易日，其中 16 只零买点，命中的 4 只也只有
+1~2 笔。门槛低不等于能出结果。
 """
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -145,13 +185,32 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 一买 → 二买 的最大间隔（交易日）
-DEFAULT_MAX_GAP_1TO2 = 15
-# 日线二买 → 30 分钟二买 的最大间隔（交易日）
-DEFAULT_MAX_GAP_2TOM = 2
+# 2026-09-18 由 15 改为 40：实测 8 只标的的间隔为 6/17/27/33/34/34/50+，
+# 中位数 ≈ 33，原值卡掉 7/8。详见模块 docstring「窗口为什么是 40 / ±10」。
+DEFAULT_MAX_GAP_1TO2 = 40
+# 日线二买 → 30 分钟二买 的**双向**窗口（前后各这么多交易日）
+# 2026-09-18 由「之后 2 日内」改为双向 ±10：几何法的 30 分钟买点常早于
+# 日线二买（次级别先转势），原窗口方向是反的。
+DEFAULT_MAX_GAP_2TOM = 10
 # 次级别周期
+# ⚠️ 两个不同的字符串，别混：
+#   BASE_FREQ   —— czsc **信号列名**里的频段（"30分钟_D1#SMA#21_BS2辅助V230320"）
+#   BASE_PERIOD —— `core.chan.build()` 认的**项目周期**字符串（"30min"）
+# 实测把 BASE_FREQ 传给 build() 会抛 `ValueError: 不支持的周期 '30分钟'`。
 BASE_FREQ = "30分钟"
-# czsc 预热根数：前 init_n 根不产出信号
+BASE_PERIOD = "30min"
+# czsc 预热根数：前 init_n 根不产出信号（仅 signal 源使用）
 DEFAULT_INIT_N = 500
+
+# 取点来源
+SOURCE_SIGNAL = "signal"        # czsc cxt_* 择时信号（状态跃迁）
+SOURCE_GEOMETRY = "geometry"    # chan_points 几何判定（默认）
+
+# geometry 源的硬门槛：480 根 ≈ 60 个交易日。
+# 几何法没有 init_n 预热，但日线要形成中枢（≥3 笔）才谈得上一买 ——
+# 实测日线中枢平均 49 个交易日一个，数据太短根本算不出结构，早退避免
+# 无意义计算（避免"跑通了但永远 0 笔"这种更难查的症状）。
+GEO_MIN_BARS = 480
 
 _FIRST_BUY_SIGNAL = "cxt_first_buy_V221126"
 _SECOND_BS_SIGNAL = "cxt_second_bs_V230320"
@@ -184,13 +243,15 @@ def build_signals_config(ma_type: str = "SMA", timeperiod: int = 21) -> list[dic
 @dataclass
 class BuySignal:
     """一次买点触发"""
-    dt: str                 # 成交时刻（信号 bar 之后第 entry_delay_bars 根）
+    dt: str                 # 成交时刻（所有条件确认后第 entry_delay_bars 根 bar）
     price: float            # 成交价（该 bar 收盘价）
     d1: str                 # 日线一买生效日
     d2: str                 # 日线二买生效日
-    gap_1to2: int           # 一买 → 二买 间隔交易日
-    gap_2tom: int           # 二买 → 30 分钟二买 间隔交易日
-    signal_dt: str = ""     # 信号确认时刻（30 分钟二买跃迁 bar）
+    gap_1to2: int           # 一买 → 二买 间隔交易日（恒为正）
+    gap_2tom: int           # 30 分钟二买相对日线二买的交易日偏移
+                            #   **有符号**：<0 表示 30 分钟买点早于日线二买
+                            #   （次级别先转势，成交会推迟到 d2 之后）
+    signal_dt: str = ""     # 信号确认时刻（触发用的那根 30 分钟 bar）
 
 
 @dataclass
@@ -221,6 +282,7 @@ class Trade:
 class ScanResult:
     """一次扫描的完整结果"""
     code: str = ""
+    source: str = ""                # 取点来源（SOURCE_SIGNAL / SOURCE_GEOMETRY）
     trades: list[Trade] = field(default_factory=list)
     # 诊断用：各级信号的原始跃迁点（便于排查"为什么没触发"）
     buy1_days: list[str] = field(default_factory=list)
@@ -390,23 +452,30 @@ def match_buy_points(
     trading_days : 交易日序列（升序），窗口按"第几个交易日"计算
     d1_days      : 日线一买生效的交易日
     d2_days      : 日线二买生效的交易日
-    m30_items    : ``[(交易日, bar 标识), ...]``，30 分钟二买跃迁点，
+    m30_items    : ``[(交易日, bar 标识), ...]``，30 分钟二买点，
                    **按时间升序**、允许同一天多次（一天内可有多个 30 分钟 bar）
 
     规则
     ----
     1. 对每个日线二买日 d2，向前找最近的日线一买日 d1，要求
        ``0 < pos(d2) - pos(d1) <= max_gap_1to2``
-    2. 对每个 (d1, d2) 配对，取 ``pos(d2) <= pos(d3) <= pos(d2) + max_gap_2tom``
-       区间内**第一个未被占用**的 30 分钟二买 bar 作为触发点
-    3. 每个 30 分钟二买 bar 只触发一次（先到先得，不重复配对）
+    2. 对每个 (d1, d2) 配对，在 ``|pos(d3) - pos(d2)| <= max_gap_2tom``
+       的**双向**窗口内取**离 d2 最近**的、尚未被占用的 30 分钟买点作为
+       触发点（同距离时取 d2 之后那根 —— 确认顺序上它可立即成交）
+    3. 每个 30 分钟买点 bar 只触发一次（先到先得，不重复配对）
+
+    ⚠️ ``max_gap_2tom`` 是**双向**窗口的一半，且 ``gap_2tom`` 返回**有符号**
+    偏移（可为负）。2026-09-18 改：几何法的 30 分钟买点常早于日线二买
+    （次级别先转势），原「只能在其后」的窗口方向是反的。
+    触发 bar 早于 d2 时，**成交时点由调用方推迟**到 d2 之后 —— 本函数只管
+    配对，不管成交时点（见 `scan_from_frame` 的 ``confirm_pos``）。
 
     返回：[{d1, d2, d3, bar, gap_1to2, gap_2tom}, ...]，按触发时间升序
     """
     pos = {d: i for i, d in enumerate(trading_days)}
     d1_list = sorted({d for d in d1_days if d in pos}, key=pos.get)
     d2_list = sorted({d for d in d2_days if d in pos}, key=pos.get)
-    # 保留 bar 顺序与重复：一天内可能有多个 30 分钟二买跃迁 bar
+    # 保留 bar 顺序与重复：一天内可能有多个 30 分钟买点 bar
     m30_list = [(pos[d], d, bar) for d, bar in m30_items if d in pos]
     m30_list.sort(key=lambda x: (x[0], x[2]))
 
@@ -421,21 +490,29 @@ def match_buy_points(
             continue
         d1 = max(candidates, key=pos.get)
 
-        # 向后找窗口内第一个未被占用的 30 分钟二买 bar
+        # 在双向窗口内找离 d2 最近的未占用 bar
+        best = None
         for i3, d3, bar in m30_list:
-            if i3 < i2:
+            if i3 < i2 - max_gap_2tom:
                 continue
             if i3 > i2 + max_gap_2tom:
                 break
             if bar in used_bars:
                 continue
-            all_matches.append({
-                "d1": d1, "d2": d2, "d3": d3, "bar": bar,
-                "gap_1to2": i2 - pos[d1],
-                "gap_2tom": i3 - i2,
-            })
-            used_bars.add(bar)
-            break
+            # 距离优先；同距离时 d2 之后的那根优先（可立即成交）
+            key = (abs(i3 - i2), 0 if i3 >= i2 else 1)
+            if best is None or key < best[0]:
+                best = (key, i3, d3, bar)
+        if best is None:
+            continue
+
+        _, i3, d3, bar = best
+        all_matches.append({
+            "d1": d1, "d2": d2, "d3": d3, "bar": bar,
+            "gap_1to2": i2 - pos[d1],
+            "gap_2tom": i3 - i2,          # 有符号：<0 = 30 分钟买点早于日线二买
+        })
+        used_bars.add(bar)
 
     return sorted(all_matches, key=lambda m: (pos[m["d3"]], m["bar"]))
 
@@ -494,6 +571,199 @@ def match_sell_points(
 
 
 # ======================================================================
+# 几何点事件（geometry 源）—— 用 chan_points 的判定替代 cxt_* 信号
+# ======================================================================
+
+@dataclass
+class GeoPoints:
+    """几何法产出的三级点事件（`points_from_chan` 的返回）
+
+    d1_days / d2_days : 日线一买 / 二买**生效交易日**（= 笔终点所在交易日的
+                        次一交易日，见 `points_from_chan`）
+    m30_items         : ``[(交易日, bar 下标), ...]``，30 分钟二买点，
+                        bar 下标基于调用方传入的 30 分钟帧
+    daily_bars        : 合成出的日线根数（诊断用）
+    counts            : 各类点数量（诊断用，含未采用的三买/卖点）
+    """
+
+    d1_days: list = field(default_factory=list)
+    d2_days: list = field(default_factory=list)
+    m30_items: list = field(default_factory=list)
+    daily_bars: int = 0
+    counts: dict = field(default_factory=dict)
+
+
+def _effective_day(dt, day_list: list, offset: int = 1):
+    """笔终点 dt → 生效交易日（``offset=1`` 即次一交易日）
+
+    日线笔的终点落在交易日 T 的收盘价上，而"它成立"这件事要等 T 收盘才
+    知道 —— 直接把 T 当生效日就是 1 个交易日的未来函数。T+1 才是可下单的
+    第一天。
+
+    返回 None 表示超出现有数据范围（尾部笔尚未确认）—— 宁可丢这个点，
+    也不能拿"还不知道成不成立"的笔去交易。
+    """
+    d = pd.Timestamp(str(dt)).date()
+    i = bisect.bisect_left(day_list, d)
+    if i < len(day_list) and day_list[i] == d:
+        base = i
+    elif i > 0:
+        base = i - 1        # dt 落在两个交易日之间 → 归到前一个交易日
+    else:
+        return None
+    j = base + offset
+    return day_list[j] if j < len(day_list) else None
+
+
+def _bar_lookup(dt_list: list):
+    """返回 ``dt → bar 下标`` 的查找函数
+
+    先精确匹配（笔端点必然落在某根 bar 上），匹配不上再取时间最近的 ——
+    错位会静默指向错误的 K 线，所以宁可慢一点也不能瞎猜。
+    """
+    keys = [t.value for t in dt_list]
+    pos = {t: i for i, t in enumerate(dt_list)}
+
+    def lookup(dt) -> int:
+        t = pd.Timestamp(str(dt))
+        if t.tzinfo is not None:
+            t = t.tz_localize(None)
+        i = pos.get(t)
+        if i is not None:
+            return i
+        k = bisect.bisect_left(keys, t.value)
+        if k <= 0:
+            return 0
+        if k >= len(keys):
+            return len(keys) - 1
+        return k - 1 if (t.value - keys[k - 1]) <= (keys[k] - t.value) else k
+
+    return lookup
+
+
+def points_from_structures(
+    bis_m30,
+    centers_m30,
+    bis_daily,
+    centers_daily,
+    days,
+    day_list,
+    dt_list,
+    *,
+    confirm_offset: int = 1,
+) -> GeoPoints:
+    """从**已算好的**缠论结构推三级点事件（纯函数，不碰 czsc）
+
+    与 `points_from_chan` 的分工：后者负责「建 czsc 对象」，本函数只做
+    「结构 → 点事件」的换算。可视化层已经为画图建好了两套结构，直接用
+    本函数可以省掉一次重复计算（建 czsc 对象是全链路最慢的一步）。
+
+    参数
+    ----
+    bis_m30 / centers_m30     : `core.chan.bis()/centers()` 在 30 分钟上的输出
+    bis_daily / centers_daily : 同上，日线级别
+    days     : 与 30 分钟帧**等长**的交易日（date 对象，允许重复）
+    day_list : 去重升序的交易日（date 对象）
+    dt_list  : 与 30 分钟帧**等长**的 Timestamp（用于把笔终点映射回 bar 下标）
+    """
+    from core import chan_points
+
+    pts = GeoPoints()
+    bar_of = _bar_lookup(dt_list)
+
+    def tally(prefix: str, p: dict) -> None:
+        key = f"{prefix}{p['kind']}"
+        pts.counts[key] = pts.counts.get(key, 0) + 1
+
+    # 日线级：一买 / 二买，延后到次一交易日生效
+    for p in chan_points.buy_sell_points(bis_daily, centers_daily):
+        tally("日线", p)
+        if p["kind"] not in ("一买", "二买"):
+            continue
+        d = _effective_day(p["dt"], day_list, confirm_offset)
+        if d is None:
+            continue
+        if p["kind"] == "一买":
+            pts.d1_days.append(d)
+        else:
+            pts.d2_days.append(d)
+
+    # 30 分钟级：二买，按 bar 时刻直接生效
+    for p in chan_points.buy_sell_points(bis_m30, centers_m30):
+        tally("30分", p)
+        if p["kind"] != "二买":
+            continue
+        i = bar_of(p["dt"])
+        pts.m30_items.append((days[i], i))
+
+    pts.m30_items.sort(key=lambda x: x[1])
+    pts.d1_days = sorted(set(pts.d1_days))
+    pts.d2_days = sorted(set(pts.d2_days))
+    return pts
+
+
+def points_from_chan(
+    klines_30m: Iterable[KLineData],
+    df_30m: Optional[pd.DataFrame] = None,
+    code: str = "",
+    *,
+    confirm_offset: int = 1,
+) -> GeoPoints:
+    """用几何判定（`core.chan_points`）产出三级点事件 —— 替代 `cxt_*` 信号
+
+    参数
+    ----
+    klines_30m : 30 分钟 K 线（原样传给 `core.chan.build`）
+    df_30m     : ``klines_to_df(klines_30m)`` 的结果。不传则内部现算；
+                 **传进来的必须与 klines_30m 同源** —— 返回的 bar 下标
+                 是这份 DataFrame 的整数位置，错位会静默指向错误的 K 线。
+    confirm_offset : 日线点延后的交易日数（默认 1 = 次一交易日）
+
+    三条口径
+    --------
+    1. **日线点延后到次一交易日生效**，理由见 `_effective_day`。
+    2. **30 分钟点直接用 bar 时刻** —— 30 分钟 bar 收盘即确定，不涉及
+       未走完的更大周期 bar，无需延后。
+    3. 只取**买点**里的「日线一买 / 日线二买 / 30 分钟二买」三级
+       （对应策略定义）；其余类别只计入 `counts` 供诊断。
+
+    与 signal 源的差别：czsc 的 `cxt_*` 是**逐 bar 持续状态**，"出现"要靠
+    状态跃迁定义；几何点是**离散事件**，没有这个问题（也就没有"一次二买
+    状态覆盖几十个交易日"的歧义）。见 `docs/PLAN_BUYSELL_GEOMETRY.md`。
+    """
+    from core import chan as chan_mod
+
+    klines_30m = list(klines_30m)
+    if df_30m is None:
+        df_30m = chan_mod.klines_to_df(klines_30m)
+
+    df = df_30m.copy()
+    df["dt"] = pd.to_datetime(df["dt"])
+    if getattr(df["dt"].dtype, "tz", None) is not None:
+        df["dt"] = df["dt"].dt.tz_localize(None)
+    days = [t.date() for t in df["dt"]]
+    day_list = sorted(set(days))
+    dt_list = list(df["dt"])
+
+    daily_df = chan_mod.resample_daily(df)
+    cr = chan_mod.build(klines_30m, period=BASE_PERIOD)
+    cr_d = None
+    if len(daily_df) >= 3:
+        cr_d = chan_mod.build(
+            chan_mod.df_to_klines(daily_df, period="daily", code=code),
+            period="daily")
+
+    pts = points_from_structures(
+        chan_mod.bis(cr) if cr else [],
+        chan_mod.centers(cr) if cr else [],
+        chan_mod.bis(cr_d) if cr_d else [],
+        chan_mod.centers(cr_d) if cr_d else [],
+        days, day_list, dt_list, confirm_offset=confirm_offset)
+    pts.daily_bars = len(daily_df)
+    return pts
+
+
+# ======================================================================
 # 主入口
 # ======================================================================
 
@@ -501,6 +771,7 @@ def scan(
     klines: Iterable[KLineData],
     code: str = "",
     *,
+    source: str = SOURCE_GEOMETRY,
     max_gap_1to2: int = DEFAULT_MAX_GAP_1TO2,
     max_gap_2tom: int = DEFAULT_MAX_GAP_2TOM,
     ma_short: int = 5,
@@ -513,10 +784,37 @@ def scan(
 ) -> ScanResult:
     """对一只股票的 30 分钟 K 线跑完整策略，返回买点/卖点与诊断信息
 
+    `source` **默认 geometry**（老三 2026-09-18 定：策略用图上那套几何买卖点、
+    弃用 `cxt_*`）。传 ``source="signal"`` 可回到原 czsc 信号实现做对比。
+
     需要 czsc；未安装时抛 ImportError（由调用方决定是否降级）。
     """
+    klines = list(klines)
     df = klines_to_df(klines)
-    result = ScanResult(code=code)
+    result = ScanResult(code=code, source=source)
+
+    if source == SOURCE_GEOMETRY:
+        # 几何源不需要 czsc 的 init_n 预热，但日线要能形成中枢才谈得上一买
+        if len(df) < GEO_MIN_BARS:
+            logger.info(
+                f"缠论多周期策略跳过 {code}：30 分钟 K 线 {len(df)} 根，"
+                f"不足（geometry 源需 ≥ {GEO_MIN_BARS} 根 ≈ "
+                f"{GEO_MIN_BARS // 8} 个交易日，否则日线形不成中枢）")
+            return result
+        pts = points_from_chan(klines, df, code)
+        logger.info(
+            f"缠论多周期策略 {code}：几何源，30 分钟 {len(df)} 根 / "
+            f"日线 {pts.daily_bars} 根，点事件 {pts.counts}")
+        return scan_from_frame(df, code=code, source=SOURCE_GEOMETRY, points=pts,
+                               ma_short=ma_short, ma_long=ma_long,
+                               max_gap_1to2=max_gap_1to2,
+                               max_gap_2tom=max_gap_2tom,
+                               entry_delay_bars=entry_delay_bars,
+                               exit_delay_days=exit_delay_days)
+
+    if source != SOURCE_SIGNAL:
+        raise ValueError(
+            f"未知的 source={source!r}，可选：{SOURCE_SIGNAL} / {SOURCE_GEOMETRY}")
 
     # 长度检查必须排在 load_czsc() 前面：这条早退路径不需要 czsc
     # （klines_to_df 只用 pandas），否则没装 czsc 的环境连「数据不足」
@@ -531,7 +829,8 @@ def scan(
     out = generate_signal_frame(df, czsc, ma_type=ma_type,
                                 timeperiod=timeperiod, init_n=init_n)
     cols = signal_columns(ma_type, timeperiod)
-    return scan_from_frame(out, code=code, ma_short=ma_short, ma_long=ma_long,
+    return scan_from_frame(out, code=code, source=SOURCE_SIGNAL, ma_short=ma_short,
+                           ma_long=ma_long,
                            max_gap_1to2=max_gap_1to2, max_gap_2tom=max_gap_2tom,
                            columns=cols,
                            entry_delay_bars=entry_delay_bars,
@@ -568,6 +867,8 @@ def scan_from_frame(
     out: pd.DataFrame,
     code: str = "",
     *,
+    source: str = SOURCE_SIGNAL,
+    points: Optional[GeoPoints] = None,
     ma_short: int = 5,
     ma_long: int = 10,
     max_gap_1to2: int = DEFAULT_MAX_GAP_1TO2,
@@ -576,36 +877,75 @@ def scan_from_frame(
     entry_delay_bars: int = 1,
     exit_delay_days: int = 1,
 ) -> ScanResult:
-    """从已算好的信号表执行策略（信号表含 day 列与三个信号列）"""
+    """从已算好的 30 分钟帧执行策略（匹配/卖出两条纯逻辑对两个源完全共用）
+
+    `source` 决定「点事件」从哪来：
+
+    - ``SOURCE_SIGNAL``（**本函数默认**）：从 `out` 的 czsc 信号列取
+      （状态跃迁），需要 `columns`；与历史行为一致。
+    - ``SOURCE_GEOMETRY``：用 `points`（`points_from_chan()` 的产出），
+      `out` 只需含 dt / close（day 缺了会自动补）。
+
+    ⚠️ 两个入口的默认源不同是**有意的**：`scan()` 是产品入口、默认 geometry；
+    本函数是「手上已有一份信号帧」的底层入口，默认沿用 signal。
+    新代码请走 `scan()`。
+
+    `out` 的每一行是一根 30 分钟 bar，行序即时间序；行下标（整数位置）就是
+    匹配结果里 ``bar`` 的含义。
+    """
     columns = columns or signal_columns()
-    result = ScanResult(code=code)
+    result = ScanResult(code=code, source=source)
 
     # czsc 输出的数值列是字符串，统一转数值后再用（见 generate_signal_frame）
     out = out.copy()
     if "close" in out.columns:
         out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    if "day" not in out.columns:
+        # geometry 源直接传 klines_to_df 的结果（没有 day 列）
+        out["day"] = pd.to_datetime(out["dt"]).dt.date
 
     trading_days = sorted(set(out["day"]))
     result.trading_days = len(trading_days)
 
-    # ---- 日线信号：按交易日取首根 bar 的值（见模块 docstring 硬约束 2） ----
-    d1_state = daily_state_from_bars(out, columns["daily_buy1"])
-    d2_state = daily_state_from_bars(out, columns["daily_buy2"])
+    # 每个交易日的**首根 bar** 下标 —— 成交时点不能早于「最后一个被确认的条件」
+    first_bar: dict = {}
+    for i, d in enumerate(out["day"]):
+        first_bar.setdefault(d, i)
 
-    d1_hit = d1_state[columns["daily_buy1"]].astype(str).str.contains(CONTAINS_BUY1, na=False)
-    d2_hit = d2_state[columns["daily_buy2"]].astype(str).str.contains(CONTAINS_BUY2, na=False)
+    if source == SOURCE_GEOMETRY:
+        if points is None:
+            raise ValueError(
+                "source=geometry 需要传入 points_from_chan() 的结果")
+        all_days = list(trading_days)
+        d1_days = [d for d in points.d1_days if d in first_bar]
+        d2_days = [d for d in points.d2_days if d in first_bar]
+        m30_items = [(d, b) for d, b in points.m30_items if d in first_bar]
+        m30_positions = [b for _, b in m30_items]
+        result.buy1_days = [str(d) for d in d1_days]
+        result.buy2_days = [str(d) for d in d2_days]
+        result.m30_buy2_bars = [str(out["dt"].iloc[b]) for b in m30_positions]
+    elif source == SOURCE_SIGNAL:
+        # ---- 日线信号：按交易日取首根 bar 的值（见模块 docstring 硬约束 2） ----
+        d1_state = daily_state_from_bars(out, columns["daily_buy1"])
+        d2_state = daily_state_from_bars(out, columns["daily_buy2"])
 
-    all_days = list(d2_state.index)
-    d1_days = [all_days[i] for i in _entry_positions(d1_hit)]
-    d2_days = [all_days[i] for i in _entry_positions(d2_hit)]
-    result.buy1_days = [str(d) for d in d1_days]
-    result.buy2_days = [str(d) for d in d2_days]
+        d1_hit = d1_state[columns["daily_buy1"]].astype(str).str.contains(CONTAINS_BUY1, na=False)
+        d2_hit = d2_state[columns["daily_buy2"]].astype(str).str.contains(CONTAINS_BUY2, na=False)
 
-    # ---- 30 分钟二买：bar 级跃迁（30 分钟信号无日内翻转问题） ----
-    m30_hit = out[columns["m30_buy2"]].astype(str).str.contains(CONTAINS_BUY2, na=False)
-    m30_positions = _entry_positions(m30_hit)
-    m30_items = [(out["day"].iloc[i], i) for i in m30_positions]
-    result.m30_buy2_bars = [str(out["dt"].iloc[i]) for i in m30_positions]
+        all_days = list(d2_state.index)
+        d1_days = [all_days[i] for i in _entry_positions(d1_hit)]
+        d2_days = [all_days[i] for i in _entry_positions(d2_hit)]
+        result.buy1_days = [str(d) for d in d1_days]
+        result.buy2_days = [str(d) for d in d2_days]
+
+        # ---- 30 分钟二买：bar 级跃迁（30 分钟信号无日内翻转问题） ----
+        m30_hit = out[columns["m30_buy2"]].astype(str).str.contains(CONTAINS_BUY2, na=False)
+        m30_positions = _entry_positions(m30_hit)
+        m30_items = [(out["day"].iloc[i], i) for i in m30_positions]
+        result.m30_buy2_bars = [str(out["dt"].iloc[i]) for i in m30_positions]
+    else:
+        raise ValueError(
+            f"未知的 source={source!r}，可选：{SOURCE_SIGNAL} / {SOURCE_GEOMETRY}")
 
     # ---- 三条件时序匹配 ----
     matches = match_buy_points(all_days, d1_days, d2_days, m30_items,
@@ -613,7 +953,7 @@ def scan_from_frame(
                                max_gap_2tom=max_gap_2tom)
     if not matches:
         logger.info(
-            f"缠论多周期策略 {code}：无买点（一买 {len(d1_days)} 次、"
+            f"缠论多周期策略 {code}（{source}）：无买点（一买 {len(d1_days)} 次、"
             f"二买 {len(d2_days)} 次、30 分钟二买 {len(m30_positions)} 次，未形成共振）")
         return result
 
@@ -628,11 +968,15 @@ def scan_from_frame(
 
     # ---- 组装交易 ----
     for m in matches:
-        # 信号要等 30 分钟 bar 收盘才确认，实际成交顺延 entry_delay_bars 根
-        trade_pos = m["bar"] + entry_delay_bars
+        # 成交时点 = **所有条件都确认之后**，再等 entry_delay_bars 根 bar。
+        # 双向窗口允许 30 分钟买点早于日线二买，那种情况下必须等到日线二买
+        # 所在交易日的**首根 bar** 之后才能动手 —— 否则就是在用尚未发生的
+        # 信息交易（1 个交易日尺度的未来函数）。
+        confirm_pos = max(m["bar"], first_bar.get(m["d2"], m["bar"]))
+        trade_pos = confirm_pos + entry_delay_bars
         if trade_pos >= len(out):
             logger.info(
-                f"缠论多周期策略 {code}：{m['d3']} 的二买信号落在数据末尾，"
+                f"缠论多周期策略 {code}：{m['d3']} 的触发落在数据末尾，"
                 "无后续 bar 可成交，已跳过")
             continue
         trade_bar = out.iloc[trade_pos]
@@ -643,14 +987,16 @@ def scan_from_frame(
             gap_1to2=m["gap_1to2"], gap_2tom=m["gap_2tom"],
             signal_dt=str(out.iloc[m["bar"]]["dt"]),
         )
-        sell = match_sell_points(daily, m["d3"], ma_short=ma_short,
+        # 卖点从**实际成交日**起算 —— 触发点可能早于 d2，用 m["d3"] 会从
+        # 一个还没成交的日子开始扫均线。
+        sell = match_sell_points(daily, trade_bar["day"], ma_short=ma_short,
                                  ma_long=ma_long, exit_delay_days=exit_delay_days)
         trade = Trade(buy=buy, sell=SellSignal(**sell) if sell else None)
         result.trades.append(trade)
         logger.info(
             f"缠论多周期策略 {code} 买点 {buy.dt} @{buy.price:.2f} "
             f"(一买 {buy.d1} → 二买 {buy.d2} 间隔{buy.gap_1to2}日 → "
-            f"30分钟二买 {buy.gap_2tom}日内)"
+            f"30分钟二买 偏移{buy.gap_2tom:+d}日)"
             + (f"，卖点 {trade.sell.dt} @{trade.sell.price:.2f} "
                f"({trade.sell.ma}, {trade.return_pct:+.2f}%)" if trade.sell else "，未平仓")
         )

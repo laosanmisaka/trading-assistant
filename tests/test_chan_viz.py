@@ -154,7 +154,7 @@ def test_find_column_matches_prefix_and_tokens():
 def payload():
     kl = make_klines(420)
     return build_payload(kl, code="600000", name="测试股", period="30min",
-                         init_n=60, ma_short=5, ma_long=10)
+                         ma_short=5, ma_long=10)
 
 
 def test_payload_basic_shape(payload):
@@ -177,18 +177,15 @@ def test_payload_bars_columns_consistent(payload):
         assert b[4] >= 0
 
 
-def test_payload_warmup_matches_init_n(payload):
-    """预热区间只约束策略信号
+def test_payload_has_no_signal_warmup(payload):
+    """不再有信号预热区间（2026-09-18）
 
-    几何买卖点由全量笔/中枢算出，**不受预热影响**（旧版在这里断言
-    「预热区间内不得出现买卖点」，是因为当时用的是 czsc 信号）。
+    旧版画一块浅灰底纹标出 czsc `cxt_*` 信号源前 `init_n` 根的预热禁区。
+    策略改几何源后没有这个截断 —— 几何点由全量笔/中枢算出，从第一根就有效。
     """
-    assert payload["warmup"] == payload["meta"]["warmup"]
-    assert payload["meta"]["init_n"] == 60
-    assert payload["warmup"] == 60
-    n = payload["meta"]["bars"]
-    for t in payload["strategy"]["trades"]:
-        assert t["buy"]["idx"] >= payload["warmup"]
+    assert "warmup" not in payload
+    assert "warmup" not in payload["meta"]
+    assert "init_n" not in payload["meta"]
 
 
 def test_payload_indices_in_range(payload):
@@ -362,10 +359,17 @@ def test_render_html_states_and_notes(payload, tmp_path):
     # 关键口径必须在图上（否则图会骗人）
     assert "几何定义" in html
     assert "30 分钟级别默认关闭" in html
-    assert "czsc 预热区间" in html
+    # 策略窗口口径（2026-09-18 改为 40 / ±10）必须写在图上
+    assert "40 个交易日内" in html
+    assert "前后各 10 个交易日" in html
+    # 日线点延后一个交易日生效（未来函数防线）
+    assert "次一交易日" in html
     assert "日线MA5" in html and "日线MA10" in html
     # 策略命中的二买 bar 要单独高亮
     assert "策略命中二买" in html
+    # 不再有信号预热区间（图层与配色都已删除）
+    assert "CFG.warmup" not in html
+    assert "warmupArea" not in html
 
 
 def test_render_html_discloses_position_overlap(payload, tmp_path):

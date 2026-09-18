@@ -13,10 +13,13 @@ import pytest
 from core.chan_strategy import (
     BuySignal, ScanResult, SellSignal, Trade,
     CONTAINS_BUY1, CONTAINS_BUY2,
+    SOURCE_GEOMETRY, SOURCE_SIGNAL,
+    _effective_day,
     _entry_positions,
     daily_state_from_bars,
     match_buy_points,
     match_sell_points,
+    points_from_chan,
     position_overlap_stats,
     scan_from_frame,
     signal_columns,
@@ -168,24 +171,50 @@ def test_match_triggers_within_windows():
     assert res[0]["gap_2tom"] == 1
 
 
-def test_match_gap_1to2_boundary_15_ok_16_rejected():
-    """一买→二买：第 15 个交易日 OK，第 16 个算超窗"""
-    days = seq("2024-01-01", 40)
-    ok = match_buy_points(days, [days[0]], [days[15]], [(days[16], "b1")])
-    assert len(ok) == 1 and ok[0]["gap_1to2"] == 15
+def test_match_gap_1to2_boundary_40_ok_41_rejected():
+    """一买→二买：第 40 个交易日 OK，第 41 个算超窗
 
-    over = match_buy_points(days, [days[0]], [days[16]], [(days[17], "b2")])
+    2026-09-18 由 15 改为 40：实测 8 只标的的间隔为 6/17/27/33/34/34/50+，
+    中位数 ≈ 33，原值卡掉 7/8。
+    """
+    days = seq("2024-01-01", 90)
+    ok = match_buy_points(days, [days[0]], [days[40]], [(days[41], "b1")])
+    assert len(ok) == 1 and ok[0]["gap_1to2"] == 40
+
+    over = match_buy_points(days, [days[0]], [days[41]], [(days[42], "b2")])
     assert over == []
 
 
-def test_match_gap_2tom_boundary_2_ok_3_rejected():
-    """二买→30 分钟二买：第 2 个交易日 OK，第 3 个算超窗"""
-    days = seq("2024-01-01", 40)
-    ok = match_buy_points(days, [days[0]], [days[5]], [(days[7], "b1")])
-    assert len(ok) == 1 and ok[0]["gap_2tom"] == 2
+def test_match_gap_2tom_window_is_symmetric_10_ok_11_rejected():
+    """30 分钟买点窗口是双向 ±10（2026-09-18 由「之后 2 日」改）
 
-    over = match_buy_points(days, [days[0]], [days[5]], [(days[8], "b2")])
-    assert over == []
+    几何法的 30 分钟买点常早于日线二买（次级别先转势），原实现只允许
+    「其后」，方向是反的 → 这类点全被丢掉，8 只标的 0 笔。
+    """
+    days = seq("2024-01-01", 90)
+    after = match_buy_points(days, [days[0]], [days[20]], [(days[30], "b1")])
+    assert len(after) == 1 and after[0]["gap_2tom"] == 10
+
+    before = match_buy_points(days, [days[0]], [days[20]], [(days[10], "b2")])
+    assert len(before) == 1 and before[0]["gap_2tom"] == -10
+
+    # 两侧第 11 个交易日都超窗
+    assert match_buy_points(days, [days[0]], [days[20]], [(days[31], "b3")]) == []
+    assert match_buy_points(days, [days[0]], [days[20]], [(days[9], "b4")]) == []
+
+
+def test_match_picks_m30_nearest_to_d2():
+    """窗口内有多个 30 分钟买点时取**离 d2 最近**的，而不是最早的那个
+
+    取最早的那个会捞到窗口边缘（±10 日）的陈旧触发点，然后一直等到 d2
+    才成交 —— 该点已经失效。
+    """
+    days = seq("2024-01-01", 90)
+    res = match_buy_points(days, [days[0]], [days[20]],
+                           [(days[12], "far"), (days[19], "near")])
+    assert len(res) == 1
+    assert res[0]["bar"] == "near"
+    assert res[0]["gap_2tom"] == -1
 
 
 def test_match_same_day_1to2_not_counted():
@@ -195,11 +224,16 @@ def test_match_same_day_1to2_not_counted():
     assert res == []
 
 
-def test_match_m30_before_d2_not_used():
-    """30 分钟二买出现在日线二买之前 → 不能配对"""
+def test_match_m30_before_d2_allowed_within_window():
+    """30 分钟买点早于日线二买 —— 双向窗口内允许配对，gap_2tom 为负
+
+    ⚠️ 「允许配对」≠「可以在 d2 之前成交」。成交时点由 `scan_from_frame`
+    取 ``max(触发 bar, d2 当日首根 bar)``，见 `test_buy_not_before_d2_confirm`。
+    """
     days = seq("2024-01-01", 30)
     res = match_buy_points(days, [days[0]], [days[10]], [(days[5], "b")])
-    assert res == []
+    assert len(res) == 1
+    assert res[0]["gap_2tom"] == -5
 
 
 def test_match_same_day_m30_allowed():
@@ -224,9 +258,9 @@ def test_match_picks_nearest_d1():
 
 
 def test_match_ignores_stale_d1():
-    """一买太早（超出 15 日）不能作为配对起点"""
-    days = seq("2024-01-01", 40)
-    res = match_buy_points(days, [days[0]], [days[20]], [(days[21], "b")])
+    """一买太早（超出 40 日窗口）不能作为配对起点"""
+    days = seq("2024-01-01", 90)
+    res = match_buy_points(days, [days[0]], [days[45]], [(days[46], "b")])
     assert res == []
 
 
@@ -571,29 +605,50 @@ def test_buy_chain_end_to_end_windows():
 
 
 def test_no_trade_when_m30_window_missed():
-    """30 分钟二买超出 2 日窗口 → 不成交"""
-    days = seq("2024-01-01", 25)
+    """30 分钟买点超出 ±10 双向窗口 → 不成交"""
+    days = seq("2024-01-01", 40)
     out = build_out(chain_plan(
         days, days[0], days[10],
-        {days[13]: [M30_HIT, OTHER, OTHER, OTHER]},   # gap_2tom = 3
+        {days[25]: [M30_HIT, OTHER, OTHER, OTHER]},   # gap_2tom = 15
     ))
     res = scan_from_frame(out, code="T")
     assert res.trades == []
 
 
+def test_buy_not_before_d2_confirm():
+    """成交时点不得早于「最后一个被确认的条件」（未来函数回归）
+
+    双向窗口允许 30 分钟买点早于日线二买。若照搬「触发 bar 的下一根成交」，
+    成交会落在**日线二买确认之前** —— 那一刻还不知道二买会成立。
+    成交必须推迟到 d2 当日首根 bar 之后。
+    """
+    days = seq("2024-01-01", 40)
+    out = build_out(chain_plan(
+        days, days[0], days[20],
+        {days[15]: [OTHER, OTHER, M30_HIT, OTHER]},   # 30 分钟买点早 5 个交易日
+    ))
+    res = scan_from_frame(out, code="T")
+    assert len(res.trades) == 1
+    b = res.trades[0].buy
+    assert b.gap_2tom == -5
+    assert b.signal_dt == f"{days[15]} 09:50:00"      # 触发时点仍记在买点 bar 上
+    assert b.dt.startswith(days[20])                  # 但成交不早于 d2
+    assert b.dt > b.signal_dt
+
+
 def test_scan_from_frame_records_diagnostics():
     """诊断信息必须齐备（用于排查"为什么没触发"）"""
-    days = seq("2024-01-01", 25)
+    days = seq("2024-01-01", 40)
     out = build_out(chain_plan(
         days, days[0], days[16],
-        {days[20]: [M30_HIT, OTHER, OTHER, OTHER]},   # 超窗，不成交
+        {days[35]: [M30_HIT, OTHER, OTHER, OTHER]},   # gap_2tom = 19，超窗
     ))
     res = scan_from_frame(out, code="T")
     assert res.trades == []
     assert res.buy1_days == [days[0]]
     assert res.buy2_days == [days[16]]
     assert len(res.m30_buy2_bars) == 1
-    assert res.trading_days == 25
+    assert res.trading_days == 40
 
 
 def test_scan_from_frame_handles_string_prices():
@@ -656,23 +711,24 @@ def synth_30min():
 
 
 def test_scan_runs_end_to_end(synth_30min):
-    """完整链路能跑通，返回结构正确"""
+    """完整链路能跑通（**默认几何源**），返回结构正确"""
     pytest.importorskip("czsc")
-    from core.chan_strategy import scan
+    from core.chan_strategy import SOURCE_GEOMETRY, scan
 
     res = scan(synth_30min, code="TEST")
     assert isinstance(res, ScanResult)
     assert res.code == "TEST"
+    assert res.source == SOURCE_GEOMETRY
     # czsc 的 bars_raw 会从头截断（见 core/chan.py 约束 3），所以少于自然交易日数
     assert res.trading_days > 200
-    # 三级信号都要被记录（即使最终没共振，诊断信息必须在）
+    # 三级点事件都要被记录（即使最终没共振，诊断信息必须在）
     assert isinstance(res.buy1_days, list)
     assert isinstance(res.buy2_days, list)
     assert isinstance(res.m30_buy2_bars, list)
     for t in res.trades:
         assert t.buy.price > 0
-        assert 0 < t.buy.gap_1to2 <= 15
-        assert 0 <= t.buy.gap_2tom <= 2
+        assert 0 < t.buy.gap_1to2 <= 40
+        assert abs(t.buy.gap_2tom) <= 10
         assert t.buy.dt > t.buy.signal_dt      # 成交必须晚于信号确认
         if t.sell:
             assert t.sell.hold_days >= 1
@@ -680,25 +736,52 @@ def test_scan_runs_end_to_end(synth_30min):
             assert t.sell.dt > t.sell.confirm_dt
 
 
-def test_scan_respects_windows_on_real_signals(synth_30min):
-    """真实信号上，所有触发的窗口约束都成立"""
+def test_scan_signal_source_still_available(synth_30min):
+    """signal 源保留可跑（用于与几何源对比）"""
+    pytest.importorskip("czsc")
+    from core.chan_strategy import SOURCE_SIGNAL, scan
+
+    res = scan(synth_30min, code="TEST", source=SOURCE_SIGNAL)
+    assert res.source == SOURCE_SIGNAL
+    assert isinstance(res.buy1_days, list)
+
+
+def test_scan_rejects_unknown_source(synth_30min):
     pytest.importorskip("czsc")
     from core.chan_strategy import scan
 
-    res = scan(synth_30min, code="TEST", max_gap_1to2=15, max_gap_2tom=2)
-    for t in res.trades:
+    with pytest.raises(ValueError, match="未知的 source"):
+        scan(synth_30min, code="T", source="nonsense")
+
+
+def test_scan_respects_windows_on_real_signals(synth_30min):
+    """真实信号上，所有触发的窗口约束都成立（两个源各自的口径）"""
+    pytest.importorskip("czsc")
+    from core.chan_strategy import SOURCE_SIGNAL, scan
+
+    sig = scan(synth_30min, code="TEST", source=SOURCE_SIGNAL,
+               max_gap_1to2=15, max_gap_2tom=2)
+    for t in sig.trades:
         assert t.buy.gap_1to2 <= 15
-        assert t.buy.gap_2tom <= 2
+        assert abs(t.buy.gap_2tom) <= 2
+
+    geo = scan(synth_30min, code="TEST", max_gap_1to2=40, max_gap_2tom=10)
+    for t in geo.trades:
+        assert t.buy.gap_1to2 <= 40
+        assert abs(t.buy.gap_2tom) <= 10
 
 
 def test_scan_tighter_window_reduces_or_keeps_signals(synth_30min):
-    """收窄窗口不应产生更多买点（单调性）"""
+    """收窄窗口不应产生更多买点（单调性）—— 两个源都测"""
     pytest.importorskip("czsc")
-    from core.chan_strategy import scan
+    from core.chan_strategy import SOURCE_SIGNAL, scan
 
-    wide = scan(synth_30min, code="T", max_gap_1to2=15, max_gap_2tom=2)
-    narrow = scan(synth_30min, code="T", max_gap_1to2=3, max_gap_2tom=1)
-    assert narrow.buy_count <= wide.buy_count
+    for src in (SOURCE_SIGNAL, "geometry"):
+        wide = scan(synth_30min, code="T", source=src,
+                    max_gap_1to2=40, max_gap_2tom=10)
+        narrow = scan(synth_30min, code="T", source=src,
+                      max_gap_1to2=3, max_gap_2tom=1)
+        assert narrow.buy_count <= wide.buy_count
 
 
 def test_scan_insufficient_data_returns_empty():
@@ -766,3 +849,77 @@ def test_klines_to_df_drops_intraday_nan_placeholder():
     df = klines_to_df(kl)
     assert len(df) == 1
     assert str(df["dt"].iloc[0]).startswith("2026-09-17")
+
+
+# ----------------------------------------------------------------------
+# 几何源：生效日（未来函数防线）
+# ----------------------------------------------------------------------
+
+def test_effective_day_shifts_to_next_trading_day():
+    """日线笔终点落在 T 的收盘上，而 T 收盘才成立 → 生效日是 T+1
+
+    直接把 T 当生效日就是 1 个交易日的未来函数。
+    """
+    days = [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7)]
+    assert _effective_day("2026-01-05 00:00:00", days) == date(2026, 1, 6)
+    assert _effective_day("2026-01-06", days) == date(2026, 1, 7)
+
+
+def test_effective_day_none_at_tail():
+    """尾部笔尚未确认（次日不存在）→ 丢点
+
+    宁可少一个点，也不能拿"还不知道成不成立"的笔去交易。
+    """
+    days = [date(2026, 1, 5), date(2026, 1, 6)]
+    assert _effective_day("2026-01-06", days) is None
+
+
+def test_effective_day_normalizes_time_and_tz():
+    """带时区 / 带时分秒的 dt 都要归到正确交易日"""
+    days = [date(2026, 1, 5), date(2026, 1, 6)]
+    assert _effective_day("2026-01-05 15:00:00+00:00", days) == date(2026, 1, 6)
+
+
+def test_effective_day_between_two_trading_days():
+    """dt 落在两个交易日之间（如周末）→ 归到**前一个**交易日再顺延
+
+    取前一个而非后一个是**偏保守**的选择：生效日更晚，不会提前交易。
+    这条分支在正常数据里走不到（日线由 30 分钟合成，日期必然在交易日序列里），
+    兜住它是为了不让上游异常静默变成"提前成交"。
+    """
+    days = [date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 9)]
+    # 1/7 落在 1/6 与 1/9 之间 → 归到 1/6，再顺延一个交易日 → 1/9
+    assert _effective_day("2026-01-07", days) == date(2026, 1, 9)
+    # 落在最后一个交易日 → 顺延后的日期不存在 → 丢点
+    assert _effective_day("2026-01-09", days) is None
+
+
+def test_scan_from_frame_geometry_requires_points():
+    """geometry 源必须给 points —— 静默返回空结果会掩盖调用错误"""
+    out = build_out([{"day": "2024-01-02"}])
+    with pytest.raises(ValueError, match="points_from_chan"):
+        scan_from_frame(out, code="T", source=SOURCE_GEOMETRY)
+
+
+def test_points_from_chan_structure(synth_30min):
+    """几何源产出的点事件结构正确，且都能对上帧里的 bar / 交易日"""
+    pytest.importorskip("czsc")
+    from core.chan import klines_to_df
+
+    df = klines_to_df(synth_30min)
+    pts = points_from_chan(synth_30min, df, code="TEST")
+    assert pts.daily_bars > 0
+    assert isinstance(pts.counts, dict)
+
+    days = set(pd.to_datetime(df["dt"]).dt.date)
+    assert all(d in days for d in pts.d1_days)
+    assert all(d in days for d in pts.d2_days)
+    assert all(0 <= i < len(df) for _, i in pts.m30_items)
+    # 30 分钟点按 bar 下标升序
+    assert [i for _, i in pts.m30_items] == sorted(i for _, i in pts.m30_items)
+
+    # 不带 day 列的帧也要能被接受（geometry 路径会自动补 day）
+    res = scan_from_frame(df, code="TEST", source=SOURCE_GEOMETRY, points=pts)
+    assert res.source == SOURCE_GEOMETRY
+    assert res.trading_days > 200
+    assert res.buy1_days == [str(d) for d in pts.d1_days]
