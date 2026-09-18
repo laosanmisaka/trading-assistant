@@ -271,6 +271,15 @@ def centers(result: ChanResult) -> list[dict]:
 
     返回: [{high, low, mid, sdt, edt, is_valid}, ...]
           high = zg 中枢上沿, low = zd 中枢下沿, mid = zz 中枢中轴
+
+    ⚠️ `edt` **包含「离开中枢的那一笔」的终点**（实测，2026-09-18）：
+    紫金矿业日线上某个中枢 `edt=2026-03-23`，其 `zs.bis` 有 5 笔，
+    最后一笔 `Down 2026-03-02 → 2026-03-23 [29.00, 39.81]` 正是跌破 zd、
+    把中枢走完并离开的那一笔。所以 `edt` 不是"最后一笔中枢笔的终点"，
+    而是"中枢结束（价格离开）的时刻"。
+
+    用 `bi.sdt >= edt` 找「离开笔」会跳过它（它的 sdt 早于 edt），
+    判三买/三卖时要改用 `bi.edt >= edt` —— 见 `core/chan_points.py`。
     """
     out = []
     for zs in result.obj.zs_list:

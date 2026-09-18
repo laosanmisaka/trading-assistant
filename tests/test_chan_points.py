@@ -151,6 +151,64 @@ def test_third_sell():
     assert tp["price"] == 97 and tp["direction"] == "Up"
 
 
+def _centers_ending_with_leaving_bi(center_edt: str):
+    """一段「中枢 + 离开笔 + 反抽」的笔序列
+
+    czsc 的中枢 `edt` 实测就是**离开笔的终点**，离开笔本身也在 `zs.bis` 里
+    （紫金矿业日线：edt=2026-03-23 的中枢含 5 笔，最后一笔
+    `Down 2026-03-02 → 2026-03-23 [29.00, 39.81]` 就是跌破 zd 的离开笔）。
+
+    center_edt 传 "2024-01-20" = 中枢含离开笔（czsc 实际行为）；
+    传 "2024-01-10" = 中枢不含离开笔（离开笔 sdt == 中枢 edt）。
+    """
+    centers = [zs("2024-01-01", center_edt, 100, 105)]
+    bis = [
+        bi("Up",   "2024-01-01", "2024-01-05", 106, 99),
+        bi("Down", "2024-01-05", "2024-01-07", 106, 100),
+        bi("Up",   "2024-01-07", "2024-01-10", 105, 100),
+        bi("Down", "2024-01-10", "2024-01-20", 105, 90),   # 离开笔：跌破 zd 100
+        bi("Up",   "2024-01-20", "2024-01-25", 95, 90),    # 反抽 95 < 100 → 三卖
+    ]
+    return bis, centers
+
+
+def test_third_sell_accepts_leaving_bi_absorbed_into_center():
+    """回归：离开笔被 czsc 放进 `zs.bis` 时，也要认出来
+
+    原实现用 `bi.sdt >= zs.edt` 找「离开笔」，而离开笔的 sdt 早于 edt
+    （它正是把中枢走完、并跌破 zd 的那一笔），于是被跳过、拿后面那笔下跌
+    当离开笔 → **三买/三卖整体晚一笔**。实测紫金矿业日线因此把三卖标到
+    2026-05-12 @34.39，而标准口径是 2026-04-15 @35.04（老三的批注指的正是后者）。
+    """
+    bis, centers = _centers_ending_with_leaving_bi("2024-01-20")
+    tp = pick(buy_sell_points(bis, centers), "三卖")
+    assert tp["price"] == 95
+    assert str(tp["dt"])[:10] == "2024-01-25"
+
+
+def test_third_sell_also_works_when_leaving_bi_starts_at_center_edt():
+    """离开笔的 sdt == 中枢 edt 时同样要能判出三卖（旧逻辑覆盖的那半）"""
+    bis, centers = _centers_ending_with_leaving_bi("2024-01-10")
+    tp = pick(buy_sell_points(bis, centers), "三卖")
+    assert tp["price"] == 95
+    assert str(tp["dt"])[:10] == "2024-01-25"
+
+
+def test_third_buy_mirrors_leaving_bi_case():
+    """三买对称：离开笔是向上突破 zg 的那一笔"""
+    centers = [zs("2024-01-01", "2024-01-20", 100, 105)]
+    bis = [
+        bi("Down", "2024-01-01", "2024-01-05", 101, 94),
+        bi("Up",   "2024-01-05", "2024-01-07", 101, 94),
+        bi("Down", "2024-01-07", "2024-01-10", 101, 94),
+        bi("Up",   "2024-01-10", "2024-01-20", 120, 94),   # 离开笔：突破 zg 105
+        bi("Down", "2024-01-20", "2024-01-25", 120, 110),  # 回调 110 > 105 → 三买
+    ]
+    tp = pick(buy_sell_points(bis, centers), "三买")
+    assert tp["price"] == 110
+    assert str(tp["dt"])[:10] == "2024-01-25"
+
+
 # ----------------------------------------------------------------------
 # 卖点对称性
 # ----------------------------------------------------------------------

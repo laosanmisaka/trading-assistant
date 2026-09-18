@@ -42,9 +42,17 @@ czsc 的 `cxt_first_buy_V221126` / `cxt_second_bs_V230320` /
       (b) P.low 严格低于 P 之前最近一个中枢的下沿 zd（下跌趋势终结）
       (c) 后面不再出现更低的低点 —— 连续创新低段只取**最后一个**
 二买：一买之后的下一个向下笔终点 Q（中间隔一个向上笔），Q.low > 一买 P.low
-三买：某中枢 Z 之后，向上笔的 high 突破 Z.zg，紧随其后的向下笔终点
+三买：某中枢 Z 的**离开笔**之后，第一次回抽（向下笔）的终点 R，
       R.low > Z.zg（回调不回中枢）
 卖点（一卖 / 二卖 / 三卖）完全对称。
+
+⚠️ 「离开笔」的判定（2026-09-18 修，踩过坑）：
+czsc 的 `zs.bis` **已经包含离开中枢的那一笔** —— 实测某中枢 `edt=2026-03-23`，
+`zs.bis` 有 5 笔，最后一笔 `Down 2026-03-02 → 2026-03-23 [29.00, 39.81]`
+就是跌破 zd、离开中枢的那一笔。原实现用 `bi.sdt >= zs.edt` 找「离开笔」，
+把这笔跳过了，于是把 5 周之后的第二笔下跌当成离开笔 → **三买/三卖整体晚一笔**
+（紫金矿业日线：三卖标到 2026-05-12 @34.39，而标准口径是 2026-04-15 @35.04，
+后者才是离开中枢后的第一次反抽）。改用 `bi.edt >= zs.edt`。
 
 条件 (b) 的推论：**数据最开头、还没有中枢的那一段不会有一买** ——
 没有中枢就谈不上「趋势」，这个排除是刻意的。
@@ -194,11 +202,13 @@ def buy_sell_points(
                     add("二卖", j, _ts(bis[j]["edt"]), float(bis[j]["high"]), "Up")
                 break
 
-    # ---------------- 三买：中枢之后向上笔突破 zg，回调低点仍在 zg 之上
+    # ---------------- 三买：离开中枢后的**第一次回抽**不回到中枢
+    # 「离开笔」的判定用 edt >= z.edt：czsc 的 zs.bis 里已经含了离开那一笔，
+    # 用 sdt >= z.edt 会把它跳过，导致三买/三卖整体晚一笔（见模块 docstring）。
     for z in centers:
         z_edt, zg = _ts(z["edt"]), float(z["high"])
         for j, b in enumerate(bis):
-            if _ts(b["sdt"]) < z_edt:
+            if _ts(b["edt"]) < z_edt:
                 continue
             if str(b["direction"]) != "Up" or float(b["high"]) <= zg:
                 continue
@@ -213,7 +223,7 @@ def buy_sell_points(
     for z in centers:
         z_edt, zd = _ts(z["edt"]), float(z["low"])
         for j, b in enumerate(bis):
-            if _ts(b["sdt"]) < z_edt:
+            if _ts(b["edt"]) < z_edt:
                 continue
             if str(b["direction"]) != "Down" or float(b["low"]) >= zd:
                 continue
