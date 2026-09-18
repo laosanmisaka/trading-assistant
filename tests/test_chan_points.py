@@ -85,6 +85,44 @@ def test_first_buy_needs_breaking_below_center():
     assert count(buy_sell_points(bis, centers), "一买") == 0
 
 
+def test_first_buy_converges_within_same_center():
+    """同一中枢下的多次创新低只保留最低点（一次建仓机会不数成多次）"""
+    centers = [zs("2024-01-01", "2024-01-05", 100, 105)]
+    bis = [
+        bi("Down", "2024-01-05", "2024-01-08", 110, 96),   # 候选
+        bi("Up",   "2024-01-08", "2024-01-10", 105, 96),
+        bi("Down", "2024-01-10", "2024-01-12", 108, 94),   # 候选（更低）
+        bi("Up",   "2024-01-12", "2024-01-15", 100, 94),
+        bi("Down", "2024-01-15", "2024-01-18", 100, 92),   # 候选（最低）
+        bi("Up",   "2024-01-18", "2024-01-20", 99, 92),
+    ]
+    pts = buy_sell_points(bis, centers)
+    assert count(pts, "一买") == 1
+    assert pick(pts, "一买")["price"] == 92
+
+
+def test_first_buy_not_merged_across_centers():
+    """跨中枢的两段下跌是两次机会，不能链式合并
+
+    旧实现按「相邻候选更低就吞并」收敛，A(96) 会因为后面有 B(88) 被吞掉，
+    于是两次独立的建仓机会只剩一个。收敛必须以参照中枢为界。
+    """
+    centers = [zs("2024-01-01", "2024-01-05", 100, 105),
+               zs("2024-02-01", "2024-02-05", 90, 95)]
+    bis = [
+        bi("Down", "2024-01-05", "2024-01-08", 110, 96),   # 候选A（破 100）
+        bi("Up",   "2024-01-08", "2024-01-10", 105, 96),
+        bi("Down", "2024-01-10", "2024-01-12", 105, 98),
+        bi("Up",   "2024-01-12", "2024-01-15", 106, 98),
+        bi("Down", "2024-02-05", "2024-02-08", 96, 88),    # 候选B（破 90，更低）
+        bi("Up",   "2024-02-08", "2024-02-10", 92, 88),
+    ]
+    pts = buy_sell_points(bis, centers)
+    assert count(pts, "一买") == 2
+    prices = sorted(p["price"] for p in pts if p["kind"] == "一买")
+    assert prices == [88.0, 96.0]
+
+
 def test_second_buy_rejected_when_new_low():
     """一买之后又创了新低 → 不是二买"""
     centers = [zs("2024-01-01", "2024-01-05", 100, 105)]

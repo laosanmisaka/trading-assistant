@@ -40,7 +40,7 @@ czsc 的 `cxt_first_buy_V221126` / `cxt_second_bs_V230320` /
 一买：向下笔的终点 P，满足
       (a) P.low 是最近 ``lookback`` 个向下笔终点中的最低
       (b) P.low 严格低于 P 之前最近一个中枢的下沿 zd（下跌趋势终结）
-      (c) 后面不再出现更低的低点 —— 连续创新低段只取**最后一个**
+      (c) 同一段下跌只取最低点 —— 收敛以**参照中枢**为界，中枢换了即断段
 二买：一买之后的下一个向下笔终点 Q（中间隔一个向上笔），Q.low > 一买 P.low
 三买：某中枢 Z 的**离开笔**之后，第一次回抽（向下笔）的终点 R，
       R.low > Z.zg（回调不回中枢）
@@ -67,10 +67,13 @@ czsc 的 `zs.bis` = 所有**仍与中枢区间 [zd, zg] 有重叠**的笔，**�
 
 **已知简化**（如需更严口径要老三拍板）：
 
-1. 严格缠论的一买要求「下跌趋势中最后一个中枢的三卖之后」，本实现
-   放宽为「跌破最近一个已完成中枢的下沿」。
+1. 严格缠论的一买要求「下跌趋势（≥2 个依次下移的同级别中枢）终结 +
+   背驰」，本实现放宽为「跌破最近一个已完成中枢的下沿」—— **没有背驰
+   判定，也没有要求 ≥2 个中枢**。放宽的结果是：单中枢盘整的向下离开
+   也会被标成一买（对应缠论的「盘整背驰」，缠师也认，但级别低于趋势一买）。
 2. czsc 1.0.1 没有线段（`xd_list`），一/二/三买都在**笔**级别判定，
-   没有做「线段级别」的递归。
+   没有做「线段级别」的递归。所以本模块的「日线中枢」严格说是
+   **日线笔中枢**，级别低于缠师体系里递归定义的「日线级别中枢」。
 3. `bis` / `centers` 的时间必须可比（同源，来自 `core.chan`）。
 """
 
@@ -114,6 +117,37 @@ def _last_center_before(centers: Sequence[dict], dt) -> dict | None:
     return found
 
 
+def _center_key(z: dict) -> tuple[str, str]:
+    """中枢的身份键 —— 判定两个候选是否「同属一段下跌」"""
+    return (str(_ts(z["sdt"])), str(_ts(z["edt"])))
+
+
+def _converge_by_center(cands: Sequence[tuple]) -> list[tuple]:
+    """按参照中枢分段收敛：同属一个中枢的候选只保留最低点
+
+    ``cands`` 元素为 ``(bi_idx, dt, price, center_key)``，按时间升序。
+    中枢换了 → 新的一段下跌开始，重新计数。
+
+    为什么不能按「相邻候选更低就吞并」做链式收敛（2026-09-18 实测）：
+    链式传播会跨越数月、跨越多个中枢，把互不相干的两段下跌并成一段。
+    5 年日线上贵州茅台 10 个候选被吞到 3 个、平安银行 11 个吞到 3 个；
+    平安银行 `9.83 → 9.37 → 8.65 → 7.55 → 7.53` 这一串里，9.83 比
+    8.38 高 17%、中间有完整反弹，是独立的一段，却被一路并掉。
+    """
+    out: list[tuple] = []
+    group: list[tuple] = []
+    for item in cands:
+        if group and group[-1][3] == item[3]:
+            group.append(item)
+        else:
+            if group:
+                out.append(min(group, key=lambda x: x[2]))
+            group = [item]
+    if group:
+        out.append(min(group, key=lambda x: x[2]))
+    return out
+
+
 def buy_sell_points(
     bis: Sequence[dict],
     centers: Sequence[dict] = (),
@@ -153,11 +187,10 @@ def buy_sell_points(
 
     # ---------------- 一买：向下笔终点创出最近 lookback 笔新低 + 跌破中枢下沿
     #
-    # 注意「连续创新低」要收敛成一个点：一段跌势里可能连着好几根向下笔
-    # 都在创新低，若每根都标一买，就把一次建仓机会数成了好几次。
-    # 缠论的一买是「下跌趋势的终结」，因此只保留**连续创新低段的最后
-    # 一个**（后面还有更低的低点 → 下跌没结束，当前这根不算）。
-    cand_buys: list[tuple[int, pd.Timestamp, float]] = []
+    # 收敛范围以**参照中枢**为界（见 `_converge_by_center`）：一段跌势里
+    # 连着几根向下笔都在创新低，只标一次（否则一次建仓机会被数成好几次）；
+    # 但跨越中枢的两段下跌是两次机会，不合并。
+    cand_buys: list[tuple] = []
     for k, (i, dt, _, low) in enumerate(down_ends):
         prior = [e[3] for e in down_ends[max(0, k - lookback):k]]
         if prior and low > min(prior):
@@ -167,17 +200,14 @@ def buy_sell_points(
         # 一买（数据最开头那段会被这条规则排除，符合缠论）。
         if z is None or low >= float(z["low"]):
             continue
-        cand_buys.append((i, dt, low))
+        cand_buys.append((i, dt, low, _center_key(z)))
 
-    first_buys: list[tuple[int, pd.Timestamp, float]] = []
-    for idx, (i, dt, low) in enumerate(cand_buys):
-        if idx + 1 < len(cand_buys) and cand_buys[idx + 1][2] < low:
-            continue                        # 后面还有更低的低点 → 不是终结
-        first_buys.append((i, dt, low))
+    first_buys = _converge_by_center(cand_buys)
+    for i, dt, low, _ in first_buys:
         add("一买", i, dt, low, "Down")
 
     # ---------------- 一卖：向上笔终点创出最近 lookback 笔新高 + 升破中枢上沿
-    cand_sells: list[tuple[int, pd.Timestamp, float]] = []
+    cand_sells: list[tuple] = []
     for k, (i, dt, _, high) in enumerate(up_ends):
         prior = [e[3] for e in up_ends[max(0, k - lookback):k]]
         if prior and high < max(prior):
@@ -185,17 +215,14 @@ def buy_sell_points(
         z = _last_center_before(centers, dt)
         if z is None or high <= float(z["high"]):
             continue
-        cand_sells.append((i, dt, high))
+        cand_sells.append((i, dt, high, _center_key(z)))
 
-    first_sells: list[tuple[int, pd.Timestamp, float]] = []
-    for idx, (i, dt, high) in enumerate(cand_sells):
-        if idx + 1 < len(cand_sells) and cand_sells[idx + 1][2] > high:
-            continue
-        first_sells.append((i, dt, high))
+    first_sells = _converge_by_center(cand_sells)
+    for i, dt, high, _ in first_sells:
         add("一卖", i, dt, high, "Up")
 
     # ---------------- 二买：一买之后第一个向下笔终点，不创新低（中间必隔向上笔）
-    for i0, _, low0 in first_buys:
+    for i0, _, low0, _ in first_buys:
         for j in range(i0 + 1, len(bis)):
             if str(bis[j]["direction"]) == "Down":
                 if float(bis[j]["low"]) > low0:
@@ -203,7 +230,7 @@ def buy_sell_points(
                 break
 
     # ---------------- 二卖
-    for i0, _, high0 in first_sells:
+    for i0, _, high0, _ in first_sells:
         for j in range(i0 + 1, len(bis)):
             if str(bis[j]["direction"]) == "Up":
                 if float(bis[j]["high"]) < high0:
