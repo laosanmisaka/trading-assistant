@@ -16,6 +16,7 @@ from PyQt5.QtGui import QIcon, QColor, QFont
 from config import (
     WINDOW_TITLE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT,
     SIDEBAR_WIDTH, REALTIME_REFRESH_MS, BUYPOINT_SCAN_INTERVAL_MS,
+    ENABLE_BUYPOINT_SCAN,
     KLINE_REFRESH_MS, KLINE_FLUSH_INTERVAL_SEC,
     DAILY_STOP_LOSS_HOUR, DAILY_STOP_LOSS_MINUTE,
     STOCK_TABLE_COLUMNS, PRESET_GROUPS, CHART_COLORS,
@@ -294,9 +295,16 @@ class MainWindow(QMainWindow):
         self._realtime_timer.start(REALTIME_REFRESH_MS)
 
         # 买点扫描 (5分钟，异步不阻塞UI)
+        # 2026-09-18 起停用：原判定是自研伪缠论（分位数「中枢」+ MACD 金叉 + 缩量），
+        # 与新缠论买卖点口径不一致。开关见 config.ENABLE_BUYPOINT_SCAN。
+        # 注意：保护放在这里而不是 `_scan_buy_points` 内部 ——
+        # tests/test_ui_threading.py 有 6 处直接调该方法测线程泄漏，加早退会废掉那些用例。
         self._buypoint_timer = QTimer(self)
         self._buypoint_timer.timeout.connect(self._scan_buy_points)
-        self._buypoint_timer.start(BUYPOINT_SCAN_INTERVAL_MS)
+        if ENABLE_BUYPOINT_SCAN:
+            self._buypoint_timer.start(BUYPOINT_SCAN_INTERVAL_MS)
+        else:
+            logger.info("买点扫描已停用（config.ENABLE_BUYPOINT_SCAN = False）")
 
         # K线数据刷新 (60秒)
         self._kline_timer = QTimer(self)
@@ -630,6 +638,10 @@ class MainWindow(QMainWindow):
 
     def _scan_buy_points(self):
         """异步扫描所有跟踪股票的买点 — 仅交易时段运行
+
+        ⚠️ 2026-09-18 起定时器已停用（config.ENABLE_BUYPOINT_SCAN = False）：
+        本方法的判定链是自研伪缠论，已决定弃用。方法本体保留是为了不废掉
+        tests/test_ui_threading.py 里直接调用它的线程泄漏用例。
 
         单 worker 串行扫描。原实现为每只股票各起一个 QThread：无并发上限、
         无回收，且靠主线程计数归零复位（任一 worker 异常退出即永久停摆）。

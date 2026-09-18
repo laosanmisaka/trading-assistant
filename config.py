@@ -45,6 +45,13 @@ TOP_FRACTAL_LOOKBACK = 10           # 分型回溯K线数 —— [未接线] 无
 GOLDEN_CROSS_LOOKBACK_DAYS = 3      # 金叉回溯天数
 VOLUME_CONTRACTION_RATIO = 0.7      # 缩量判断比例 (当前量 < 前5均量*0.7)
 CENTER_LOOKBACK_WEEKS = 20          # 中枢回溯周数
+ENABLE_BUYPOINT_SCAN = False        # 2026-09-18 停用（老三决定）
+                                    #   原判定是自研伪缠论：calc_center_range 取高点 75 分位 /
+                                    #   低点 25 分位当「中枢」，再叠 MACD 金叉 + 缩量，
+                                    #   与新缠论买卖点（czsc 笔+中枢 + 几何判定，见
+                                    #   core/chan_points.py）口径不一致，已弃用。
+                                    #   置 True 可临时恢复。替换方案见
+                                    #   docs/PLAN_BUYSELL_GEOMETRY.md
 
 # 图表
 CHART_STYLE = "charles"             # mplfinance 样式 —— [未接线] 无引用。
