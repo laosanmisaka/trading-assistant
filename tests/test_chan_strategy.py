@@ -641,3 +641,58 @@ def test_scan_insufficient_data_returns_empty():
     res = scan(kl, code="X")
     assert res.buy_count == 0
     assert res.trading_days == 0
+
+
+def test_scan_insufficient_data_does_not_need_czsc(monkeypatch):
+    """数据不足的早退路径不该碰 czsc
+
+    回归：scan() 原先第一行就 load_czsc()、长度检查在后面 ——
+    没装 czsc 的环境连「数据不足返回空」都走不通（直接 ImportError）。
+    """
+    from data.models import KLineData
+    import core.chan_strategy as cs
+
+    def _boom():
+        raise ImportError("模拟：czsc 未安装")
+
+    monkeypatch.setattr(cs, "load_czsc", _boom)
+    kl = [KLineData(code="X", date=f"2024-01-01 10:{i:02d}:00",
+                    open=1, high=1, low=1, close=1, volume=1) for i in range(50)]
+    res = cs.scan(kl, code="X")
+    assert res.buy_count == 0
+
+
+def test_match_buy_points_picks_earliest_bar_in_day():
+    """同一天内多个 30 分钟跃迁 bar，必须取**下标较小**的那根
+
+    回归：排序键曾写作 str(bar)，而 '100' < '99' 为真 —— 一天内的 bar
+    下标一旦跨过 10 的幂（99 → 100），会选中较晚的那根。
+    """
+    from core.chan_strategy import match_buy_points
+
+    days = [f"2025-01-{d:02d}" for d in range(1, 21)]
+    m = match_buy_points(days, [days[0]], [days[1]],
+                         [(days[1], 100), (days[1], 99)],
+                         max_gap_1to2=15, max_gap_2tom=2)
+    assert len(m) == 1
+    assert m[0]["bar"] == 99, "应取较早的 bar(99)，而不是 str 排序下的 100"
+
+
+def test_klines_to_df_drops_intraday_nan_placeholder():
+    """盘中未走完的占位 bar（OHLC 全 NaN）必须在桥接层丢掉
+
+    回归：新浪 stock_zh_a_minute 盘中会返回当日首根 bar 的占位行
+    （OHLC 全 NaN、volume/amount 有值），czsc 的 BarGenerator 拒绝该输入，
+    实测抛 ValueError: update_signals 失败 ... bar.open = NaN。
+    """
+    from core.chan import klines_to_df
+    from data.models import KLineData
+
+    kl = [KLineData(code="X", date="2026-09-17 15:00:00",
+                    open=1.0, high=1.1, low=0.9, close=1.05, volume=100),
+          KLineData(code="X", date="2026-09-18 10:00:00",
+                    open=float("nan"), high=float("nan"), low=float("nan"),
+                    close=float("nan"), volume=200)]
+    df = klines_to_df(kl)
+    assert len(df) == 1
+    assert str(df["dt"].iloc[0]).startswith("2026-09-17")

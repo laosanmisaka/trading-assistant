@@ -23,7 +23,10 @@ mootdx>=0.11.0
 # plotly 等），并会把 requests 升到 2.3x。
 # 实测坑（amount 必需列、输入必须排序、max_bi_num 截断、FX.mark 是枚举）
 # 见 core/chan.py 模块 docstring，改之前先读。
-czsc>=1.0.1
+# **封上限**：0.x → 1.0 已是重大跳跃（signals 模块整体进 Rust、xd_list
+# 消失），桥接层与策略层全是按 1.0.1 实测行为写的；2.x 会静默算错，
+# 不封上限等于留一个"升级即错误"的陷阱。
+czsc>=1.0.1,<2
 
 # ---- 开发/测试依赖 ----
 pytest>=8.0

@@ -34,6 +34,14 @@ czsc 1.0.1 实测约束（改这个文件之前先读完）
    判断会恒为 False，**把所有分型都识别成底分型**（本层初版即踩此坑：
    890 个分型全被标成 bottom，顶分型数为 0）。正确读法是 `mark.name`。
    同理 `BI.direction` 是 `Direction` 枚举，`.name` 取 "Up" / "Down"。
+
+7. **拒绝 NaN OHLCV，而盘中取数恰好会带回一根 NaN 占位 bar**。
+   1.0.1 的 `BarGenerator` 在聚合前校验，遇 NaN 直接抛
+   `ValueError: update_signals 失败 (dt=...) : bar.open = NaN`。
+   而新浪 `stock_zh_a_minute` 在**盘中**会多返回一根「当日第一根 bar」
+   的占位行：OHLC 全 NaN、volume/amount 有值（2026-09-18 10:00 那根
+   实测如此）。症状是**同一个脚本盘后跑得通、盘中直接崩**。
+   本层因此在 `klines_to_df` 里丢掉 OHLC 缺失的行，调用方不必自己清。
 --------------------------------------------------------------------
 """
 
@@ -144,6 +152,12 @@ def klines_to_df(klines: Iterable[KLineData]):
     df = pd.DataFrame(rows)
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
     df = df.dropna(subset=["dt"])
+    # 新浪 / 东财的分钟接口在**盘中**会多给一根「当日第一根 bar」的占位行：
+    # OHLC 全 NaN、volume/amount 有值（2026-09-18 10:00 那根实测如此）。
+    # czsc 1.0.1 的 BarGenerator 明确拒绝 NaN OHLCV，会抛
+    #   ValueError: update_signals 失败 ... bar.open = NaN
+    # 而且未走完的 bar 参与信号计算本来就会误导，所以收口在这里丢掉。
+    df = df.dropna(subset=["open", "high", "low", "close"])
     df = (df.sort_values("dt", kind="stable")
             .drop_duplicates(subset=["dt"], keep="last")
             .reset_index(drop=True))
