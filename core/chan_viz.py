@@ -10,7 +10,8 @@
 | 图层 | 来源 | 含义 |
 |------|------|------|
 | K 线 | 30 分钟原始行情 | 涨红跌绿（A 股惯例） |
-| 中枢 | `CZSC.zs_list` | 矩形 = [zd, zg]，横跨 [sdt, edt] |
+| 日线中枢 | 日线 `CZSC.zs_list` | **主图层**：实线框 = [zd, zg]，跨 [sdt, edt] |
+| 30 分中枢 | 30 分钟 `CZSC.zs_list` | 次图层，默认关闭（一个框只跨几十根 bar，碎） |
 | 笔   | `CZSC.bi_list` | 分型端点连线 |
 | 分型 | `CZSC.fx_list` | 顶/底分型散点（默认收起） |
 | 日线买卖点 | `chan_points` 几何 | **主图层**：一/二/三 买与卖，位置在笔端点 |
@@ -22,6 +23,16 @@
 ======================================================================
 三条必须在图上说清楚的口径（否则图会骗人）
 ======================================================================
+
+0. **中枢画日线级别，不画 30 分钟笔中枢（2026-09-18 按老三的批注改）。**
+
+   原先把 czsc 在 30 分钟数据上的 `zs_list` 直接画出来，一个中枢只跨几十根
+   bar、一年 20 多个碎框，看不出「哪一段是震荡区」。改成用同一份数据合成
+   日线、在日线上算笔与中枢，再映射回 30 分钟下标。实测（紫金矿业，246 个
+   交易日）：30 分钟笔中枢 26 个 → **日线中枢 5 个**，且与老三手绘的三个
+   震荡区逐一吻合（中框 [31.64, 34.39] vs 手绘 [31.62, 34.69]）。
+
+   日线 czsc 对象本来就要建（算日线买卖点用），所以这一层不增加计算量。
 
 1. **买卖点用「笔 + 中枢」的几何定义，不用 czsc 的 cxt_ 系列信号。**
 
@@ -101,6 +112,9 @@ STYLE = {
     "up": "#e53935", "down": "#26a69a",
     "center_fill": "rgba(96,125,139,0.16)",
     "center_line": "rgba(69,90,100,0.85)",
+    # 日线中枢：主图层，实线框 —— 用来一眼看出「哪一段是震荡区」
+    "center_daily_fill": "rgba(69,90,100,0.09)",
+    "center_daily_line": "rgba(55,71,79,0.95)",
     "bi": "rgba(92,107,192,0.75)",
     "fx_top": "#e57373", "fx_bottom": "#81c784",
     "ma_short": "#ff9800", "ma_long": "#2196f3",
@@ -354,6 +368,7 @@ def build_payload(
     # ---- 2. 日线缠论结构 + 几何买卖点（映射回 30 分钟下标） ----
     daily_df = _resample_daily(df)
     pts_daily: list[dict] = []
+    cr_d = None
     if len(daily_df) >= 3:
         cr_d = chan_mod.build(_to_klines(daily_df, "daily", code), period="daily")
         if cr_d:
@@ -366,7 +381,8 @@ def build_payload(
                     pts_daily.append({"kind": p["kind"], "idx": i,
                                       "price": p["price"]})
     logger.info(f"{code}: 几何买卖点 日线 {len(pts_daily)} 个 / "
-                f"30 分钟 {len(pts_m30)} 个（笔 {len(bis_raw)}、中枢 {len(centers_raw)}）")
+                f"30 分钟 {len(pts_m30)} 个（笔 {len(bis_raw)}、"
+                f"30 分钟中枢 {len(centers_raw)}）")
 
     def pack(points: list[dict]) -> dict:
         g: dict[str, list] = {k: [] for k in chan_points.KINDS}
@@ -383,6 +399,25 @@ def build_payload(
             i0, i1 = i1, i0
         centers.append([i0, max(i1, i0), round(float(zs["low"]), 3),
                         round(float(zs["high"]), 3)])
+
+    # ---- 3b. 日线中枢（主图层）----
+    # 2026-09-18 老三指出：图上只画 30 分钟笔中枢时，一个中枢只有几十根 bar、
+    # 一年下来 20 多个碎框，看不出「哪一段是震荡区」。他要的是**日线级别**中枢
+    # —— 用同一份数据合成日线、在日线上算笔与中枢，再按交易日映射回 30 分钟下标。
+    # 实测（紫金矿业 246 个交易日）：30 分钟笔中枢 26 个 → 日线中枢 5 个，
+    # 且日线中枢的 [zd, zg] 与他手绘的三个框逐一对上（中框 [31.64, 34.39]
+    # vs 手绘 [31.62, 34.69]）。日线 czsc 对象原本就为算日线买卖点而建，
+    # 这里只是把它的中枢也取出来，不额外增加计算。
+    centers_daily = []
+    if cr_d:
+        for zs in chan_mod.centers(cr_d):
+            r0 = day_range.get(pd.Timestamp(str(zs["sdt"])[:10]).date())
+            r1 = day_range.get(pd.Timestamp(str(zs["edt"])[:10]).date())
+            if r0 is None or r1 is None:
+                continue
+            centers_daily.append([r0[0], r1[1],
+                                  round(float(zs["low"]), 3),
+                                  round(float(zs["high"]), 3)])
 
     bi_points: list[list] = []
     for b in bis_raw:
@@ -459,27 +494,20 @@ def build_payload(
                 if i >= 0 and any(t["buy"]["signal_idx"] == i for t in trades)]
 
     # ---- 6. 默认视窗 ----
-    # 有成交：框住两笔交易的前后各留 80 / 120 根，聚焦到策略本身。
-    # 视窗别开太大（旧版 740 根）—— 一是 K 线太密看不清，二是拖动时
-    # 一屏变化幅度小、手感发涩。其余区间用拖动 / 滚轮看。
-    if trades:
-        first = min(t["buy"]["idx"] for t in trades)
-        idxs = [t["buy"]["idx"] for t in trades] + \
-               [t["sell"]["idx"] for t in trades
-                if t["sell"] and t["sell"]["idx"] >= 0]
-        last = max(idxs) if idxs else first
-        start = max(0, first - 80)
-        end = min(n - 1, last + 120)
-        if end <= start:
-            end = min(n - 1, start + 200)
-    else:
-        start = max(0, int(n * 0.72))
-        end = n - 1
+    # 铺满全量：主图层是**日线**级别的中枢与买卖点（一个中枢跨数月、一年
+    # 只有 5~9 个点），聚焦到几百根 bar 反而看不出结构。抠细节用底部滑条
+    # 或滚轮缩放。
+    # 策略买卖点用 32px 的大圆点、尺寸不随缩放变化，全量视图下依然清晰，
+    # 所以「看结构」和「对策略点」不冲突。
+    # （旧版默认贴在最右端 —— 向右拖 1 像素即触边界，是「拖着拖着拖不动」
+    # 的根因；中间版本改成聚焦交易窗口，只为对策略点，现在不必了。）
+    start, end = 0, n - 1
 
     packed_daily = pack(pts_daily)
     packed_m30 = pack(pts_m30)
     counts = {
-        "中枢": len(centers), "笔": len(bis_raw),
+        "日线中枢": len(centers_daily), "30分中枢": len(centers),
+        "笔": len(bis_raw),
         "顶分型": len(fx["top"]), "底分型": len(fx["bottom"]),
         "策略买点": len(trades),
         "日线买卖点": sum(len(x) for x in packed_daily.values()),
@@ -521,6 +549,7 @@ def build_payload(
             for i in range(n)
         ],
         "centers": centers,
+        "centers_daily": centers_daily,
         "bi_points": bi_points,
         "fractals": fx,
         "points": {"daily": packed_daily, "m30": packed_m30},
@@ -620,20 +649,40 @@ POINT_KEYS.forEach(function (k) {
   (isBuy ? dailyBuy : dailySell).push([k, pts]);
 });
 
-// ---- 区域标注：预热底纹 + 中枢（都用 markArea，silent 不参与 hover） ----
+// ---- 区域标注：预热底纹 + 两级中枢（都用 markArea，silent 不参与 hover） ----
 // 注意 xAxis 用类目值（日期字符串）而不是下标数字：category 轴上类目值
 // 是确定可匹配的，数字下标在不同 ECharts 版本里解释不一致。
-var areaData = CFG.centers.map(function (z) {
-  return [{xAxis: dates[z[0]], yAxis: z[2]},
-          {xAxis: dates[z[1]], yAxis: z[3]}];
-});
-if (CFG.warmup > 1) {
-  areaData.unshift([
-    {xAxis: dates[0], yAxis: CFG.price_min,
-     itemStyle: {color: ST.warmup, borderWidth: 0}},
-    {xAxis: dates[CFG.warmup - 1], yAxis: CFG.price_max}
-  ]);
+function boxes(src) {
+  return (src || []).map(function (z) {
+    return [{xAxis: dates[z[0]], yAxis: z[2]},
+            {xAxis: dates[z[1]], yAxis: z[3]}];
+  });
 }
+var warmupArea = CFG.warmup > 1 ? [[
+  {xAxis: dates[0], yAxis: CFG.price_min,
+   itemStyle: {color: ST.warmup, borderWidth: 0}},
+  {xAxis: dates[CFG.warmup - 1], yAxis: CFG.price_max}
+]] : [];
+
+// 中枢分两层（日线级别 / 30 分钟笔中枢），各挂在一个「无数据的散点系列」上。
+// markArea 属于 series —— 挂到 K 线上就只能有一个开关，分不了层。
+function centerLayer(name, src, style) {
+  var data = boxes(src);
+  if (!data.length) { return null; }
+  return {
+    name: name, type: 'scatter', xAxisIndex: 0, yAxisIndex: 0,
+    data: [], z: 1, animation: false, silent: true,
+    markArea: {silent: true, animation: false, itemStyle: style, data: data}
+  };
+}
+// 日线中枢：主图层。区间大、数量少，用来一眼看出「哪一段是震荡区」
+var layerDaily = centerLayer('日线中枢', CFG.centers_daily, {
+  color: ST.center_daily_fill, borderColor: ST.center_daily_line,
+  borderWidth: 1.6, opacity: 1});
+// 30 分钟笔中枢：次图层，默认收起（一个中枢只跨几十根 bar，一年 20 多个框）
+var layerM30 = centerLayer('30分中枢', CFG.centers, {
+  color: ST.center_fill, borderColor: ST.center_line,
+  borderWidth: 1, borderType: [4, 3], opacity: 0.9});
 
 // ---- 策略日线条件「生效日」竖线（markLine，silent） ----
 var lineData = CFG.strategy.d1_days.map(function (i) {
@@ -649,12 +698,10 @@ var series = [
     itemStyle: {color: ST.up, color0: ST.down,
       borderColor: ST.up, borderColor0: ST.down},
     // 中枢改用 markArea 挂在 K 线上（原实现用 custom 系列 + renderItem，
-    // dataZoom 每帧重跑 renderItem，是拖动卡顿的主因）
-    markArea: areaData.length ? {
-      silent: true, animation: false,
-      itemStyle: {color: ST.center_fill, borderColor: ST.center_line,
-                  borderWidth: 1, borderType: [4, 3], opacity: 0.9},
-      data: areaData
+    // dataZoom 每帧重跑 renderItem，是拖动卡顿的主因）。
+    // 这里只剩「预热底纹」—— 中枢已拆成上面两个独立图层。
+    markArea: warmupArea.length ? {
+      silent: true, animation: false, data: warmupArea
     } : undefined,
     markLine: lineData.length ? {
       silent: true, symbol: 'none', animation: false, label: {show: false},
@@ -758,14 +805,19 @@ series.push({
   barWidth: '60%', animation: false
 });
 
+// 中枢图层插到最前面：z 序上压在 K 线之下，图例顺序交给 LEGEND_FIRST 管
+[layerDaily, layerM30].filter(Boolean).reverse().forEach(function (s) {
+  series.unshift(s);
+});
+
 var counts = CFG.meta.counts;
 
 // 图例顺序 = 判读优先级。条目近 20 个、一行放不下，ECharts 会折行；
 // 若按 series 原顺序排，「策略买点 / 策略卖点」会被挤到末尾一行，
 // 而它们恰恰是这张图最需要看的两个点，所以显式排序提到最前。
-var LEGEND_FIRST = ['策略买点', '策略卖点', '策略命中二买', '成交点',
+var LEGEND_FIRST = ['策略买点', '策略卖点', '策略命中二买', '日线中枢',
                     '日线一买', '日线二买', '日线三买',
-                    '日线一卖', '日线二卖', '日线三卖'];
+                    '日线一卖', '日线二卖', '日线三卖', '成交点'];
 var legendData = series.map(function (s) { return s.name; });
 legendData.sort(function (a, b) {
   var ia = LEGEND_FIRST.indexOf(a), ib = LEGEND_FIRST.indexOf(b);
@@ -775,16 +827,16 @@ legendData.sort(function (a, b) {
 });
 
 // 默认只开日线级别；30 分钟级别与分型收起（数量多，会盖住 K 线）
-var legendSelected = {'顶分型': false, '底分型': false};
+var legendSelected = {'顶分型': false, '底分型': false, '30分中枢': false};
 POINT_KEYS.forEach(function (k) { legendSelected['30分' + k] = false; });
 
 var option = {
   animation: false,
   backgroundColor: '#ffffff',
   title: {
-    text: counts['策略买点'] > 0
-      ? '三重共振买点 ' + counts['策略买点'] + ' 次（默认视窗已定位到首笔买点附近）'
-      : '本区间未出现三重共振买点（默认视窗为最近一段）',
+    text: '默认铺满全量　·　日线中枢 ' + counts['日线中枢'] + ' 个　日线买卖点 '
+          + counts['日线买卖点'] + ' 个　策略买点 ' + counts['策略买点']
+          + ' 次　（底部滑条 / 滚轮可缩放）',
     left: 'center', top: 6,
     textStyle: {fontSize: 13, fontWeight: 'normal', color: '#555'}
   },
@@ -905,7 +957,8 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
     chips = [
         ("K线", f"{meta['bars']} 根 / {meta['trading_days']} 交易日"),
         ("区间", f"{meta['first_dt']} → {meta['last_dt']}"),
-        ("中枢", counts.get("中枢", 0)),
+        ("日线中枢", counts.get("日线中枢", 0)),
+        ("30分中枢", counts.get("30分中枢", 0)),
         ("笔", counts.get("笔", 0)),
         ("分型", f"顶 {counts.get('顶分型', 0)} / 底 {counts.get('底分型', 0)}"),
         ("日线买点", f"一 {dp.get('一买', 0)} / 二 {dp.get('二买', 0)} / "
@@ -939,14 +992,19 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
     note = (
         "<b>怎么读这张图</b>"
         "<ol>"
+        "<li><b>中枢分两个级别，别混着看</b>。<b>日线中枢</b>（实线框，主图层）"
+        "是同一份数据合成日线后在日线上算的笔中枢 —— 区间大、数量少，"
+        "一眼能看出「哪一段是震荡区」；<b>30 分中枢</b>（虚线框，默认收起）"
+        "是 30 分钟笔中枢，一个只跨几十根 bar，一年 20 多个碎框，"
+        "判读趋势时反而碍事。<b>说「买卖点太多」多半是级别选小了</b>："
+        "同一段行情里 30 分钟级别买卖点比日线多一个数量级。</li>"
         "<li><b>买卖点用「笔 + 中枢」的几何定义</b>，位置就是笔的端点"
         "（所以标记与折线拐点重合）。"
         "<b>不用</b> czsc 的 <code>cxt_*</code> 信号 —— 那些是逐 bar 的"
         "择时状态，会在同段行情里反复闪断（实测「一买」和「二卖」逐根 bar "
         "交替、笔序号在 9→5→11 间跳），按关键字计数会把状态抖动数成买点。</li>"
         "<li><b>日线级别是主图层</b>（大三角），<b>30 分钟级别默认关闭</b>"
-        "（图例点开）。同一段行情里日线的买卖点比 30 分钟少一个数量级 —— "
-        "「买卖点太多」多半是级别选小了。</li>"
+        "（图例点开）。</li>"
         "<li><b>紫色/橙色竖线</b>是策略用的日线条件「生效日」，取"
         "「当日首根 bar 上的日线值」，等价于上一交易日收盘确认的状态。"
         "实测日线信号在日内会翻转（418 个交易日中 45 天），所以不能取"
@@ -1003,7 +1061,8 @@ def generate(code: str, out_path=None, *, period: str = "30min",
         out_path = Path("outputs") / f"chan_{payload['meta']['code']}_{period}.html"
     path = save_html(html, out_path)
     logger.info(f"已生成 {path}（{payload['meta']['bars']} 根 K 线，"
-                f"中枢 {len(payload['centers'])} 个，"
+                f"日线中枢 {len(payload['centers_daily'])} 个 / "
+                f"30分中枢 {len(payload['centers'])} 个，"
                 f"策略买点 {len(payload['strategy']['trades'])} 个）")
     return path
 

@@ -210,6 +210,22 @@ def test_payload_indices_in_range(payload):
                 assert 0 <= idx < n and price > 0
 
 
+def test_payload_centers_two_levels(payload):
+    """中枢分日线 / 30 分钟两层
+
+    日线中枢是主图层（区间大、数量少，用来看「哪一段是震荡区」），
+    30 分钟笔中枢是次图层默认收起。两者都用 [i0, i1, zd, zg] 表示。
+    """
+    n = payload["meta"]["bars"]
+    assert "centers_daily" in payload
+    for key in ("centers", "centers_daily"):
+        for i0, i1, zd, zg in payload[key]:
+            assert 0 <= i0 <= i1 < n
+            assert zd <= zg
+    assert payload["meta"]["counts"]["日线中枢"] == len(payload["centers_daily"])
+    assert payload["meta"]["counts"]["30分中枢"] == len(payload["centers"])
+
+
 def test_payload_points_two_levels(payload):
     """买卖点分日线 / 30 分钟两层，kind 只能是六类之一"""
     from core.chan_points import KINDS
@@ -326,6 +342,19 @@ def test_render_html_markarea_uses_category_values(payload, tmp_path):
     html = render_html(payload, echarts_path=fake_echarts(tmp_path))
     assert "xAxis: dates[" in html
     assert "yAxis: z[2]" in html and "yAxis: z[3]" in html
+
+
+def test_render_html_has_two_center_layers(payload, tmp_path):
+    """两级中枢各自独立成层，图例才能分别开关
+
+    markArea 属于 series —— 两层都挂在 K 线上的话只有一个开关，
+    所以每层各挂在一个「无数据的散点系列」上。
+    """
+    html = render_html(payload, echarts_path=fake_echarts(tmp_path))
+    assert "日线中枢" in html and "30分中枢" in html
+    assert "'30分中枢': false" in html          # 30 分钟层默认收起
+    assert "centerLayer('日线中枢'" in html
+    assert "centerLayer('30分中枢'" in html
 
 
 def test_render_html_states_and_notes(payload, tmp_path):
