@@ -94,6 +94,30 @@ czsc 的 `日线_D1B_BUY1` / `..._BS2辅助V230320` 输出的不是 0/1，
 成交"这种做不到的假设。
 
 ======================================================================
+持仓与统计口径（2026-09-18 定案，改之前先读）
+======================================================================
+
+**每个买点独立成一笔交易，前一笔未平仓时新买点照开 —— 允许重叠持仓。**
+
+定案理由：当前目的是**验证买卖点是否成立**，不是做组合回测。重叠持仓把
+「信号质量」与「资金约束」解耦 —— 每笔交易独立可查、互不干扰，不会被
+「没资金了所以没买」这类组合层面的事盖住信号本身的问题。
+
+由此产生的口径（读统计数字前必须知道）：
+
+- `ScanResult.summary()` 的胜率 / 平均收益 / 平均持有是**按笔统计**，
+  **不是资金曲线**。同一时刻若有 N 笔持仓，这些收益不可直接相加成组合收益。
+- `summary()` 额外给出 `最大同时持仓` / `重叠笔数`（`position_overlap_stats`），
+  用来自查这批结果有多大比例是重叠的。**重叠笔数占比高时，按笔统计的结论
+  要打折看**；若只想看互不干扰的信号质量，可先把重叠的那几笔摘掉再谈胜率。
+- 未平仓的那笔（`sell is None`）视为一直持有到数据末尾，与之后所有买点重叠。
+
+**什么时候要改**：接组合回测 / 资金曲线 / 仓位管理时。届时二选一 ——
+「持仓中忽略新买点」（单持仓）或按仓位分配。改的位置是 `scan_from_frame`
+组装 `trades` 的那段循环；`position_overlap_stats` 可直接当回归判据
+（改成单持仓后，`最大同时持仓` 必须为 1）。
+
+======================================================================
 数据量要求（两个门槛，别混为一谈）
 ======================================================================
 
@@ -209,11 +233,16 @@ class ScanResult:
         return len(self.trades)
 
     def summary(self) -> dict:
-        """汇总统计（未平仓的交易不计入收益率）"""
+        """汇总统计（未平仓的交易不计入收益率）
+
+        ⚠️ 收益按**笔**统计，不是资金曲线 —— 本策略允许重叠持仓（见模块
+        docstring「持仓与统计口径」），同一时刻多笔时收益不可相加。
+        `最大同时持仓` / `重叠笔数` 同时返回，用于自查重叠程度。
+        """
         closed = [t for t in self.trades if t.sell is not None]
         rets = [t.return_pct for t in closed if t.return_pct is not None]
         wins = [r for r in rets if r > 0]
-        return {
+        stats = {
             "code": self.code,
             "买点数": self.buy_count,
             "已平仓": len(closed),
@@ -225,6 +254,86 @@ class ScanResult:
             "平均持有交易日": (round(sum(t.sell.hold_days for t in closed) / len(closed), 1)
                         if closed else None),
         }
+        stats.update(position_overlap_stats(self.trades))
+        return stats
+
+
+# ======================================================================
+# 同时持仓统计（校验「每笔独立、允许重叠」的口径）
+# ======================================================================
+
+def _as_naive(dt) -> pd.Timestamp:
+    """转成不带时区的 Timestamp
+
+    买点 dt 来自 czsc 输出（**带 UTC 时区**，墙钟仍是北京时间），卖点 dt
+    来自日线索引（朴素日期）—— 两者直接比较会抛
+    `TypeError: Cannot compare tz-naive and tz-aware timestamps`。
+    统一去时区后再比（`chan_viz._naive` 同口径）。
+    """
+    ts = pd.Timestamp(str(dt))
+    return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+
+def _spans_overlap(a: tuple, b: tuple) -> bool:
+    """两个时间区间是否有**正长度**的交叠
+
+    端点相接（卖在买当天）不算重叠 —— 那是换仓，不是同时在手。
+    `end is None` 表示仍未平仓，视作延伸到无穷。
+    """
+    far = pd.Timestamp.max
+    a_end = a[1] if a[1] is not None else far
+    b_end = b[1] if b[1] is not None else far
+    return a[0] < b_end and b[0] < a_end
+
+
+def position_overlap_stats(trades: Iterable[Trade]) -> dict:
+    """同时持仓统计 —— 每个买点独立成笔的副产物（见模块 docstring）
+
+    每笔交易占用 ``[买入成交, 卖出成交)`` 这段区间；未平仓的占用到数据末尾之后。
+
+    返回
+    ----
+    ``{"最大同时持仓": int, "重叠笔数": int, "重叠对数": int}``
+
+    - 最大同时持仓：任意时刻同时在手的最大笔数（1 = 全程最多只持一笔）
+    - 重叠笔数：与至少另一笔有交叠的交易笔数（未平仓那笔会与之后所有买点重叠）
+    - 重叠对数：有交叠的交易两两配对数量
+
+    注意这是**按笔独立**口径下的自查指标。若重叠笔数占比高，`summary()`
+    里的胜率 / 平均收益属于「信号统计」而非「组合收益」。
+    """
+    spans = []
+    for t in trades:
+        start = _as_naive(t.buy.dt)
+        end = _as_naive(t.sell.dt) if t.sell is not None else None
+        spans.append((start, end))
+    if not spans:
+        return {"最大同时持仓": 0, "重叠笔数": 0, "重叠对数": 0}
+
+    # 扫描线：同一时刻**先平后开**（-1 排在 +1 前），
+    # 否则「卖在买当天」的换仓会被算成两笔同时在手。
+    events: list[tuple] = []
+    for start, end in spans:
+        events.append((start, 1))
+        if end is not None:
+            events.append((end, -1))
+    events.sort(key=lambda e: (e[0], e[1]))
+    running = max_conc = 0
+    for _, delta in events:
+        running += delta
+        max_conc = max(max_conc, running)
+
+    overlapped: set = set()
+    pairs = 0
+    for i in range(len(spans)):
+        for j in range(i + 1, len(spans)):
+            if _spans_overlap(spans[i], spans[j]):
+                pairs += 1
+                overlapped.update((i, j))
+
+    return {"最大同时持仓": max_conc,
+            "重叠笔数": len(overlapped),
+            "重叠对数": pairs}
 
 
 # ======================================================================

@@ -922,9 +922,19 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
         f'<span class="box">{k}：<b>{v}</b></span>' for k, v in chips)
     s = meta["strategy_summary"]
     if s.get("买点数"):
+        # 允许重叠持仓（见 chan_strategy docstring「持仓与统计口径」），
+        # 所以要显式标出同时持仓笔数与重叠笔数 —— 否则「胜率/平均收益」
+        # 会被当成组合收益读，而它是按笔统计的。
+        conc, ov = s.get("最大同时持仓", 1), s.get("重叠笔数", 0)
+        conc_color = "#c62828" if (conc or 0) > 1 else "#333"
         meta_html += ('<span class="box">已平仓：<b>{}</b>　胜率：<b>{}%</b>　'
-                      '平均：<b>{}%</b>　平均持有：<b>{} 交易日</b></span>').format(
-            s["已平仓"], s["胜率%"], s["平均收益%"], s["平均持有交易日"])
+                      '平均：<b>{}%</b>　平均持有：<b>{} 交易日</b></span>'
+                      '<span class="box">最大同时持仓：'
+                      '<b style="color:{}">{}</b>　重叠笔数：<b>{}</b>'
+                      '<span style="color:#888">（按笔统计，非组合收益）</span>'
+                      '</span>').format(
+            s["已平仓"], s["胜率%"], s["平均收益%"], s["平均持有交易日"],
+            conc_color, conc, ov)
 
     note = (
         "<b>怎么读这张图</b>"
@@ -946,6 +956,11 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
         "<b>策略买点</b>＝日线一买 → 15 个交易日内日线二买 → 2 个交易日内 "
         "该二买 bar 收盘确认，成交顺延 1 根 bar；<b>策略卖点</b>＝收盘破"
         "日线 MA5 后改用 MA10、两条都被跌破后卖出，成交顺延 1 个交易日。</li>"
+        "<li><b>每笔买点独立成一笔交易，允许重叠持仓</b>（前一笔没平仓，"
+        "新买点照开）。所以上方的 胜率 / 平均收益 是<b>按笔统计</b>，"
+        "<b>不是资金曲线</b> —— 同一时刻多笔持仓时，这些收益不能相加成"
+        "组合收益。顶部「最大同时持仓」标出实际重叠了几笔，大于 1 时标红。"
+        "这是为了先把「信号本身对不对」验清楚，资金约束留到组合回测再接。</li>"
         f"<li>左侧浅灰底纹是 <b>czsc 预热区间（前 {payload['warmup']} 根）</b>："
         "只有策略用的信号需要预热，几何买卖点由全量笔/中枢算出，不受影响。</li>"
         "</ol>"

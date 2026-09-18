@@ -17,6 +17,7 @@ from core.chan_strategy import (
     daily_state_from_bars,
     match_buy_points,
     match_sell_points,
+    position_overlap_stats,
     scan_from_frame,
     signal_columns,
     build_signals_config,
@@ -401,8 +402,8 @@ def test_scan_result_summary_counts():
     buy = BuySignal(dt="2024-01-02 10:00", price=10.0, d1="2024-01-01",
                     d2="2024-01-05", gap_1to2=4, gap_2tom=1)
     r = ScanResult(code="600000", trades=[
-        Trade(buy=buy, sell=SellSignal("d", 11.0, "MA5", 10.5, 5)),
-        Trade(buy=buy, sell=SellSignal("d", 9.0, "MA10", 9.5, 7)),
+        Trade(buy=buy, sell=SellSignal("2024-02-01", 11.0, "MA5", 10.5, 5)),
+        Trade(buy=buy, sell=SellSignal("2024-02-02", 9.0, "MA10", 9.5, 7)),
         Trade(buy=buy, sell=None),
     ])
     s = r.summary()
@@ -418,6 +419,75 @@ def test_scan_result_summary_empty():
     s = ScanResult(code="600000").summary()
     assert s["买点数"] == 0
     assert s["胜率%"] is None
+
+
+# ----------------------------------------------------------------------
+# 同时持仓统计（2026-09-18 定案：每笔独立、允许重叠）
+# ----------------------------------------------------------------------
+
+def _trade(buy_dt, sell_dt=None, buy_px=10.0, sell_px=11.0, hold=5):
+    """构造一笔交易；sell_dt=None 表示数据末尾仍未平仓"""
+    buy = BuySignal(dt=buy_dt, price=buy_px, d1="2024-01-01", d2="2024-01-05",
+                    gap_1to2=4, gap_2tom=1)
+    sell = (SellSignal(dt=sell_dt, price=sell_px, ma="MA5",
+                       ma_value=10.5, hold_days=hold)
+            if sell_dt else None)
+    return Trade(buy=buy, sell=sell)
+
+
+def test_position_overlap_sequential_trades():
+    """首尾相接、互不重叠 → 最多同时只持一笔"""
+    stats = position_overlap_stats([
+        _trade("2024-01-02", "2024-02-01"),
+        _trade("2024-02-01", "2024-03-01"),   # 卖在买当天：换仓，不是重叠
+        _trade("2024-03-05", "2024-04-01"),
+    ])
+    assert stats["最大同时持仓"] == 1
+    assert stats["重叠笔数"] == 0
+    assert stats["重叠对数"] == 0
+
+
+def test_position_overlap_counts_concurrent_trades():
+    """两笔交叠 → 最大同时持仓 2"""
+    stats = position_overlap_stats([
+        _trade("2024-01-02", "2024-03-01"),
+        _trade("2024-02-01", "2024-04-01"),
+    ])
+    assert stats["最大同时持仓"] == 2
+    assert stats["重叠笔数"] == 2
+    assert stats["重叠对数"] == 1
+
+
+def test_position_overlap_open_trade_spans_to_end():
+    """未平仓的那笔视为持有到数据末尾，与后面所有买点重叠"""
+    stats = position_overlap_stats([
+        _trade("2024-01-02", None),
+        _trade("2024-05-01", "2024-06-01"),
+    ])
+    assert stats["最大同时持仓"] == 2
+    assert stats["重叠笔数"] == 2
+
+
+def test_position_overlap_empty_and_single():
+    assert position_overlap_stats([]) == {
+        "最大同时持仓": 0, "重叠笔数": 0, "重叠对数": 0}
+    assert position_overlap_stats([_trade("2024-01-02", "2024-02-01")]) == {
+        "最大同时持仓": 1, "重叠笔数": 0, "重叠对数": 0}
+
+
+def test_summary_exposes_overlap_metrics():
+    """summary() 必须显式给出重叠指标
+
+    允许重叠持仓是老三 2026-09-18 的定案（先验证买卖点，不做资金约束），
+    但胜率/平均收益因此在口径上是「按笔统计」而非组合收益 —— 重叠笔数
+    必须能让读者看到，否则数字会被读成资金曲线收益。
+    """
+    s = ScanResult(code="600000", trades=[
+        _trade("2024-01-02", "2024-03-01"),
+        _trade("2024-02-01", "2024-04-01"),
+    ]).summary()
+    assert s["最大同时持仓"] == 2
+    assert s["重叠笔数"] == 2
 
 
 # ----------------------------------------------------------------------

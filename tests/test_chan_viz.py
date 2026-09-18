@@ -339,6 +339,18 @@ def test_render_html_states_and_notes(payload, tmp_path):
     assert "策略命中二买" in html
 
 
+def test_render_html_discloses_position_overlap(payload, tmp_path):
+    """允许重叠持仓的口径必须写在图上
+
+    每笔买点独立成笔、允许重叠（2026-09-18 定案），所以胜率/平均收益是
+    「按笔统计」而非资金曲线收益。图上必须显式披露，否则数字会被误读。
+    """
+    html = render_html(payload, echarts_path=fake_echarts(tmp_path))
+    assert "最大同时持仓" in html
+    assert "重叠笔数" in html
+    assert "按笔统计" in html and "不是资金曲线" in html
+
+
 def test_render_html_defaults_hide_minor_layers(payload, tmp_path):
     """分型与 30 分钟买卖点默认收起（数量多，会盖住 K 线）"""
     html = render_html(payload, echarts_path=fake_echarts(tmp_path))
