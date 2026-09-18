@@ -223,3 +223,74 @@ class TestFractalsAndCenters:
         r = chan.build(make_klines(600), "30min")
         dirs = {b["direction"] for b in chan.bis(r)}
         assert dirs <= {"Up", "Down"}, f"未归一化的方向: {dirs}"
+
+
+# --------------------------------------------------- 中枢的起止与区间口径
+class TestCenterBoundaryRules:
+    """把 czsc 1.0.1 的中枢口径钉死（2026-09-18 实测确认，见 chan.centers docstring）
+
+    这几条是**特征化测试**：czsc 从 0.x 跳到 1.0 时 API 面目全非，
+    将来升到 1.1 若改了中枢构造，这里会第一时间报警。
+    """
+
+    @staticmethod
+    def _seq(b):
+        return (str(b.sdt)[:16], str(b.edt)[:16])
+
+    def test_boundaries_equal_first_and_last_bi(self):
+        """起始 = 第一笔起点（zs.bis[0].sdt）；终止 = 最后一笔终点（zs.bis[-1].edt）"""
+        r = chan.build(make_klines(2000), "30min")
+        zss = list(r.obj.zs_list)
+        assert zss, "未识别出任何中枢"
+        for zs in zss:
+            rb = list(zs.bis)
+            assert str(zs.sdt)[:16] == str(rb[0].sdt)[:16], "中枢起点不是第一笔起点"
+            assert str(zs.edt)[:16] == str(rb[-1].edt)[:16], "中枢终点不是最后一笔终点"
+
+    def test_bis_all_overlap_the_center_range(self):
+        """zs.bis 的每一笔都与 [zd, zg] 有重叠 —— 这是「延伸」的判据
+
+        对应缠论中心定理一（延伸 ⟺ 任意段 [dn,gn] 与 [ZD,ZG] 有重叠），
+        也说明 **离开笔不在 zs.bis 里**。
+        """
+        r = chan.build(make_klines(2000), "30min")
+        for zs in r.obj.zs_list:
+            zd, zg = float(zs.zd), float(zs.zg)
+            for b in zs.bis:
+                assert not (float(b.high) < zd or float(b.low) > zg), (
+                    f"延伸笔 [{float(b.low)}, {float(b.high)}] 与中枢 "
+                    f"[{zd}, {zg}] 无重叠")
+
+    def test_range_is_first_three_bis_and_extremes_are_all_bis(self):
+        """zg/zd 取前三笔；gg/dd 取全部笔"""
+        r = chan.build(make_klines(2000), "30min")
+        for zs in r.obj.zs_list:
+            rb = list(zs.bis)
+            hs = [float(b.high) for b in rb]
+            ls = [float(b.low) for b in rb]
+            assert min(hs[:3]) == pytest.approx(float(zs.zg))
+            assert max(ls[:3]) == pytest.approx(float(zs.zd))
+            assert max(hs) == pytest.approx(float(zs.gg))
+            assert min(ls) == pytest.approx(float(zs.dd))
+
+    def test_leaving_bi_is_the_one_after_zs_bis(self):
+        """中枢结束后的第一笔与中枢区间无重叠（= 离开笔）
+
+        数据末尾那个中枢例外：尾部还没走完，czsc 会提前收口，
+        所以这里只看非末尾的中枢。
+        """
+        r = chan.build(make_klines(2000), "30min")
+        bl = list(r.obj.bi_list)
+        seq = [self._seq(b) for b in bl]
+        zss = list(r.obj.zs_list)
+        checked = 0
+        for zs in zss[:-1]:                      # 排除末中枢（尾部未确认）
+            rb = list(zs.bis)
+            pos = seq.index(self._seq(rb[-1]))
+            nxt = bl[pos + 1]
+            zd, zg = float(zs.zd), float(zs.zg)
+            assert float(nxt.high) < zd or float(nxt.low) > zg, (
+                f"中枢后的第一笔 [{float(nxt.low)}, {float(nxt.high)}] "
+                f"仍与 [{zd}, {zg}] 重叠")
+            checked += 1
+        assert checked >= 1, "样本里只有一个中枢，无法验证离开笔规则"
