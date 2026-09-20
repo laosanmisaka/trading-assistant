@@ -40,13 +40,16 @@ TOP_FRACTAL_LOOKBACK = 10           # 分型回溯K线数 —— [未接线] 无
                                     #   且该常量未被使用。是否应接入 + 周期到底是哪个，
                                     #   已列入 docs/BUSINESS_RULES_CONFIRMATION.md Q1
 
-# 买点扫描参数
+# 买点参数
 # ⚠️ 2026-09-18 已删除伪缠论买点扫描链路（core/buy_point_scanner.py 及其
 #    calc_center_range / check_pullback_to_center / is_volume_contraction
 #    配套参数）。原判定是「高 75 分位 / 低 25 分位当中枢 + MACD 金叉 + 缩量」，
 #    与新缠论口径（czsc 笔+中枢 + 几何判定，见 core/chan_points.py）无关。
 #    当前买点由 core/chan_strategy.py 给出，只在 K 线图上标注，不做提醒。
-GOLDEN_CROSS_LOOKBACK_DAYS = 3      # 金叉回溯天数（回测模块 core/backtest 使用）
+# ⚠️ 2026-09-20 收尾：`GOLDEN_CROSS_LOOKBACK_DAYS`（金叉回溯天数）也已删除 ——
+#    它唯一的用户是 core/backtest/strategy.py 的 BuyPointStrategy（伪缠论回测
+#    策略），该策略整体取缔。买点参数现在全部落在 core/chan_strategy.py 的
+#    DEFAULT_* 常量里。
 
 # 图表
 CHART_STYLE = "charles"             # mplfinance 样式 —— [未接线] 无引用。

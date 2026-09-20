@@ -1,8 +1,11 @@
-"""技术指标测试 — 均线 / MACD / 分型 / 金叉
+"""技术指标测试 — 均线 / MACD / 分型
 
-2026-09-18：`calc_center_range` / `check_pullback_to_center` /
-`is_volume_contraction` / `is_volume_expansion` 随伪缠论买点链路一并
-删除，对应用例同步移除（它们是「高 75 分位 / 低 25 分位当中枢」那套）。
+伪缠论链路两轮取缔后，对应用例同步移除：
+- 2026-09-18：`calc_center_range` / `check_pullback_to_center` /
+  `is_volume_contraction` / `is_volume_expansion`（「高 75 分位 / 低 25 分位
+  当中枢」那套）
+- 2026-09-20：`get_latest_bottom_fractal` / `detect_golden_cross` /
+  `detect_macd_golden_cross` / `detect_death_cross`（随伪缠论回测策略失活）
 """
 
 import numpy as np
@@ -10,9 +13,7 @@ import pytest
 from core.technical import (
     calc_ma, calc_ema, calc_macd,
     _merge_contains, detect_top_fractal, detect_bottom_fractal,
-    get_latest_top_fractal, get_latest_bottom_fractal,
-    detect_golden_cross, detect_macd_golden_cross,
-    detect_death_cross,
+    get_latest_top_fractal,
     kline_to_arrays, find_stop_loss_price,
 )
 
@@ -49,24 +50,11 @@ class TestMACD:
         assert len(dea) == 50
         assert len(bar) == 50
 
-    def test_macd_golden_cross(self):
-        """构造已知的MACD金叉场景 — V形反转产生金叉"""
-        # 前40根：持续下跌 (EMA12 < EMA26, DIF为负)
-        # 后30根：持续上涨 (DIF上穿DEA产生金叉)
-        closes = np.array(
-            [15.0 - i * 0.15 for i in range(40)] +    # 15 → 9.15
-            [9.15 + i * 0.2 for i in range(30)]         # 9.15 → 14.95
-        )
-        has_gc, idx = detect_macd_golden_cross(closes, lookback=30)
-        # V形反弹段应该有MACD金叉
-        assert has_gc
-        assert idx >= 40  # 金叉应发生在反弹期间
-
-    def test_macd_no_golden_cross_in_downtrend(self):
-        """持续下跌中无金叉"""
-        closes = np.array([20 - i * 0.3 for i in range(50)])
-        has_gc, idx = detect_macd_golden_cross(closes, lookback=10)
-        assert not has_gc
+    def test_calc_macd_too_short_returns_nan(self):
+        """长度不足 slow 时返回全 NaN（调用方据此跳过）"""
+        closes = np.array([10.0] * 10)
+        dif, dea, bar = calc_macd(closes)
+        assert np.all(np.isnan(dif)) and np.all(np.isnan(dea))
 
 
 class TestFractal:
@@ -127,24 +115,6 @@ class TestFractal:
         bottoms = detect_bottom_fractal(highs, lows)
         assert bottoms == [4]
         assert lows[bottoms[0]] == 1.0  # 分型低点所在原始K线
-        has_bottom, idx = get_latest_bottom_fractal(highs, lows)
-        assert has_bottom
-        assert idx == 4
-
-
-class TestGoldenCross:
-    def test_sma_golden_cross(self):
-        """快速上穿慢速产生金叉"""
-        closes = np.array([10]*20 + list(range(10, 20)), dtype=float)
-        # 快线(5)会上穿慢线(10)
-        has_gc, _ = detect_golden_cross(closes, fast_period=5, slow_period=10, lookback=10)
-        assert has_gc
-
-    def test_no_cross_in_flat(self):
-        """盘整中无金叉"""
-        closes = np.full(30, 10.0)
-        has_gc, _ = detect_golden_cross(closes, lookback=10)
-        assert not has_gc
 
 
 class TestStopLoss:

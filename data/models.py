@@ -19,9 +19,14 @@ class TradeType(str, Enum):
 
 
 class AlertType(str, Enum):
+    """提醒类型
+
+    ⚠️ 2026-09-20：`BUY_POINT = "buy_point"` 已删除 —— 买点自 2026-09-18 起
+    不做提醒（只在 K 线图上标注），该枚举值失去唯一用途。DB 里若残留
+    `alert_type='buy_point'` 的旧行，不会被任何代码读到。
+    """
     STOP_LOSS = "stop_loss"
     TAKE_PROFIT = "take_profit"
-    BUY_POINT = "buy_point"
     ALL = "all"
 
 
@@ -118,15 +123,3 @@ class AlertState:
     tp_manual: bool = False            # 止盈价是否为手动设置
     sl_manual_value: float = 0.0       # 手动设置的止损价
     tp_manual_value: float = 0.0       # 手动设置的止盈价
-
-
-@dataclass
-class BuyPointState:
-    """买点信号状态"""
-    stock_code: str = ""
-    weekly_bottom_fractal: bool = False    # 周线底分型
-    daily_golden_cross: bool = False        # 日线金叉
-    shallow_pullback_center: bool = False   # 30min缩量回踩中枢
-    buy_point_triggered: bool = False       # 综合买点触发 (≥2/3)
-    signal_details: str = ""                # 具体满足条件描述
-    last_checked: str = ""                  # 上次检查时间

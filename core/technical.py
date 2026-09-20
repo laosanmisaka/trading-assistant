@@ -1,10 +1,22 @@
-"""技术指标计算 — 均线/分型/金叉死叉/MACD（自研）
+"""技术指标计算 — 均线/分型/MACD（自研）
 
-⚠️ 这里的「分型」是**自研 K 线包含处理**，与 czsc 的笔/分型不是同一套。
-2026-09-18 已删除 `calc_center_range` / `check_pullback_to_center` /
-`is_volume_contraction` / `is_volume_expansion` —— 它们是已废弃的伪缠论
-买点扫描（`core/buy_point_scanner.py`）专用，旧「中枢」是高 75 分位 /
-低 25 分位，与新缠论口径无关。缠论结构一律走 `core/chan.py`。
+⚠️ 这里的「分型」是**自研 K 线包含处理**，与 czsc 的笔/分型不是同一套
+（实测两者逐点等价，但本模块只做单序列分型，不做笔/中枢）。
+缠论结构一律走 `core/chan.py`。
+
+**已取缔的伪缠论链路（两轮）**
+- 2026-09-18 删 `calc_center_range` / `check_pullback_to_center` /
+  `is_volume_contraction` / `is_volume_expansion` —— 伪缠论买点扫描
+  （`core/buy_point_scanner.py`）专用。旧「中枢」取高 75 分位 / 低 25 分位，
+  不是缠论中枢。
+- 2026-09-20 删 `get_latest_bottom_fractal` / `detect_golden_cross` /
+  `detect_macd_golden_cross` / `detect_death_cross` —— 随伪缠论回测策略
+  `core/backtest/strategy.py::BuyPointStrategy` 一并失活。生产代码里
+  `get_latest_top_fractal` 仍被 `alert_engine` 用于止盈判定（**活跃，勿删**）。
+
+保留 `detect_bottom_fractal`：它是 `detect_top_fractal` 的对称构件，与
+`_merge_contains` 共用实现。当前生产代码无调用方（原调用方是已删的伪缠论策略），
+保留是因为它不是伪缠论、且成对删除会让分型模块残缺。**老三确认不要可一并删。**
 """
 
 from typing import Optional, Tuple
@@ -189,103 +201,6 @@ def get_latest_top_fractal(highs: np.ndarray, lows: np.ndarray) -> Tuple[bool, i
         idx = tops[-1]
         return True, idx, float(highs[idx])
     return False, -1, 0.0
-
-
-def get_latest_bottom_fractal(highs: np.ndarray, lows: np.ndarray) -> Tuple[bool, int]:
-    """获取最近的底分型
-    返回: (是否存在, 索引)
-    """
-    bottoms = detect_bottom_fractal(highs, lows)
-    if bottoms:
-        return True, bottoms[-1]
-    return False, -1
-
-
-# ============================================================
-# 金叉/死叉检测
-# ============================================================
-
-def detect_golden_cross(
-    closes: np.ndarray,
-    fast_period: int = 5,
-    slow_period: int = 10,
-    lookback: int = 3,
-) -> Tuple[bool, int]:
-    """
-    检测最近N日内是否发生SMA金叉 (快线上穿慢线)
-    返回: (是否金叉, 金叉发生日索引)
-    注意: 这是SMA均线金叉，需求要求MACD金叉请使用 detect_macd_golden_cross()
-    """
-    if len(closes) < slow_period + 1:
-        return False, -1
-
-    fast_ma = calc_ma(closes, fast_period)
-    slow_ma = calc_ma(closes, slow_period)
-
-    for i in range(len(closes) - 1, max(0, len(closes) - lookback - 1), -1):
-        if i < slow_period:
-            continue
-        if (not np.isnan(fast_ma[i]) and not np.isnan(slow_ma[i]) and
-                not np.isnan(fast_ma[i - 1]) and not np.isnan(slow_ma[i - 1])):
-            if fast_ma[i - 1] <= slow_ma[i - 1] and fast_ma[i] > slow_ma[i]:
-                return True, i
-
-    return False, -1
-
-
-def detect_macd_golden_cross(
-    closes: np.ndarray,
-    fast: int = 12,
-    slow: int = 26,
-    signal: int = 9,
-    lookback: int = 3,
-) -> Tuple[bool, int]:
-    """
-    检测最近N日内是否发生MACD金叉 (DIF上穿DEA)
-    MACD金叉定义: 前一周期 DIF <= DEA, 当前周期 DIF > DEA
-    返回: (是否金叉, 金叉发生日索引)
-    """
-    if len(closes) < slow + signal + 1:
-        return False, -1
-
-    dif, dea, _ = calc_macd(closes, fast, slow, signal)
-
-    for i in range(len(closes) - 1, max(0, len(closes) - lookback - 1), -1):
-        if i < slow + signal:
-            continue
-        if (not np.isnan(dif[i]) and not np.isnan(dea[i]) and
-                not np.isnan(dif[i - 1]) and not np.isnan(dea[i - 1])):
-            if dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]:
-                logger.debug(f"MACD金叉发生于索引 {i}")
-                return True, i
-
-    return False, -1
-
-
-def detect_death_cross(
-    closes: np.ndarray,
-    fast_period: int = 5,
-    slow_period: int = 10,
-    lookback: int = 3,
-) -> Tuple[bool, int]:
-    """
-    检测最近N日内是否发生死叉 (快线下穿慢线)
-    """
-    if len(closes) < slow_period + 1:
-        return False, -1
-
-    fast_ma = calc_ma(closes, fast_period)
-    slow_ma = calc_ma(closes, slow_period)
-
-    for i in range(len(closes) - 1, max(0, len(closes) - lookback - 1), -1):
-        if i < slow_period:
-            continue
-        if (not np.isnan(fast_ma[i]) and not np.isnan(slow_ma[i]) and
-                not np.isnan(fast_ma[i - 1]) and not np.isnan(slow_ma[i - 1])):
-            if fast_ma[i - 1] >= slow_ma[i - 1] and fast_ma[i] < slow_ma[i]:
-                return True, i
-
-    return False, -1
 
 
 # ============================================================
