@@ -108,7 +108,9 @@ trading-assistant/
 ├── ui/
 ├── utils/
 ├── scripts/                  <- 离线工具（标的池扫描 / 窗口标定 / 策略评估）
-│   ├── pool_liquid50.txt     <- 50 只流动性标的池
+│   ├── pool_liquid50.txt     <- 50 只「行业龙头」池（缠论早期口径）
+│   ├── pool_liquid500.txt    <- 520 只池（成交额前 500 + 原 50 只并集，六脉默认）
+│   ├── build_pool.py         <- 按成交额重新生成标的池
 │   └── scan_pool.py
 ├── visualize_chan.py         <- 缠论单文件 HTML 图入口
 ├── outputs/                  <- 图表/报告产物（.gitignore 已忽略）

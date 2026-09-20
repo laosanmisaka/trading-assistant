@@ -339,14 +339,17 @@ UI 与 HTML 图共用同一套函数，不各算一套。
 | --- | --- | --- | --- |
 | `ema(s, n)` / `sma_tdx(s, n, m)` | Series、周期 | Series | 通达信 `EMA` / `SMA`（**加权**平均，不是简单均线） |
 | `to_frame(daily)` | `list[KLineData]` | DataFrame | 转日线表 |
-| `compute_indicators(df, ma_exit=10)` | 日线表、卖出均线周期 | DataFrame | OHLC + `B1`~`B6` / `all6` / `buy_signal` / `sell_signal` |
-| `SixPulseStrategy(warmup=60, ma_exit=10, hold_days=None)` | — | 策略 | 共振首日买入、破 MA10 卖出；`hold_days` **仅供对照实验** |
-| `SixPulseStrategy.generate_signals(daily)` | 日线 | `list[Signal]` | T 日收盘确认、**T+1 开盘**成交 |
+| `compute_indicators(df, ma_exit=10, entry_ma=None)` | 日线表、均线周期 | DataFrame | OHLC + `B1`~`B6` / `all6` / `buy_signal` / `sell_signal` + 分级出口三条均线（`entry_ma` 非空时另有 `ma_entry`） |
+| `SixPulseStrategy(..., entry_ma=20, trade_from=None)` | — | 策略 | 共振首日**且收盘站上 MA20** 买入；分级出口（破 MA5 卖半 / 站回 MA10 补 / 破 MA20 全清） |
+| `SixPulseStrategy.generate_signals(daily)` | 日线 | `list[Signal]` | T 日收盘确认、**T+1 开盘**成交；`weight` 表委托占本轮满仓的比例 |
 
-实测（50 只 / 1500 根日线，2026-09-20）：4466 笔、胜率 30.5%、平均每笔 +0.18%、
-平均区间收益 **+11.33%** vs 买入持有 **+62.39%**；买点相对"任意日起"的超额
-≈ 0 ⇒ **无 alpha**，不建议实盘。评估脚本 `scripts/eval_six_pulse.py`，
-测试 `tests/test_six_pulse.py`（19 条，全离线）。
+实测（2026-09-20，**当前口径**：520 只池 / `--start 2025-01-01` / 带 MA20 过滤）：
+7997 轮 15908 笔、轮胜率 35.4%、平均区间收益 **+50.13%** vs 同池买入持有 **+195.09%**。
+换**无偏随机池**（499 只）是 **+11.23% vs +54.10%**。**三个池全部跑输同池基线**，
+买点超额 ≈ 0、横截面回归 α 为负、β 仅 0.15~0.28 ⇒ **无 alpha，不建议实盘**。
+评估脚本 `scripts/eval_six_pulse.py`（`--pool` / `--start` / `--entry-ma`），
+池构建 `scripts/build_pool.py`，测试 `tests/test_six_pulse.py`（35 条，全离线）。
+口径与完整证据见 `docs/STRATEGY_SIX_PULSE.md`（§2.0 是主口径）。
 
 ## 9. 做 T 模块
 
