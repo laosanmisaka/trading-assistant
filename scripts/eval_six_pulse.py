@@ -161,11 +161,23 @@ def eval_one(code: str, daily: list[KLineData], strategy, capital: float,
         i0 = next((i for i, k in enumerate(daily) if k.date >= start), len(daily))
         if i0 >= len(daily):
             i0 = len(daily) - 1                    # 区间内无数据：退化到最后一根
-    holds = [
-        idx[t.exit_date] - idx[t.entry_date]
+    # 在场天数必须按**区间并集**算：引擎里轮内每一笔的 `entry_date` 都保持为
+    # 该轮首次建仓日（只在清仓时才重置），分级出口一轮拆多笔 ⇒ 逐笔累加会把
+    # 同一段重复计入（实测把 39.7% 的在场时间算成 73.5%）。
+    spans = sorted(
+        (idx[t.entry_date], idx[t.exit_date])
         for t in rep.trades
         if t.entry_date in idx and t.exit_date in idx
-    ]
+        and idx[t.exit_date] > idx[t.entry_date]
+    )
+    merged: list[list[int]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    holds = [e - s for s, e in merged]                 # 轮级持仓长度（跨出口可比）
+    hold_sum = sum(holds)
     first, last = daily[i0].close, daily[-1].close
     return {
         "code": code,
@@ -179,7 +191,7 @@ def eval_one(code: str, daily: list[KLineData], strategy, capital: float,
         "max_dd": rep.max_drawdown,
         "profit_factor": rep.profit_factor,
         "avg_hold": (sum(holds) / len(holds)) if holds else 0.0,
-        "hold_sum": sum(holds),
+        "hold_sum": hold_sum,
         "buy_hold": (last / first - 1.0) if first else 0.0,
         "open_position": rep.open_position,
         "_trades": rep.trades,
@@ -235,7 +247,8 @@ def merge_stats(rows: list[dict]) -> dict:
         "max_dd": max((r["max_dd"] for r in rows), default=0.0),
         "avg_hold": (sum(holds) / len(holds)) if holds else 0.0,
         "win_codes": sum(1 for r in rows if r["total_return"] > 0),
-        # 在场时间占比 —— 用来看"收益是择时挣的还是在场时间挣的"
+        # 在场**时间**占比（轮级区间并集）—— 只回答"多久手里有仓"，**不含仓位深浅**。
+        # 半仓同样算在场 ⇒ 时间在场率必然 ≥ **资金**在场率 E(w)，两者不可混用。
         "exposure": (sum(r["hold_sum"] for r in rows) / sum(r["bars"] for r in rows))
         if rows else 0.0,
     }
@@ -399,7 +412,7 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     add(f"| 收益为正的标的 | {st['win_codes']} / {st['codes']} | — |")
     add(f"| 平均最大回撤 | {st['avg_dd']:.2%} | — |")
     add(f"| 最大回撤（单只最差） | {st['max_dd']:.2%} | — |")
-    add(f"| **在场时间占比** | {st['exposure']:.1%} | 100% |")
+    add(f"| **在场时间占比**（含半仓，非资金口径） | {st['exposure']:.1%} | 100% |")
     add("")
     add(f"**轮级口径**（{st['episodes']} 轮持仓）：胜率 **{st['ep_win_rate']:.1%}**、"
         f"平均每轮 **{_pct(st['ep_avg_pct'])}**。"
@@ -408,10 +421,10 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     add("")
     add(f"**笔级口径**（{st['codes_with_trades']} 只标的有交易、共 {st['trades']} 笔）："
         f"胜率 {st['win_rate']:.1%}、平均每笔 {_pct(st['avg_pct'])}、"
-        f"盈亏比 {_pf(st['profit_factor'])}、平均持有 {st['avg_hold']:.1f} 个交易日。")
+        f"盈亏比 {_pf(st['profit_factor'])}、轮均持有 {st['avg_hold']:.1f} 个交易日。")
     add("")
     add(f"⚠️ 逐只独立满仓、等权平均 ⇒ **不是组合资金曲线**，收益不可相加。"
-        f"平均持有 {st['avg_hold']:.1f} 日意味着单只一年换手约 "
+        f"轮均持有 {st['avg_hold']:.1f} 日意味着单只一年换手约 "
         f"{252 / st['avg_hold']:.0f} 次，费用按双边 0.15% 量级计每年磨掉不少。")
     add("")
 
@@ -476,7 +489,7 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     nxt = 5 if sweep else 4
     add(f"## {nxt}. 逐标的明细（按区间收益排序）")
     add("")
-    add("| 代码 | 名称 | 笔数 | 胜率 | 平均每笔 | 区间收益 | 最大回撤 | 平均持有 | 买入持有 |")
+    add("| 代码 | 名称 | 笔数 | 胜率 | 平均每笔 | 区间收益 | 最大回撤 | 轮均持有 | 买入持有 |")
     add("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for r in sorted(rows, key=lambda x: x["total_return"], reverse=True):
         nm = names.get(r["code"], "")
