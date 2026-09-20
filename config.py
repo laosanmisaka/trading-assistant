@@ -8,7 +8,6 @@
 
 # 数据刷新
 REALTIME_REFRESH_MS = 60000         # 增量行情刷新间隔 (毫秒, 60秒)
-BUYPOINT_SCAN_INTERVAL_MS = 300000  # 买点扫描间隔 (毫秒, 5分钟)
 KLINE_REFRESH_MS = 60000            # K线数据刷新间隔 (毫秒, 60秒, 仅当前查看的股票)
 KLINE_FLUSH_INTERVAL_SEC = 300      # 内存K线 flush 到 DB 间隔 (秒, 5分钟)
 KLINE_CACHE_TTL_SEC = 60            # 内存K线缓存TTL (秒) —— [未接线] 无引用
@@ -41,17 +40,13 @@ TOP_FRACTAL_LOOKBACK = 10           # 分型回溯K线数 —— [未接线] 无
                                     #   且该常量未被使用。是否应接入 + 周期到底是哪个，
                                     #   已列入 docs/BUSINESS_RULES_CONFIRMATION.md Q1
 
-# 买点扫描
-GOLDEN_CROSS_LOOKBACK_DAYS = 3      # 金叉回溯天数
-VOLUME_CONTRACTION_RATIO = 0.7      # 缩量判断比例 (当前量 < 前5均量*0.7)
-CENTER_LOOKBACK_WEEKS = 20          # 中枢回溯周数
-ENABLE_BUYPOINT_SCAN = False        # 2026-09-18 停用（老三决定）
-                                    #   原判定是自研伪缠论：calc_center_range 取高点 75 分位 /
-                                    #   低点 25 分位当「中枢」，再叠 MACD 金叉 + 缩量，
-                                    #   与新缠论买卖点（czsc 笔+中枢 + 几何判定，见
-                                    #   core/chan_points.py）口径不一致，已弃用。
-                                    #   置 True 可临时恢复。替换方案见
-                                    #   docs/PLAN_BUYSELL_GEOMETRY.md
+# 买点扫描参数
+# ⚠️ 2026-09-18 已删除伪缠论买点扫描链路（core/buy_point_scanner.py 及其
+#    calc_center_range / check_pullback_to_center / is_volume_contraction
+#    配套参数）。原判定是「高 75 分位 / 低 25 分位当中枢 + MACD 金叉 + 缩量」，
+#    与新缠论口径（czsc 笔+中枢 + 几何判定，见 core/chan_points.py）无关。
+#    当前买点由 core/chan_strategy.py 给出，只在 K 线图上标注，不做提醒。
+GOLDEN_CROSS_LOOKBACK_DAYS = 3      # 金叉回溯天数（回测模块 core/backtest 使用）
 
 # 图表
 CHART_STYLE = "charles"             # mplfinance 样式 —— [未接线] 无引用。
@@ -63,7 +58,6 @@ CHART_COLORS = {
     "down": "#008000",              # 绿跌
     "alert_stop_loss": "#FF4500",   # 止损警告色
     "alert_take_profit": "#FFD700", # 止盈警告色
-    "alert_buy_point": "#00CED1",   # 买点信号色
     "ma_colors": ["#FFA500", "#00BFFF", "#FF69B4", "#9370DB"],  # MA线颜色
     "volume_up": "#DC143C",
     "volume_down": "#008000",
@@ -81,7 +75,9 @@ WINDOW_TITLE = "A股交易辅助系统"
 WINDOW_MIN_WIDTH = 1280
 WINDOW_MIN_HEIGHT = 800
 SIDEBAR_WIDTH = 180
+# 列序与 ui/stock_table.py 的 COL_* 常量一一对应。
+# 2026-09-18 删除「买点信号」列 —— 买点提醒已取消，改在 K 线图上标注。
 STOCK_TABLE_COLUMNS = [
     "代码", "名称", "现价", "涨跌幅(%)", "涨跌额",
-    "成交量(手)", "止损价", "止盈价", "买点信号", "提醒",
+    "成交量(手)", "止损价", "止盈价", "提醒",
 ]

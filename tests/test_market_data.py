@@ -400,7 +400,7 @@ class TestStockTableModel:
         quotes = {
             "000001": RealtimeQuote(code="000001", name="平安银行", price=0.0),
         }
-        model.update_data(quotes, set(), set())
+        model.update_data(quotes, set())
         assert model.rowCount() == 1
         # 验证 display role 返回代码和名称
         idx_code = model.index(0, StockTableModel.COL_CODE)
@@ -416,5 +416,5 @@ class TestStockTableModel:
         app = QApplication.instance() or QApplication(sys.argv)
 
         model = StockTableModel()
-        model.update_data({}, set(), set())
+        model.update_data({}, set())
         assert model.rowCount() == 0

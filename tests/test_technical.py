@@ -1,4 +1,9 @@
-"""技术指标测试 — MACD / 分型 / 金叉 / 中枢 / 缩量"""
+"""技术指标测试 — 均线 / MACD / 分型 / 金叉
+
+2026-09-18：`calc_center_range` / `check_pullback_to_center` /
+`is_volume_contraction` / `is_volume_expansion` 随伪缠论买点链路一并
+删除，对应用例同步移除（它们是「高 75 分位 / 低 25 分位当中枢」那套）。
+"""
 
 import numpy as np
 import pytest
@@ -8,8 +13,6 @@ from core.technical import (
     get_latest_top_fractal, get_latest_bottom_fractal,
     detect_golden_cross, detect_macd_golden_cross,
     detect_death_cross,
-    calc_center_range, check_pullback_to_center,
-    is_volume_contraction, is_volume_expansion,
     kline_to_arrays, find_stop_loss_price,
 )
 
@@ -142,30 +145,6 @@ class TestGoldenCross:
         closes = np.full(30, 10.0)
         has_gc, _ = detect_golden_cross(closes, lookback=10)
         assert not has_gc
-
-
-class TestCenterRange:
-    def test_center_calculation(self):
-        highs = np.array([10 + i for i in range(20)], dtype=float)
-        lows  = np.array([8 + i for i in range(20)], dtype=float)
-        ch, cl = calc_center_range(highs, lows, lookback=10)
-        assert ch > cl
-
-    def test_pullback_to_center(self):
-        """价格在中枢区间内"""
-        assert check_pullback_to_center(15.0, 16.0, 14.0)
-
-
-class TestVolume:
-    def test_volume_contraction(self):
-        """前5根大成交量，当前缩量"""
-        vols = np.array([1000, 1200, 1100, 1300, 1150, 600], dtype=float)
-        # 前5均量 = 1150; 600 < 1150 * 0.7 = 805
-        assert is_volume_contraction(vols)
-
-    def test_no_contraction(self):
-        vols = np.array([1000, 1200, 1100, 1300, 1150, 2000], dtype=float)
-        assert not is_volume_contraction(vols)
 
 
 class TestStopLoss:

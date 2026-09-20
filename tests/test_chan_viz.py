@@ -259,8 +259,10 @@ def test_payload_strategy_keys(payload):
         assert 0 <= i < payload["meta"]["bars"]
     for t in st["trades"]:
         assert t["buy"]["idx"] >= 0
-        assert 1 <= t["buy"]["gap_1to2"] <= 15
-        assert 0 <= t["buy"]["gap_2tom"] <= 2
+        # 窗口口径 2026-09-18 改为 一买→二买 ≤40 交易日、二买↔30 分钟二买 ±10
+        # （gap_2tom 有符号：<0 = 次级别买点早于日线二买）
+        assert 1 <= t["buy"]["gap_1to2"] <= 40
+        assert -10 <= t["buy"]["gap_2tom"] <= 10
         if t["sell"]:
             assert t["sell"]["idx"] > t["buy"]["idx"]
             assert t["sell"]["ma"] in ("MA5", "MA10")
@@ -408,3 +410,71 @@ def test_render_html_legend_keeps_strategy_visible(payload, tmp_path):
 def test_render_html_missing_echarts_raises(payload, tmp_path):
     with pytest.raises(FileNotFoundError):
         render_html(payload, echarts_path=str(tmp_path / "nope.js"))
+
+
+# ----------------------------------------------------------------------
+# 图上标注导出（给桌面端 matplotlib 用）
+# ----------------------------------------------------------------------
+
+def _fake_payload_for_marks():
+    """手搓一份 payload —— 只为验证「下标 → 日期」的换算，不涉及缠论"""
+    return {
+        "dates": ["2026-01-05 10:00", "2026-01-06 10:00", "2026-01-07 14:00"],
+        "points": {
+            "daily": {"一买": [[0, 10.0]], "三卖": [[2, 12.5]],
+                      "二买": [[99, 1.0]]},          # 越界下标必须被丢掉
+            "m30": {"二买": [[1, 11.0]]},             # 30 分钟层不进 UI 标注
+        },
+        "strategy": {"trades": [
+            {"buy": {"dt": "2026-01-06 10:30", "price": 11.0},
+             "sell": {"dt": "2026-01-07", "price": 12.0, "return_pct": 9.09}},
+            {"buy": {"dt": "2026-01-07 14:00", "price": 12.5}, "sell": None},
+        ]},
+    }
+
+
+def test_marks_from_payload_maps_index_to_date():
+    from core.chan_viz import marks_from_payload
+
+    marks = marks_from_payload(_fake_payload_for_marks())
+
+    assert marks["geometry"] == [
+        {"date": "2026-01-05", "kind": "一买", "price": 10.0},
+        {"date": "2026-01-07", "kind": "三卖", "price": 12.5},
+    ], "日线几何点要按 bar 下标换算成日期，越界下标要丢掉"
+
+    assert marks["trades"] == [
+        {"buy_date": "2026-01-06", "buy_price": 11.0,
+         "sell_date": "2026-01-07", "sell_price": 12.0, "return_pct": 9.09},
+        {"buy_date": "2026-01-07", "buy_price": 12.5,
+         "sell_date": "", "sell_price": None, "return_pct": None},
+    ], "未平仓那笔的 sell_date 必须是空串（不是 None 也不是乱码日期）"
+
+
+def test_marks_from_payload_tolerates_empty_payload():
+    """空 payload 不抛异常 —— UI 拿到空标注只是不画点"""
+    from core.chan_viz import marks_from_payload
+
+    assert marks_from_payload({}) == {"geometry": [], "trades": []}
+
+
+def test_marks_from_klines_matches_payload(payload):
+    """marks_from_klines 的点必须与 payload 同一批（同源，不另算一套）"""
+    from core.chan_viz import marks_from_klines, marks_from_payload
+
+    marks = marks_from_payload(payload)
+    dates = {d[:10] for d in payload["dates"]}
+    for p in marks["geometry"]:
+        assert p["date"] in dates
+        assert p["kind"].endswith(("买", "卖"))
+    for t in marks["trades"]:
+        assert t["buy_date"] in dates
+    assert "meta" not in marks
+
+
+def test_marks_from_klines_carries_meta():
+    from core.chan_viz import marks_from_klines
+
+    marks = marks_from_klines(make_klines(420), code="600000", name="测试股")
+    assert marks["meta"]["code"] == "sh600000"
+    assert set(marks) == {"geometry", "trades", "meta"}

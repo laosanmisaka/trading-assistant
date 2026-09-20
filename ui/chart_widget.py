@@ -1,4 +1,9 @@
-"""K线/分时图组件 — matplotlib 嵌入 PyQt5"""
+"""K线/分时图组件 — matplotlib 嵌入 PyQt5
+
+2026-09-18 起，日线图上会标注**缠论买卖点**（日线几何买卖点 + 策略成交点）。
+数据由 `ui/chan_worker.py` 在后台算好（`core.chan_viz.marks_from_klines`），
+与本项目生成的 HTML 缠论图**同源**，不各算一套。
+"""
 
 import numpy as np
 import pandas as pd
@@ -8,6 +13,7 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QTabWidget
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.collections import LineCollection, PolyCollection
@@ -15,6 +21,18 @@ import matplotlib.font_manager as fm
 
 from config import MA_PERIODS, CHART_COLORS
 from data.models import KLineData
+
+
+# ---- 缠论买卖点配色 ----
+# 直接复用 HTML 缠论图的调色板（core/chan_viz.STYLE），保证「图」与
+# 「桌面端」看到的是同一套配色。这里不 import chan_viz 是为了避免
+# UI 启动时连带加载 core 里的缠论栈（pandas 已经在用，但 czsc 是延迟加载的）。
+CHAN_BUY_COLOR = "#d32f2f"      # 策略买点
+CHAN_SELL_COLOR = "#2e7d32"     # 策略卖点
+CHAN_DAILY_COLORS = {
+    "一买": "#7b1fa2", "二买": "#e65100", "三买": "#f9a825",
+    "一卖": "#004d40", "二卖": "#1b5e20", "三卖": "#2e7d32",
+}
 
 
 # ---- 中文字体配置 ----
@@ -133,6 +151,7 @@ class ChartTabWidget(QWidget):
         self.code = ""
         self.klines: list[KLineData] = []
         self.intraday_data: list[dict] = []
+        self.chan_marks: dict = {}      # 缠论买卖点标注（见 set_chan_marks）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -377,16 +396,18 @@ class ChartTabWidget(QWidget):
             ax1.axhline(y=self.take_profit_price, color=CHART_COLORS["alert_take_profit"],
                        linestyle="--", linewidth=1.0, label=f"止盈 {self.take_profit_price:.2f}")
 
-        # 底分型标注
-        if hasattr(self, 'bottom_fractal_indices') and self.bottom_fractal_indices:
-            for bf_idx in self.bottom_fractal_indices:
-                if 0 <= bf_idx < len(df):
-                    low = df.iloc[bf_idx]["Low"]
-                    ax1.scatter(bf_idx, low * 0.98, marker="^", color="blue", s=80, zorder=5)
+        # 缠论买卖点标注（日线图专属：点是日线级别的，其它周期没有对应关系）
+        legend_extra = []
+        if self.period == "daily" and self.chan_marks:
+            legend_extra = self._draw_chan_marks(ax1, df)
 
         ax1.set_title(title, fontsize=12, fontweight="bold", fontfamily=_CHINESE_FONT)
         ax1.set_ylabel("价格", fontfamily=_CHINESE_FONT)
-        ax1.legend(loc="upper left", fontsize=7, ncol=2,
+        handles, labels = ax1.get_legend_handles_labels()
+        for handle, label in legend_extra:
+            handles.append(handle)
+            labels.append(label)
+        ax1.legend(handles, labels, loc="upper left", fontsize=7, ncol=2,
                   prop=fm.FontProperties(family=_CHINESE_FONT, size=7))
         ax1.grid(True, alpha=0.3)
         # 上栏隐藏X轴标签，统一下栏显示
@@ -435,15 +456,103 @@ class ChartTabWidget(QWidget):
         ax2._y_data = df["Volume"].values
         ax2._y_mode = "volume"
 
+    # ================================================================
+    # 缠论买卖点标注
+    # ================================================================
+
+    def _draw_chan_marks(self, ax, df) -> list[tuple]:
+        """在有 K 线的主轴上标注缠论买卖点 → 返回额外的图例代理项
+
+        数据（``self.chan_marks``）来自 `core.chan_viz.marks_from_klines`，
+        形态是**按日期**给出的点：日线几何买卖点（一/二/三 买与卖）+ 策略
+        实际成交点。这里只做「日期 → 横轴下标」映射，把买点画在当根 K 线
+        的低点下方、卖点画在高点上方。
+
+        为什么不用 `ax.scatter` 逐个画、而是一次画一批：与蜡烛批量化同因 ——
+        250 根上逐点建 artist 会让缩放/重绘变慢。整个函数只产生
+        **2 个 collection**（买一批、卖一批）。
+        """
+        geometry = self.chan_marks.get("geometry") or []
+        trades = self.chan_marks.get("trades") or []
+        if not geometry and not trades:
+            return []
+
+        date_to_x = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(df.index)}
+        n = len(df)
+        highs = df["High"].to_numpy(dtype=float)
+        lows = df["Low"].to_numpy(dtype=float)
+
+        # 每项: (x, 标记色, 尺寸, 文字, 是否买点)
+        items: list[tuple] = []
+
+        for p in geometry:
+            i = date_to_x.get(str(p.get("date")))
+            if i is None or not 0 <= i < n:
+                continue
+            kind = str(p.get("kind", ""))
+            items.append((i, CHAN_DAILY_COLORS.get(kind, "#888888"), 45, kind,
+                          kind.endswith("买")))
+
+        for t in trades:
+            i = date_to_x.get(str(t.get("buy_date")))
+            if i is not None and 0 <= i < n:
+                price = t.get("buy_price")
+                items.append((i, CHAN_BUY_COLOR, 130,
+                              "买 " + (f"{price:.2f}" if price else ""), True))
+            j = date_to_x.get(str(t.get("sell_date"))) if t.get("sell_date") else None
+            if j is not None and 0 <= j < n:
+                price = t.get("sell_price")
+                pct = t.get("return_pct")
+                label = "卖 " + (f"{price:.2f}" if price else "")
+                if pct is not None:
+                    label += f" ({pct:+.2f}%)"
+                items.append((j, CHAN_SELL_COLOR, 130, label, False))
+
+        if not items:
+            return []
+
+        for is_buy in (True, False):
+            group = [it for it in items if it[4] is is_buy]
+            if not group:
+                continue
+            xs = [it[0] for it in group]
+            ys = [lows[it[0]] * 0.985 if is_buy else highs[it[0]] * 1.015
+                  for it in group]
+            ax.scatter(xs, ys, marker="^" if is_buy else "v",
+                       c=[it[1] for it in group], s=[it[2] for it in group],
+                       zorder=6, linewidths=0)
+            for (xi, color, _size, text, buy) in group:
+                ax.annotate(text, (xi, lows[xi] * 0.985 if buy else highs[xi] * 1.015),
+                            textcoords="offset points",
+                            xytext=(0, -6 if buy else 6),
+                            ha="center", va="top" if buy else "bottom",
+                            fontsize=6, color=color, zorder=7)
+
+        return [
+            (Line2D([], [], marker="^", color="none", markerfacecolor=CHAN_BUY_COLOR,
+                    markersize=9, label="策略买点"), "策略买点"),
+            (Line2D([], [], marker="v", color="none", markerfacecolor=CHAN_SELL_COLOR,
+                    markersize=9, label="策略卖点"), "策略卖点"),
+            (Line2D([], [], marker="^", color="none", markerfacecolor="#e65100",
+                    markersize=6, label="日线买点"), "日线买点"),
+            (Line2D([], [], marker="v", color="none", markerfacecolor="#1b5e20",
+                    markersize=6, label="日线卖点"), "日线卖点"),
+        ]
+
     # 外部接口
     def set_alert_lines(self, stop_loss: float, take_profit: float):
         """设置止损止盈显示线"""
         self.stop_loss_price = stop_loss
         self.take_profit_price = take_profit
 
-    def set_bottom_fractals(self, indices: list[int]):
-        """设置底分型位置"""
-        self.bottom_fractal_indices = indices
+    def set_chan_marks(self, marks: dict | None):
+        """设置缠论买卖点标注（``core.chan_viz.marks_from_klines`` 的返回）
+
+        传 None / ``{}`` 清除。设置了就地重绘 —— 只有已有行情时才画得出来。
+        """
+        self.chan_marks = marks or {}
+        if self.klines:
+            self._draw_kline()
 
 
 class ChartWidget(QWidget):
@@ -498,3 +607,13 @@ class ChartWidget(QWidget):
         """设置所有周期图表的止损止盈线"""
         for tab in [self.intraday_tab, self.daily_tab, self.weekly_tab, self.monthly_tab]:
             tab.set_alert_lines(stop_loss, take_profit)
+
+    def set_chan_marks(self, code: str, marks: dict | None):
+        """把缠论买卖点标注应用到日线图（缠论点是日线级别的）
+
+        带 ``code`` 是为了防串台：后台算完时用户可能已经切到别的股票了，
+        与当前日线图不是同一只就直接丢掉。
+        """
+        if self.daily_tab.code != code:
+            return
+        self.daily_tab.set_chan_marks(marks)

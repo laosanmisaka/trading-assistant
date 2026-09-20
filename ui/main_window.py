@@ -1,4 +1,4 @@
-"""主窗口 — 布局、菜单、系统托盘、实时数据轮询、止损止盈检查、买点扫描"""
+"""主窗口 — 布局、菜单、系统托盘、实时数据轮询、止损止盈检查、缠论买卖点标注"""
 
 import os
 from datetime import datetime
@@ -15,8 +15,7 @@ from PyQt5.QtGui import QIcon, QColor, QFont
 
 from config import (
     WINDOW_TITLE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT,
-    SIDEBAR_WIDTH, REALTIME_REFRESH_MS, BUYPOINT_SCAN_INTERVAL_MS,
-    ENABLE_BUYPOINT_SCAN,
+    SIDEBAR_WIDTH, REALTIME_REFRESH_MS,
     KLINE_REFRESH_MS, KLINE_FLUSH_INTERVAL_SEC,
     DAILY_STOP_LOSS_HOUR, DAILY_STOP_LOSS_MINUTE,
     STOCK_TABLE_COLUMNS, PRESET_GROUPS, CHART_COLORS,
@@ -33,7 +32,7 @@ from data.market_data import (
 from data.market_data_manager import get_data_manager
 from data.models import RealtimeQuote, Group, Stock
 from core.alert_engine import AlertEngine
-from core.buy_point_scanner import BuyPointScanWorker
+from ui.chan_worker import ChanMarkWorker
 import traceback
 
 from utils import is_trading_time
@@ -65,11 +64,11 @@ class MainWindow(QMainWindow):
         # ---- 内部状态 ----
         self._current_group_id: int = -1
         self._current_stock_code: str = ""
-        self._buy_point_states: dict[str, dict] = {}
+        self._chan_marks: dict[str, dict] = {}   # code → 缠论买卖点标注（内存缓存）
+        self._chan_mark_worker = None            # 单飞的标注计算 worker
         self._tray_flash_timer: QTimer = None
         self._tray_flash_on: bool = False
         self._alert_triggered_codes: set[str] = set()
-        self._bp_triggered_codes: set[str] = set()
         self._daily_stop_loss_done: set[tuple[str, str]] = set()  # 已执行每日止损更新的 (代码, 日期)
         self._quitting: bool = False  # 真正退出应用标志 (区分窗口关闭与退出)
 
@@ -113,6 +112,9 @@ class MainWindow(QMainWindow):
         act_refresh = QAction("刷新数据(&R)\tF5", self)
         act_refresh.triggered.connect(self._refresh_current_group_data)
         view_menu.addAction(act_refresh)
+        act_marks = QAction("刷新缠论买卖点(&C)", self)
+        act_marks.triggered.connect(lambda: self._refresh_chan_marks())
+        view_menu.addAction(act_marks)
 
         help_menu = menubar.addMenu("帮助(&H)")
         act_about = QAction("关于(&A)", self)
@@ -173,10 +175,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self._status_refresh_label = QLabel("上次刷新: --")
         self._status_profit_label = QLabel("持仓盈亏: --")
-        self._status_buypoint_label = QLabel("买点: 无")
         self.status_bar.addWidget(self._status_refresh_label)
         self.status_bar.addPermanentWidget(self._status_profit_label)
-        self.status_bar.addPermanentWidget(self._status_buypoint_label)
 
     # ================================================================
     # 系统托盘
@@ -294,17 +294,9 @@ class MainWindow(QMainWindow):
         self._realtime_timer.timeout.connect(self._refresh_current_group_data)
         self._realtime_timer.start(REALTIME_REFRESH_MS)
 
-        # 买点扫描 (5分钟，异步不阻塞UI)
-        # 2026-09-18 起停用：原判定是自研伪缠论（分位数「中枢」+ MACD 金叉 + 缩量），
-        # 与新缠论买卖点口径不一致。开关见 config.ENABLE_BUYPOINT_SCAN。
-        # 注意：保护放在这里而不是 `_scan_buy_points` 内部 ——
-        # tests/test_ui_threading.py 有 6 处直接调该方法测线程泄漏，加早退会废掉那些用例。
-        self._buypoint_timer = QTimer(self)
-        self._buypoint_timer.timeout.connect(self._scan_buy_points)
-        if ENABLE_BUYPOINT_SCAN:
-            self._buypoint_timer.start(BUYPOINT_SCAN_INTERVAL_MS)
-        else:
-            logger.info("买点扫描已停用（config.ENABLE_BUYPOINT_SCAN = False）")
+        # 买点**没有**常驻定时器了：2026-09-18 起买点不做提醒，只在 K 线图上
+        # 标注，双击股票时按需异步计算（见 `_request_chan_marks`）。
+        # 原定时扫描（自研伪缠论）连同 config 开关一并删除。
 
         # K线数据刷新 (60秒)
         self._kline_timer = QTimer(self)
@@ -458,8 +450,7 @@ class MainWindow(QMainWindow):
                     price=0.0, timestamp="--",
                 )
 
-        self.stock_table.update_quotes(merged, self._alert_triggered_codes,
-                                       self._bp_triggered_codes)
+        self.stock_table.update_quotes(merged, self._alert_triggered_codes)
 
     def _update_profit_status(self, quotes: dict[str, RealtimeQuote]):
         """更新持仓盈亏状态栏"""
@@ -577,7 +568,7 @@ class MainWindow(QMainWindow):
             # 更新高亮（清除不再触发的）
             alert_codes = list(self._alert_triggered_codes)
             if alert_codes:
-                self.stock_table.highlight_rows(alert_codes, "alert")
+                self.stock_table.highlight_rows(alert_codes)
             else:
                 self.stock_table.clear_highlights()
                 self.flash_tray(False)
@@ -587,7 +578,7 @@ class MainWindow(QMainWindow):
         self.flash_tray(True)
 
         alert_codes = list(self._alert_triggered_codes)
-        self.stock_table.highlight_rows(alert_codes, "alert")
+        self.stock_table.highlight_rows(alert_codes)
 
         msgs = [f"{code} {reason}: 触发价={trigger:.2f} 现价={price:.2f}"
                 for code, reason, trigger, price, _ in triggered]
@@ -633,76 +624,74 @@ class MainWindow(QMainWindow):
             logger.info(f"{code} 用户选择保留手动{field_name}: {manual_val:.2f}")
 
     # ================================================================
-    # 买点扫描 (异步)
+    # 缠论买卖点标注（异步，只画图不提醒）
     # ================================================================
 
-    def _scan_buy_points(self):
-        """异步扫描所有跟踪股票的买点 — 仅交易时段运行
+    def _request_chan_marks(self, code: str, force: bool = False):
+        """请求一只股票的缠论买卖点标注（命中缓存就直接上屏）
 
-        ⚠️ 2026-09-18 起定时器已停用（config.ENABLE_BUYPOINT_SCAN = False）：
-        本方法的判定链是自研伪缠论，已决定弃用。方法本体保留是为了不废掉
-        tests/test_ui_threading.py 里直接调用它的线程泄漏用例。
-
-        单 worker 串行扫描。原实现为每只股票各起一个 QThread：无并发上限、
-        无回收，且靠主线程计数归零复位（任一 worker 异常退出即永久停摆）。
+        2026-09-18 老三定：买点**不做提醒**，只在 K 线图上标注。
+        计算要联网取 30 分钟行情 + 建两套 czsc 对象（实测单只 2~3 秒），
+        所以放后台线程。**单飞**：上一轮没跑完就跳过，避免连点叠线程 ——
+        这是原 `_scan_buy_points` 的线程契约，一字未改，`tests/test_ui_threading.py`
+        继续把它钉住（单轮单 worker + `finished` 接 `deleteLater`）。
         """
-        if not is_trading_time():
-            return
-        codes = self._get_all_tracked_codes()
-        if not codes:
+        if force:
+            self._chan_marks.pop(code, None)
+
+        cached = self._chan_marks.get(code)
+        if cached is not None:
+            self.chart_widget.set_chan_marks(code, cached)
             return
 
-        # 防止重复触发：以上一轮 worker 是否仍在运行作为唯一判据
-        prev = getattr(self, '_bp_worker', None)
+        prev = getattr(self, '_chan_mark_worker', None)
         if prev is not None:
             try:
                 if prev.isRunning():
-                    logger.debug("上一轮买点扫描尚未完成，跳过")
+                    logger.debug("上一轮缠论买卖点计算尚未完成，跳过")
                     return
             except RuntimeError:
                 pass  # 底层对象已随 deleteLater 销毁
 
-        logger.info(f"开始异步买点扫描: {len(codes)} 只股票（单线程串行）")
-        self._bp_worker = BuyPointScanWorker(codes)
-        self._bp_worker.scan_done.connect(self._on_buy_point_result)
-        self._bp_worker.batch_finished.connect(self._on_buy_point_scan_finished)
-        self._bp_worker.finished.connect(self._bp_worker.deleteLater)
-        self._bp_worker.start()
+        logger.info(f"开始异步计算 {code} 的缠论买卖点")
+        self.status_bar.showMessage(f"正在计算 {code} 的缠论买卖点...")
+        self._chan_mark_worker = ChanMarkWorker(code)
+        self._chan_mark_worker.marks_ready.connect(self._on_chan_marks_ready)
+        self._chan_mark_worker.failed.connect(self._on_chan_marks_failed)
+        self._chan_mark_worker.finished.connect(self._chan_mark_worker.deleteLater)
+        self._chan_mark_worker.start()
 
-    def _on_buy_point_scan_finished(self, done: int):
-        """一轮买点扫描结束 — 无论是否有个股异常，run() 末尾都会触发"""
-        logger.info(f"买点扫描轮次结束: 成功扫描 {done} 只")
+    def _on_chan_marks_ready(self, code: str, marks: dict):
+        """标注算好了（主线程）—— 缓存；只在它还是当前股票时才上屏"""
+        self._chan_marks[code] = marks
+        trades = len(marks.get("trades") or [])
+        geo = len(marks.get("geometry") or [])
+        logger.info(f"{code} 缠论标注完成：日线几何点 {geo} 个、策略买卖点 {trades} 笔")
+        if code == self._current_stock_code:
+            self.chart_widget.set_chan_marks(code, marks)
+            self.status_bar.showMessage(
+                f"{code} 缠论买卖点：策略 {trades} 笔 / 日线几何点 {geo} 个", 5000)
 
-    def _on_buy_point_result(self, code: str, result: dict):
-        """买点扫描结果回调（主线程）"""
-        if result.get("triggered"):
-            self._buy_point_states[code] = result
-            self._bp_triggered_codes.add(code)
-            logger.info(f"🟡 {code} 买点触发! {result.get('signal_details', '')}")
-        else:
-            self._bp_triggered_codes.discard(code)
-            if code in self._buy_point_states:
-                del self._buy_point_states[code]
+    def _on_chan_marks_failed(self, code: str, message: str):
+        """取数/计算失败 —— 状态栏提示即止，不弹窗、不影响其它功能"""
+        logger.error(f"{code} 缠论买卖点计算失败: {message}")
+        if code == self._current_stock_code:
+            self.chart_widget.set_chan_marks(code, None)
+            self.status_bar.showMessage(f"{code} 缠论买卖点计算失败：{message}", 8000)
 
-        buy_codes = list(self._bp_triggered_codes)
-        self._status_buypoint_label.setText(
-            f"买点: {len(buy_codes)}只" if buy_codes else "买点: 无"
-        )
-
-        if buy_codes:
-            self.stock_table.highlight_rows(buy_codes, "buy_point")
-            self.flash_tray(True)
-        else:
-            self.stock_table.clear_highlights()
-            if not self._alert_triggered_codes:
-                self.flash_tray(False)
+    def _refresh_chan_marks(self, code: str = ""):
+        """强制重算（右键菜单 / 视图菜单）—— 盘中重取或换参数后用"""
+        code = code or self._current_stock_code
+        if not code:
+            return
+        self._request_chan_marks(code, force=True)
 
     # ================================================================
     # 股票操作
     # ================================================================
 
     def _on_stock_double_clicked(self, code: str):
-        """双击股票行 → 切换图表 + 停止闪烁 + (如有买点)弹交易纪律"""
+        """双击股票行 → 切换图表 + 停止闪烁 + 标注缠论买卖点"""
         self._current_stock_code = code
         self.chart_widget.load_stock(code)
 
@@ -713,22 +702,10 @@ class MainWindow(QMainWindow):
                 self.flash_tray(False)
                 self.stock_table.clear_highlights()
             else:
-                self.stock_table.highlight_rows(list(self._alert_triggered_codes), "alert")
+                self.stock_table.highlight_rows(list(self._alert_triggered_codes))
 
-        # 如果有买点，弹出交易纪律弹窗 (仅今日触发的有效)
-        bp = self._buy_point_states.get(code, {})
-        if bp.get("triggered"):
-            from ui.discipline_dialog import DisciplineDialog
-            dlg = DisciplineDialog(code, self)
-            dlg.set_signal_info(bp.get("signal_details", ""))
-            dlg.exec_()
-            # 弹窗关闭后清除买点状态，避免重复弹出
-            self._bp_triggered_codes.discard(code)
-            self._buy_point_states.pop(code, None)
-            # 用 _refresh_table_display 统一刷新，确保 alert 和 buy_point 高亮正确合并
-            self._refresh_table_display()
-            if not self._bp_triggered_codes and not self._alert_triggered_codes:
-                self.flash_tray(False)
+        # 缠论买卖点：**只标注在 K 线图上**，不弹窗、不提醒（2026-09-18 老三定）
+        self._request_chan_marks(code)
 
     def _on_stock_right_clicked(self, code: str, action: str):
         """股票右键菜单操作"""
@@ -736,12 +713,18 @@ class MainWindow(QMainWindow):
             from ui.trade_dialog import TradeDialog
             dlg = TradeDialog(code, self)
             dlg.exec_()
+        elif action == "refresh_chan_marks":
+            self._refresh_chan_marks(code)
+        elif action == "discipline":
+            # 交易纪律从「买点触发自动弹窗」改为手动入口 —— 自动弹窗属买点提示，已取消
+            from ui.discipline_dialog import DisciplineDialog
+            DisciplineDialog(code, self).exec_()
+            self._refresh_table_display()
         elif action == "manual_alert":
             self._on_manual_alert_settings(code)
         elif action == "disable_alert":
             disable_alert(code)
             self._alert_triggered_codes.discard(code)
-            self._bp_triggered_codes.discard(code)
             if not self._alert_triggered_codes:
                 self.flash_tray(False)
                 self.stock_table.clear_highlights()
@@ -1017,7 +1000,7 @@ class MainWindow(QMainWindow):
             "• 实时股票数据与K线图表\n"
             "• 持仓/已清仓/跟踪分组管理\n"
             "• 止损止盈线自动计算与提醒\n"
-            "• 买点扫描 (底分型/MACD金叉/回踩中枢)\n"
+            "• 缠论买卖点标注（日线几何点 + 多周期共振策略）\n"
             "• 交易纪律提醒\n\n"
             "数据来源: AKShare"
         )
@@ -1053,8 +1036,7 @@ class MainWindow(QMainWindow):
 
         # 停止所有定时器
         for timer in (self._table_display_timer, self._realtime_timer,
-                      self._buypoint_timer, self._kline_timer,
-                      self._daily_sl_timer):
+                      self._kline_timer, self._daily_sl_timer):
             timer.stop()
 
         # 退出前最后flush一次今日bar到DB

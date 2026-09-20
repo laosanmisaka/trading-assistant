@@ -1,4 +1,4 @@
-"""UI 线程契约回归测试 — 覆盖第一批两项「改了代码但断言未落地」的修复
+"""UI 线程契约回归测试 — 覆盖两项「改了代码但断言未落地」的修复
 
 对应 `docs/KNOWN_ISSUES.md` 附表「仍缺测试保护的两项」：
 
@@ -7,11 +7,12 @@
      （3 次 AKShare 请求 + 递增 sleep，最坏 6 秒冻结界面）。
      已改为启动 `StockNameSyncWorker`。本文件把「必须异步」钉成契约。
 
-  2. 买点扫描线程泄漏      `ui/main_window.py::_scan_buy_points`
-     原实现为每只股票各起一个 QThread，无并发上限、无 deleteLater 回收，
-     且靠主线程计数归零复位（任一 worker 异常退出即永久停摆）。
-     已改为单 worker 串行 + `batch_finished` 复位。
-     本文件把「单轮单 worker」钉成契约。
+  2. 标注计算线程泄漏      `ui/main_window.py::_request_chan_marks`
+     原型为买点扫描：每只股票各起一个 QThread，无并发上限、无 deleteLater
+     回收，且靠主线程计数归零复位（任一 worker 异常退出即永久停摆）。
+     2026-09-18 买点扫描链路（`core/buy_point_scanner.py`）已整体删除，
+     同一位置换成缠论买卖点标注的 `ui.chan_worker.ChanMarkWorker` ——
+     **线程契约一字未改**：单飞 + deleteLater。本文件继续钉住它。
 
 这两处一旦被无意改回同步调用、或改回循环建线程，本文件的断言必须失败。
 """
@@ -70,15 +71,15 @@ class _FakeNameSyncWorker:
         self.deleted = True
 
 
-class _FakeScanWorker:
-    """BuyPointScanWorker 替身（构造签名与真实现一致）"""
+class _FakeMarkWorker:
+    """ChanMarkWorker 替身（构造签名与真实现一致）"""
 
     created: list = []
 
-    def __init__(self, codes, parent=None):
-        self.codes = list(codes)
-        self.scan_done = _SignalStub("scan_done")
-        self.batch_finished = _SignalStub("batch_finished")
+    def __init__(self, code, parent=None):
+        self.code = code
+        self.marks_ready = _SignalStub("marks_ready")
+        self.failed = _SignalStub("failed")
         self.finished = _SignalStub("finished")
         self.started = False
         self.deleted = False
@@ -103,6 +104,16 @@ class _DestroyedWorker:
         raise RuntimeError("wrapped C/C++ object of type QThread has been deleted")
 
 
+class _FakeChart:
+    """ChartWidget 替身 —— 只记录 set_chan_marks 的调用"""
+
+    def __init__(self):
+        self.calls: list = []
+
+    def set_chan_marks(self, code, marks):
+        self.calls.append((code, marks))
+
+
 # ============================================================
 # fixtures
 # ============================================================
@@ -116,11 +127,11 @@ def name_sync_workers(monkeypatch):
 
 
 @pytest.fixture
-def scan_workers(monkeypatch):
-    """替换 BuyPointScanWorker，返回本轮创建实例列表"""
-    _FakeScanWorker.created = []
-    monkeypatch.setattr("ui.main_window.BuyPointScanWorker", _FakeScanWorker)
-    return _FakeScanWorker.created
+def mark_workers(monkeypatch):
+    """替换 ChanMarkWorker，返回本轮创建实例列表"""
+    _FakeMarkWorker.created = []
+    monkeypatch.setattr("ui.main_window.ChanMarkWorker", _FakeMarkWorker)
+    return _FakeMarkWorker.created
 
 
 def _bare_window(**attrs):
@@ -128,15 +139,18 @@ def _bare_window(**attrs):
 
     注意：QObject 子类未走 __init__ 时，读取**不存在的**属性会抛
     RuntimeError（"super-class __init__() was never called"），而不是
-    AttributeError —— 因此代码里的 getattr(self, '_bp_worker', None)
+    AttributeError —— 因此代码里的 getattr(self, '_chan_mark_worker', None)
     兜不住。必须先显式置空。
     """
     from ui.main_window import MainWindow
 
     win = MainWindow.__new__(MainWindow)
     win.status_bar = types.SimpleNamespace(showMessage=lambda *a, **k: None)
-    win._bp_worker = None
+    win._chan_mark_worker = None
     win._name_sync_worker = None
+    win._chan_marks = {}
+    win._current_stock_code = ""
+    win.chart_widget = _FakeChart()
     for key, value in attrs.items():
         setattr(win, key, value)
     return win
@@ -247,87 +261,130 @@ class TestAddByCodeIsAsync:
 
 
 # ============================================================
-# 2. 买点扫描单轮单 worker
+# 2. 缠论买卖点标注：单飞 + 必回收
 # ============================================================
 
-CODES = ["000001", "000002", "600519", "600036", "601318"]
+CODE = "600519"
 
 
-class TestBuyPointScanSingleWorker:
-    """一轮买点扫描只能创建一个 worker —— 不允许每只股票各起一个 QThread"""
-
-    @pytest.fixture(autouse=True)
-    def _in_trading_time(self, monkeypatch):
-        monkeypatch.setattr("ui.main_window.is_trading_time", lambda: True)
+class TestChanMarkSingleFlight:
+    """一次标注计算只能创建一个 worker —— 不允许每只股票各起一个 QThread"""
 
     @staticmethod
-    def _window(codes=None):
-        if codes is None:
-            codes = CODES
-        return _bare_window(_get_all_tracked_codes=lambda: list(codes))
+    def _window(**attrs):
+        return _bare_window(**attrs)
 
-    def test_one_worker_for_all_codes(self, qapp, scan_workers):
-        """5 只股票 → 1 个 worker（原实现是 5 个）"""
+    def test_one_worker_per_request(self, qapp, mark_workers):
+        """一次请求 → 1 个 worker（原实现是每只股票 1 个）"""
         win = self._window()
-        win._scan_buy_points()
+        win._request_chan_marks(CODE)
 
-        assert len(scan_workers) == 1, (
-            f"应只创建一个 worker，实际 {len(scan_workers)} 个 —— "
-            "原实现为每只股票各起一个 QThread")
-        assert scan_workers[0].codes == CODES, "worker 必须持有全部待扫代码"
-        assert scan_workers[0].started is True
+        assert len(mark_workers) == 1, (
+            f"应只创建一个 worker，实际 {len(mark_workers)} 个")
+        assert mark_workers[0].code == CODE
+        assert mark_workers[0].started is True
 
-    def test_skips_while_previous_round_running(self, qapp, scan_workers):
-        """上一轮仍在运行 → 跳过，不新建"""
+    def test_skips_while_previous_round_running(self, qapp, mark_workers):
+        """上一轮仍在运行 → 跳过，不新建（连点不能叠线程）"""
         win = self._window()
-        win._scan_buy_points()      # 第 1 个，running=True
-        win._scan_buy_points()
-        win._scan_buy_points()
+        win._request_chan_marks(CODE)      # 第 1 个，running=True
+        win._request_chan_marks(CODE)
+        win._request_chan_marks(CODE)
 
-        assert len(scan_workers) == 1, "上一轮未结束时不应新建 worker"
+        assert len(mark_workers) == 1, "上一轮未结束时不应新建 worker"
 
-    def test_rounds_do_not_accumulate_references(self, qapp, scan_workers):
+    def test_skips_when_cached(self, qapp, mark_workers):
+        """已有缓存 → 直接上屏，不再起线程"""
+        win = self._window(_chan_marks={CODE: {"geometry": [], "trades": []}},
+                           _current_stock_code=CODE)
+        win._request_chan_marks(CODE)
+
+        assert mark_workers == [], "命中缓存时不应新建 worker"
+        assert win.chart_widget.calls == [
+            (CODE, {"geometry": [], "trades": []})]
+
+    def test_force_refresh_bypasses_cache(self, qapp, mark_workers):
+        """force=True → 忽略缓存重算（右键「刷新缠论买卖点」用）"""
+        win = self._window(_chan_marks={CODE: {"geometry": [], "trades": []}})
+        win._request_chan_marks(CODE, force=True)
+
+        assert len(mark_workers) == 1
+        assert win._chan_marks == {}, "force 时应先清掉旧缓存"
+
+    def test_rounds_do_not_accumulate_references(self, qapp, mark_workers):
         """连续 4 轮：每轮新建 1 个、旧引用被覆盖，且每个都接了 deleteLater"""
         win = self._window()
         for _ in range(4):
-            win._scan_buy_points()
-            win._bp_worker._running = False     # 模拟该轮已结束
+            win._request_chan_marks(CODE)
+            win._chan_mark_worker._running = False     # 模拟该轮已结束
 
-        assert len(scan_workers) == 4, "每轮创建 1 个，不应随股票数放大"
-        assert win._bp_worker is scan_workers[-1], "只应保留最新一轮的引用"
-        for worker in scan_workers:
+        assert len(mark_workers) == 4, "每轮创建 1 个，不应随股票数放大"
+        assert win._chan_mark_worker is mark_workers[-1], "只应保留最新一轮的引用"
+        for worker in mark_workers:
             assert worker.finished.slots == [worker.deleteLater], (
                 "每个 worker 都必须接 deleteLater 回收，否则又是泄漏")
 
-    def test_tolerates_destroyed_worker(self, qapp, scan_workers):
+    def test_tolerates_destroyed_worker(self, qapp, mark_workers):
         """上一轮 worker 已随 deleteLater 销毁（isRunning 抛 RuntimeError）
         → 必须能开新一轮，而不是永久停摆"""
         win = self._window()
-        win._bp_worker = _DestroyedWorker()
+        win._chan_mark_worker = _DestroyedWorker()
 
-        win._scan_buy_points()
+        win._request_chan_marks(CODE)
 
-        assert len(scan_workers) == 1, (
-            "底层对象已销毁时必须放行，否则买点扫描永久停摆")
+        assert len(mark_workers) == 1, (
+            "底层对象已销毁时必须放行，否则标注永久停摆")
 
-    def test_batch_finished_signal_wired(self, qapp, scan_workers):
-        """batch_finished 必须接上 —— 它是复位判据，不依赖计数归零"""
+    def test_signals_all_wired(self, qapp, mark_workers):
+        """三个信号都必须接上 —— failed 不接就会静默失败"""
         win = self._window()
-        win._scan_buy_points()
+        win._request_chan_marks(CODE)
+        worker = mark_workers[0]
 
-        assert scan_workers[0].batch_finished.slots == [
-            win._on_buy_point_scan_finished], (
-            "batch_finished 必须接上，否则一轮结束后没有收尾回调")
+        assert worker.marks_ready.slots == [win._on_chan_marks_ready]
+        assert worker.failed.slots == [win._on_chan_marks_failed], (
+            "failed 必须接上，否则取数失败时界面毫无反应")
+        assert worker.finished.slots == [worker.deleteLater]
 
-    def test_no_scan_without_codes(self, qapp, scan_workers):
-        """无跟踪股票 → 不创建 worker"""
-        win = self._window(codes=[])
-        win._scan_buy_points()
-        assert scan_workers == []
 
-    def test_no_scan_outside_trading_time(self, qapp, scan_workers, monkeypatch):
-        """非交易时段 → 不创建 worker"""
-        monkeypatch.setattr("ui.main_window.is_trading_time", lambda: False)
-        win = self._window()
-        win._scan_buy_points()
-        assert scan_workers == []
+class TestChanMarkCallbacks:
+    """回调只对**当前股票**上屏，并且失败不弹窗"""
+
+    def test_ready_marks_are_cached_and_shown(self, qapp):
+        win = _bare_window(_current_stock_code=CODE)
+        marks = {"geometry": [{"date": "2026-01-05", "kind": "二买", "price": 10}],
+                 "trades": [{"buy_date": "2026-01-05"}]}
+
+        win._on_chan_marks_ready(CODE, marks)
+
+        assert win._chan_marks[CODE] is marks
+        assert win.chart_widget.calls == [(CODE, marks)]
+
+    def test_ready_marks_not_shown_after_switching_stock(self, qapp):
+        """算完时用户已切走 → 只缓存，不画到别人的图上"""
+        win = _bare_window(_current_stock_code="000001")
+
+        win._on_chan_marks_ready(CODE, {"geometry": [], "trades": []})
+
+        assert CODE in win._chan_marks, "仍应缓存，回头切回来能直接用"
+        assert win.chart_widget.calls == [], "不是当前股票就不该上屏"
+
+    def test_failed_clears_marks_and_does_not_raise(self, qapp):
+        """取数失败：清掉旧标注 + 状态栏提示，不抛异常"""
+        win = _bare_window(_current_stock_code=CODE)
+
+        win._on_chan_marks_failed(CODE, "网络错误")
+
+        assert win.chart_widget.calls == [(CODE, None)], "失败时应清掉标注"
+
+    def test_refresh_without_current_stock_is_noop(self, qapp, mark_workers):
+        """没有当前股票时「刷新」不该起线程"""
+        win = _bare_window(_current_stock_code="")
+        win._refresh_chan_marks()
+        assert mark_workers == []
+
+    def test_refresh_uses_current_stock(self, qapp, mark_workers):
+        win = _bare_window(_current_stock_code=CODE)
+        win._refresh_chan_marks()
+        assert len(mark_workers) == 1
+        assert mark_workers[0].code == CODE

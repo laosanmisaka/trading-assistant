@@ -1,4 +1,9 @@
-"""股票列表表格 — 自定义QTableView + Model，支持高亮、排序、右键菜单"""
+"""股票列表表格 — 自定义QTableView + Model，支持高亮、排序、右键菜单
+
+2026-09-18：删除「买点信号」列与买点高亮 —— 买点提醒已取消，改为在
+K 线图上标注（`ui/chart_widget.py` 的 `set_chan_marks`）。表格只保留
+止损止盈提醒这一条提醒链路。
+"""
 
 from PyQt5.QtWidgets import (
     QTableView, QHeaderView, QAbstractItemView, QMenu, QAction,
@@ -8,12 +13,14 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import QColor, QBrush, QFont
 
-from config import STOCK_TABLE_COLUMNS, CHART_COLORS
+from config import STOCK_TABLE_COLUMNS
 from data.models import RealtimeQuote
-from data.database import get_position_summary
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 提醒高亮色（红底）
+ALERT_COLOR = "#FF4444"
 
 
 class StockTableModel(QAbstractTableModel):
@@ -27,15 +34,13 @@ class StockTableModel(QAbstractTableModel):
     COL_VOLUME = 5
     COL_STOP_LOSS = 6
     COL_TAKE_PROFIT = 7
-    COL_BUY_POINT = 8
-    COL_ALERT = 9
+    COL_ALERT = 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._quotes: dict[str, RealtimeQuote] = {}
         self._codes: list[str] = []
         self._alert_codes: set[str] = set()      # 止损止盈触发代码
-        self._bp_codes: set[str] = set()          # 买点触发代码
         self._highlight_rows: set[str] = set()    # 当前高亮行
         self._highlight_colors: dict[str, QColor] = {}
 
@@ -43,16 +48,14 @@ class StockTableModel(QAbstractTableModel):
         self,
         quotes: dict[str, RealtimeQuote],
         alert_codes: set[str],
-        bp_codes: set[str],
     ):
         """更新数据"""
         self.beginResetModel()
         self._quotes = quotes
         self._codes = list(quotes.keys())
         self._alert_codes = alert_codes
-        self._bp_codes = bp_codes
         # 保持高亮与触发状态同步
-        self._highlight_rows = alert_codes | bp_codes
+        self._highlight_rows = set(alert_codes)
         self.endResetModel()
 
     def set_highlights(self, codes: set[str], color: QColor):
@@ -87,16 +90,12 @@ class StockTableModel(QAbstractTableModel):
 
         col = index.column()
         is_alert = code in self._alert_codes
-        is_bp = code in self._bp_codes
 
         # 背景色
         if role == Qt.BackgroundRole:
             if is_alert and code in self._highlight_rows:
                 # 止损止盈触发 → 红色背景
-                return QBrush(QColor("#FF4444"))
-            if is_bp and code in self._highlight_rows:
-                # 买点触发 → 黄色背景
-                return QBrush(QColor("#FFD700"))
+                return QBrush(QColor(ALERT_COLOR))
             return None
 
         # 前景色
@@ -110,13 +109,13 @@ class StockTableModel(QAbstractTableModel):
 
         # 文字对齐
         if role == Qt.TextAlignmentRole:
-            if col in (self.COL_CODE, self.COL_NAME, self.COL_BUY_POINT, self.COL_ALERT):
+            if col in (self.COL_CODE, self.COL_NAME, self.COL_ALERT):
                 return Qt.AlignCenter
             return Qt.AlignRight | Qt.AlignVCenter
 
         # 高亮行加粗
         if role == Qt.FontRole:
-            if (is_alert or is_bp) and code in self._highlight_rows:
+            if is_alert and code in self._highlight_rows:
                 font = QFont()
                 font.setBold(True)
                 return font
@@ -141,10 +140,6 @@ class StockTableModel(QAbstractTableModel):
         elif col == self.COL_STOP_LOSS:
             return "--"
         elif col == self.COL_TAKE_PROFIT:
-            return "--"
-        elif col == self.COL_BUY_POINT:
-            if is_bp:
-                return "📈 买点"
             return "--"
         elif col == self.COL_ALERT:
             if is_alert:
@@ -199,20 +194,14 @@ class StockTableWidget(QTableView):
         self,
         quotes: dict[str, RealtimeQuote],
         alert_codes: set[str],
-        bp_codes: set[str],
     ):
         """更新行情数据"""
-        self._model.update_data(quotes, alert_codes, bp_codes)
+        self._model.update_data(quotes, alert_codes)
 
-    def highlight_rows(self, codes: list[str], highlight_type: str = "alert"):
-        """高亮指定股票行"""
-        color_map = {
-            "alert": QColor("#FF4444"),         # 红色 - 止损止盈
-            "buy_point": QColor("#FFD700"),     # 黄色 - 买点
-        }
-        color = color_map.get(highlight_type, QColor("#FFD700"))
+    def highlight_rows(self, codes: list[str]):
+        """高亮指定股票行（止损止盈触发）"""
         self._flash_codes = set(codes)
-        self._model.set_highlights(set(codes), color)
+        self._model.set_highlights(set(codes), QColor(ALERT_COLOR))
         self.viewport().update()
 
         if not self._flash_timer.isActive():
@@ -225,15 +214,14 @@ class StockTableWidget(QTableView):
         self.viewport().update()
 
     def clear(self):
-        self._model.update_data({}, set(), set())
+        self._model.update_data({}, set())
 
     def _toggle_flash(self):
         """切换高亮闪烁"""
         if self._flash_on:
             self._model.clear_highlights()
         else:
-            color = QColor("#FF4444")
-            self._model.set_highlights(self._flash_codes, color)
+            self._model.set_highlights(self._flash_codes, QColor(ALERT_COLOR))
         self._flash_on = not self._flash_on
         self.viewport().update()
 
@@ -253,11 +241,21 @@ class StockTableWidget(QTableView):
             act_view.triggered.connect(lambda: self.stock_double_clicked.emit(code))
             menu.addAction(act_view)
 
+            act_marks = QAction("刷新缠论买卖点", self)
+            act_marks.triggered.connect(
+                lambda: self.stock_right_clicked.emit(code, "refresh_chan_marks"))
+            menu.addAction(act_marks)
+
             menu.addSeparator()
 
             act_trade = QAction("交易记录", self)
             act_trade.triggered.connect(lambda: self.stock_right_clicked.emit(code, "add_trade"))
             menu.addAction(act_trade)
+
+            act_discipline = QAction("交易纪律...", self)
+            act_discipline.triggered.connect(
+                lambda: self.stock_right_clicked.emit(code, "discipline"))
+            menu.addAction(act_discipline)
 
             menu.addSeparator()
 

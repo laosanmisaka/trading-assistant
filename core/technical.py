@@ -1,4 +1,11 @@
-"""技术指标计算 — 分型/金叉死叉/中枢/缩量判断/MACD"""
+"""技术指标计算 — 均线/分型/金叉死叉/MACD（自研）
+
+⚠️ 这里的「分型」是**自研 K 线包含处理**，与 czsc 的笔/分型不是同一套。
+2026-09-18 已删除 `calc_center_range` / `check_pullback_to_center` /
+`is_volume_contraction` / `is_volume_expansion` —— 它们是已废弃的伪缠论
+买点扫描（`core/buy_point_scanner.py`）专用，旧「中枢」是高 75 分位 /
+低 25 分位，与新缠论口径无关。缠论结构一律走 `core/chan.py`。
+"""
 
 from typing import Optional, Tuple
 import numpy as np
@@ -279,95 +286,6 @@ def detect_death_cross(
                 return True, i
 
     return False, -1
-
-
-# ============================================================
-# 中枢 (盘整区间) 计算
-# ============================================================
-
-def calc_center_range(
-    highs: np.ndarray,
-    lows: np.ndarray,
-    lookback: int = 20,
-) -> Tuple[float, float]:
-    """
-    计算最近N根K线的中枢区间 (盘整区间)
-    中枢 = 最近N根K线中重叠最多的价格区间
-    简化算法: 取最近N根K线中的高点的下分位 和 低点的上分位
-    返回: (中枢上沿, 中枢下沿)
-    """
-    if len(highs) < lookback:
-        lookback = len(highs)
-
-    recent_highs = highs[-lookback:]
-    recent_lows = lows[-lookback:]
-
-    center_high = np.percentile(recent_highs, 75)
-    center_low = np.percentile(recent_lows, 25)
-
-    if center_high - center_low < (center_high + center_low) / 2 * 0.01:
-        center_high = np.percentile(recent_highs, 90)
-        center_low = np.percentile(recent_lows, 10)
-
-    return round(float(center_high), 2), round(float(center_low), 2)
-
-
-def check_pullback_to_center(
-    close: float,
-    center_high: float,
-    center_low: float,
-    tolerance: float = 0.02,
-) -> bool:
-    """
-    检查当前价格是否回踩到中枢区间
-    tolerance: 允许的容差比例 (2%表示可以稍微超出中枢)
-    """
-    upper = center_high * (1 + tolerance)
-    lower = center_low * (1 - tolerance)
-    return lower <= close <= upper
-
-
-# ============================================================
-# 成交量分析
-# ============================================================
-
-def is_volume_contraction(
-    volumes: np.ndarray,
-    period: int = 5,
-    ratio: float = 0.7,
-) -> bool:
-    """
-    判断最近一根K线是否缩量
-    缩量定义: 当前成交量 < 前N根均量 * ratio
-    """
-    if len(volumes) < period + 1:
-        return False
-
-    current_vol = volumes[-1]
-    prev_avg_vol = np.mean(volumes[-(period + 1):-1])
-
-    if prev_avg_vol == 0:
-        return False
-
-    return current_vol < prev_avg_vol * ratio
-
-
-def is_volume_expansion(
-    volumes: np.ndarray,
-    period: int = 5,
-    ratio: float = 1.5,
-) -> bool:
-    """判断最近一根K线是否放量"""
-    if len(volumes) < period + 1:
-        return False
-
-    current_vol = volumes[-1]
-    prev_avg_vol = np.mean(volumes[-(period + 1):-1])
-
-    if prev_avg_vol == 0:
-        return False
-
-    return current_vol > prev_avg_vol * ratio
 
 
 # ============================================================

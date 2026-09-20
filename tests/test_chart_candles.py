@@ -258,3 +258,145 @@ class TestAutoscaleStillWorks:
 
         assert ax_price.dataLim.x0 <= 0
         assert ax_price.dataLim.x1 >= 119
+
+
+# ============================================================
+# 4. 缠论买卖点标注（2026-09-18 新增）
+# ============================================================
+
+def _daily_widget(df, marks) -> "ChartTabWidget":
+    from ui.chart_widget import ChartTabWidget
+
+    widget = ChartTabWidget("daily")
+    widget.canvas.fig.clear()
+    widget.chan_marks = marks
+    widget._draw_kline_manual(df, "test")
+    return widget
+
+
+def _marks_for(df) -> dict:
+    date = lambda i: df.index[i].strftime("%Y-%m-%d")     # noqa: E731
+    return {
+        "geometry": [
+            {"date": date(5), "kind": "一买", "price": float(df["Low"].iloc[5])},
+            {"date": date(9), "kind": "二卖", "price": float(df["High"].iloc[9])},
+        ],
+        "trades": [
+            {"buy_date": date(20), "buy_price": float(df["Close"].iloc[20]),
+             "sell_date": date(40), "sell_price": float(df["Close"].iloc[40]),
+             "return_pct": 3.5},
+            {"buy_date": date(50), "buy_price": float(df["Close"].iloc[50]),
+             "sell_date": "", "sell_price": None, "return_pct": None},
+        ],
+    }
+
+
+class TestChanMarksDrawing:
+    """K 线图上的缠论买卖点标注：位置正确、不破坏蜡烛批量化"""
+
+    def test_no_marks_keeps_artist_count(self, qapp):
+        """没有标注时不能多出任何 artist（蜡烛批量化的既有契约）"""
+        df = _df(n=60)
+        widget = _daily_widget(df, {})
+
+        ax_price = widget.canvas.fig.get_axes()[0]
+        assert len(ax_price.collections) == 2
+        assert len(ax_price.texts) == 0
+
+    def test_marks_add_two_collections_and_labels(self, qapp):
+        """买点一批 + 卖点一批（各 1 个 collection），文字逐点一条
+
+        点不能逐个建 artist —— 250 根 K 线上逐点 scatter 会让缩放变卡，
+        与蜡烛批量化是同一个理由。
+        """
+        df = _df(n=60)
+        widget = _daily_widget(df, _marks_for(df))
+        ax_price = widget.canvas.fig.get_axes()[0]
+
+        assert len(ax_price.collections) == 4, "蜡烛 2 + 买点 1 + 卖点 1"
+        # 几何 2 点 + 策略 买1 卖1 + 未平仓 1 = 5 条文字
+        assert len(ax_price.texts) == 5
+
+    def test_buy_below_low_sell_above_high(self, qapp):
+        """买点标在当根低点下方、卖点标在当根高点上方（不能压住 K 线）"""
+        df = _df(n=60)
+        widget = _daily_widget(df, _marks_for(df))
+        ax_price = widget.canvas.fig.get_axes()[0]
+
+        offsets = [c.get_offsets() for c in ax_price.collections[2:]]
+        assert len(offsets) == 2, "买点与卖点各一批"
+        for (x, y) in offsets[0]:           # 先画买点那一批
+            assert y < float(df["Low"].iloc[int(x)])
+        for (x, y) in offsets[1]:
+            assert y > float(df["High"].iloc[int(x)])
+
+    def test_legend_lists_strategy_marks(self, qapp):
+        df = _df(n=60)
+        widget = _daily_widget(df, _marks_for(df))
+        ax_price = widget.canvas.fig.get_axes()[0]
+
+        labels = [t.get_text() for t in ax_price.get_legend().get_texts()]
+        for expect in ("策略买点", "策略卖点", "日线买点", "日线卖点"):
+            assert expect in labels, f"图例缺少「{expect}」"
+
+    def test_dates_outside_chart_are_skipped(self, qapp):
+        """标注日期不在图内 → 静默跳过，不抛异常也不画到第 0 根上"""
+        df = _df(n=60)
+        marks = {"geometry": [{"date": "1999-01-01", "kind": "一买", "price": 10.0}],
+                 "trades": []}
+        widget = _daily_widget(df, marks)
+        ax_price = widget.canvas.fig.get_axes()[0]
+
+        assert len(ax_price.collections) == 2
+        assert len(ax_price.texts) == 0
+
+    def test_only_daily_tab_draws_marks(self, qapp):
+        """周线/月线不画 —— 缠论点是日线级别的，硬画会错位"""
+        from ui.chart_widget import ChartTabWidget
+
+        df = _df(n=60)
+        widget = ChartTabWidget("weekly")
+        widget.canvas.fig.clear()
+        widget.chan_marks = _marks_for(df)
+        widget._draw_kline_manual(df, "test")
+
+        ax_price = widget.canvas.fig.get_axes()[0]
+        assert len(ax_price.collections) == 2
+
+    def test_set_chan_marks_redraws_only_with_data(self, qapp):
+        """set_chan_marks 只在已有行情时重绘（否则空画布重绘没意义）"""
+        from ui.chart_widget import ChartTabWidget
+
+        widget = ChartTabWidget("daily")
+        widget.klines = []
+        widget.set_chan_marks({"geometry": [], "trades": []})   # 不抛异常
+        assert widget.canvas.fig.get_axes() == [], "没有行情时不该重绘"
+        assert widget.chan_marks == {"geometry": [], "trades": []}
+
+
+class TestChanMarksWiring:
+    """ChartWidget 把标注只投给日线页，且拒绝串台"""
+
+    def test_marks_go_to_daily_tab(self, qapp):
+        from ui.chart_widget import ChartWidget
+
+        widget = ChartWidget()
+        widget.daily_tab.code = "600519"
+        widget.weekly_tab.code = "600519"
+
+        marks = {"geometry": [], "trades": [{"buy_date": "2026-01-05"}]}
+        widget.set_chan_marks("600519", marks)
+
+        assert widget.daily_tab.chan_marks == marks
+        assert widget.weekly_tab.chan_marks == {}
+
+    def test_marks_for_other_code_are_dropped(self, qapp):
+        """后台算完时用户可能已切股票 —— 不是当前这只就丢掉"""
+        from ui.chart_widget import ChartWidget
+
+        widget = ChartWidget()
+        widget.daily_tab.code = "600519"
+
+        widget.set_chan_marks("000001", {"geometry": [], "trades": []})
+
+        assert widget.daily_tab.chan_marks == {}

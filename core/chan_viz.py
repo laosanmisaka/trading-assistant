@@ -83,6 +83,10 @@
 
 或走根目录的 `visualize_chan.py` 包装脚本。需要 akshare（取行情）
 与 czsc（算缠论），二者见 requirements.txt。
+
+另：`marks_from_klines()` 把同一批买卖点导出成**按日期**的标注，
+供桌面端的日线 K 线图（`ui/chart_widget.py::set_chan_marks`）标注 ——
+图与桌面端**同源**，不各算一套、也不会出现两套口径标两批点。
 """
 
 from __future__ import annotations
@@ -564,6 +568,65 @@ def build_payload(
         "zoom": {"startValue": start, "endValue": end},
     }
     return payload
+
+
+# ======================================================================
+# 图上标注（UI 复用）
+# ======================================================================
+
+def marks_from_payload(payload: dict) -> dict:
+    """payload → 「按日期」的买卖点标注（给 UI 的 matplotlib 日线图用）
+
+    UI 的 K 线图（`ui/chart_widget.py`）画的是**日线**、横轴是日期，
+    而 payload 里的点坐标是 **30 分钟 bar 下标**，所以要在这里换一次算。
+
+    返回
+    ----
+    ``{"geometry": [{"date", "kind", "price"}, ...],
+       "trades":   [{"buy_date", "buy_price", "sell_date", "sell_price",
+                     "return_pct"}, ...]}``
+
+    - ``geometry``：日线级别的几何买卖点（一/二/三 买与卖）—— 与 HTML 图上
+      的「日线买卖点」是同一批点
+    - ``trades``：策略实际成交（`chan_strategy` 三重共振买入 + 均线卖出）
+    - ``sell_date`` 为空串 = 数据末尾仍未平仓（收益也是 None）
+    """
+    dates = payload.get("dates") or []
+    geo: list[dict] = []
+    for kind, points in (payload.get("points", {}).get("daily") or {}).items():
+        for idx, price in points:
+            if 0 <= idx < len(dates):
+                geo.append({"date": str(dates[idx])[:10], "kind": kind,
+                            "price": float(price)})
+
+    trades: list[dict] = []
+    for t in payload.get("strategy", {}).get("trades", []):
+        buy = t.get("buy") or {}
+        sell = t.get("sell") or {}
+        trades.append({
+            "buy_date": str(buy.get("dt", ""))[:10],
+            "buy_price": float(buy.get("price") or 0.0),
+            "sell_date": str(sell.get("dt", ""))[:10],
+            "sell_price": (float(sell["price"])
+                           if sell.get("price") is not None else None),
+            "return_pct": sell.get("return_pct"),
+        })
+
+    geo.sort(key=lambda p: p["date"])
+    trades.sort(key=lambda t: t["buy_date"])
+    return {"geometry": geo, "trades": trades}
+
+
+def marks_from_klines(klines, code: str = "", name: str = "") -> dict:
+    """行情 → 图上标注（``build_payload`` + ``marks_from_payload`` 的组合）
+
+    额外带上 ``meta``（代码 / 名称 / bar 数 / 交易日 / 各级点数），
+    供状态栏与排查用；画图只看 geometry 与 trades。
+    """
+    payload = build_payload(klines, code=code, name=name)
+    marks = marks_from_payload(payload)
+    marks["meta"] = payload.get("meta", {})
+    return marks
 
 
 # ======================================================================
