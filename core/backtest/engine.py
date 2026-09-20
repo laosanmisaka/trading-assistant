@@ -8,9 +8,24 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def lots(qty: float) -> int:
+    """四舍五入到整手（100 股）。A 股委托必须是 100 的整数倍。
+
+    用**四舍五入**而不是向下取整：分级出口里「卖一半」与「买回一半」用的都是
+    `lots(满仓股数 * 0.5)`，同一个数 ⇒ 卖了再买回能精确回到原仓位，不产生
+    取整漂移（900 股卖 500 剩 400，买回 500 又是 900）。
+    """
+    return max(int(qty / 100.0 + 0.5) * 100, 0)
+
+
 @dataclass
 class Trade:
-    """一笔已平仓交易"""
+    """一笔已平仓交易
+
+    `episode` 是**持仓轮次**编号（每只标的从 1 开始，每轮首次建仓 +1）。
+    全进全出时一轮 = 一笔；分级减仓/回补时一轮会拆成多笔（卖半仓、回补后再卖…），
+    此时「按笔」的胜率会被拆细，要按 `episode` 归并才是真正的「一轮赚没赚」。
+    """
     entry_date: str = ""
     entry_price: float = 0.0
     exit_date: str = ""
@@ -19,6 +34,7 @@ class Trade:
     profit: float = 0.0
     profit_pct: float = 0.0
     reason: str = ""
+    episode: int = 0
 
 
 @dataclass
@@ -99,8 +115,19 @@ class BacktestEngine:
             logger.warning(f"{code} 数据源正常应答但无日线数据（停牌或代码不存在）")
         return self.run_on_data(strategy, code, daily)
 
+    def _affordable_lots(self, cash: float, price: float) -> int:
+        """这笔现金按当前价最多能买几手（预留佣金）"""
+        if price <= 0:
+            return 0
+        return int(cash / (price * 100 * (1 + self.commission_rate))) * 100
+
     def run_on_data(self, strategy: Strategy, code: str, daily: list[KLineData]) -> BacktestReport:
-        """对给定日线数据回测（不触网，便于测试）"""
+        """对给定日线数据回测（不触网，便于测试）
+
+        支持**部分成交**（`Signal.weight`）：一轮持仓内可以减半仓、再回补，
+        再全清。成本按**加权平均**计（含买入费用），每次减仓按卖出比例结转成本，
+        因此每笔的 `profit_pct` 是「这一部分份额」的收益率，不是整轮的。
+        """
         if not daily:
             return BacktestReport(
                 code=code, strategy=strategy.name, initial_capital=self.initial_capital,
@@ -113,42 +140,67 @@ class BacktestEngine:
 
         cash = self.initial_capital
         position_qty = 0
+        position_cost = 0.0          # 当前持仓成本（含买入费用），按卖出比例结转
+        episode_full_qty = 0         # 本轮「满仓股数」，weight 的基准
+        episode = 0
         entry_price = 0.0
         entry_date = ""
-        buy_fee = 0.0
         trades: list[Trade] = []
         equity_curve: list[float] = []
 
         for k in daily:
             for s in sig_by_date.get(k.date, []):
-                if s.action == Action.BUY and position_qty == 0:
-                    # 全仓买入，预留佣金（A 股一手 100 股）
-                    qty = int(cash / (s.price * 100 * (1 + self.commission_rate))) * 100
-                    if qty > 0:
-                        cost = qty * s.price
-                        buy_fee = max(cost * self.commission_rate, self.min_commission)
-                        cash -= cost + buy_fee
-                        position_qty = qty
-                        entry_price = s.price
-                        entry_date = s.date
+                if s.price <= 0:
+                    continue
+                w = float(getattr(s, "weight", 1.0) or 1.0)
+
+                if s.action == Action.BUY:
+                    if position_qty == 0:
+                        # 新一轮开仓：先按可用资金定出「满仓股数」
+                        episode_full_qty = self._affordable_lots(cash, s.price)
+                        if episode_full_qty <= 0:
+                            continue
+                        entry_price, entry_date = s.price, s.date
+                        episode += 1
+                    # 买入 `weight × 满仓股数`，但不越过满仓、也买不起更多
+                    room = max(episode_full_qty - position_qty, 0)
+                    delta = min(lots(episode_full_qty * w),
+                                room, self._affordable_lots(cash, s.price))
+                    if delta > 0:
+                        cost = delta * s.price
+                        fee = max(cost * self.commission_rate, self.min_commission)
+                        cash -= cost + fee
+                        position_qty += delta
+                        position_cost += cost + fee
+
                 elif s.action == Action.SELL and position_qty > 0:
-                    proceeds = position_qty * s.price
-                    sell_fee = (
-                        max(proceeds * self.commission_rate, self.min_commission)
-                        + proceeds * self.stamp_tax_rate
-                    )
-                    cash += proceeds - sell_fee
-                    profit = (s.price - entry_price) * position_qty - buy_fee - sell_fee
-                    entry_cost = entry_price * position_qty + buy_fee
-                    profit_pct = profit / entry_cost if entry_cost > 0 else 0.0
+                    if w >= 1.0:
+                        delta = position_qty          # 清仓：不留碎股
+                    else:
+                        delta = min(lots(episode_full_qty * w), position_qty)
+                    if delta <= 0:
+                        continue
+                    proceeds = delta * s.price
+                    fee = (max(proceeds * self.commission_rate, self.min_commission)
+                           + proceeds * self.stamp_tax_rate)
+                    cash += proceeds - fee
+                    cost_part = position_cost * (delta / position_qty)
+                    profit = proceeds - cost_part - fee
                     trades.append(Trade(
                         entry_date=entry_date, entry_price=entry_price,
-                        exit_date=s.date, exit_price=s.price,
-                        quantity=position_qty, profit=round(profit, 2),
-                        profit_pct=profit_pct, reason=s.reason,
+                        exit_date=s.date, exit_price=s.price, quantity=delta,
+                        profit=round(profit, 2),
+                        profit_pct=(profit / cost_part) if cost_part > 0 else 0.0,
+                        reason=s.reason, episode=episode,
                     ))
-                    position_qty = 0
-                    buy_fee = 0.0
+                    position_qty -= delta
+                    position_cost -= cost_part
+                    if position_qty <= 0:
+                        position_qty = 0
+                        position_cost = 0.0
+                        entry_price = 0.0
+                        entry_date = ""
+                        episode_full_qty = 0
 
             equity_curve.append(cash + position_qty * k.close)
 

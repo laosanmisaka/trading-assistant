@@ -108,6 +108,79 @@ def test_engine_profit_factor_inf_when_no_losses():
 
 
 # ============================================================
+# 部分成交（分级减仓 / 回补）
+# ============================================================
+
+def test_engine_partial_sell_and_buyback():
+    """卖半仓 → 再买回半仓 → 清仓：两笔同属一轮，且能精确回到满仓
+
+    资金 10000 / 价 10 ⇒ 满仓 900 股。整手四舍五入下 900 的一半是 500 股：
+    卖 500 剩 400，回补 500 又是 900 —— 「卖一半」与「买回一半」用同一个数，
+    所以不会越买越少。
+    """
+    daily = make_daily([10.0] * 10)
+    sigs = [
+        Signal(date=daily[1].date, action=Action.BUY, price=10.0, weight=1.0),
+        Signal(date=daily[3].date, action=Action.SELL, price=11.0, weight=0.5),
+        Signal(date=daily[5].date, action=Action.BUY, price=10.0, weight=0.5),
+        Signal(date=daily[7].date, action=Action.SELL, price=12.0, weight=1.0),
+    ]
+    rep = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy(sigs), "000001", daily,
+    )
+    assert [t.quantity for t in rep.trades] == [500, 900]
+    assert [t.episode for t in rep.trades] == [1, 1], "同一轮持仓，不能算成两轮"
+    assert rep.total_trades == 2
+    assert rep.win_rate == 1.0
+    # 12263.70 - 10000 = 2263.70
+    assert rep.total_return == pytest.approx(2263.7 / 10000.0, rel=1e-6)
+
+
+def test_engine_partial_buy_cannot_exceed_full():
+    """已满仓时再发 BUY 不应加仓（room = 0）"""
+    daily = make_daily([10.0] * 10)
+    sigs = [
+        Signal(date=daily[1].date, action=Action.BUY, price=10.0, weight=1.0),
+        Signal(date=daily[2].date, action=Action.BUY, price=10.0, weight=0.5),
+        Signal(date=daily[3].date, action=Action.SELL, price=10.0, weight=1.0),
+    ]
+    rep = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy(sigs), "000001", daily,
+    )
+    assert [t.quantity for t in rep.trades] == [900]
+
+
+def test_engine_full_exit_leaves_no_dust():
+    """清仓必须一笔卖光，不留碎股"""
+    daily = make_daily([10.0] * 10)
+    sigs = [
+        Signal(date=daily[1].date, action=Action.BUY, price=10.0),
+        Signal(date=daily[3].date, action=Action.SELL, price=11.0, weight=0.5),
+        Signal(date=daily[5].date, action=Action.SELL, price=12.0, weight=1.0),
+    ]
+    rep = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy(sigs), "000001", daily,
+    )
+    # 第一笔卖半仓 500，第二笔把剩下的 400 全卖掉
+    assert [t.quantity for t in rep.trades] == [500, 400]
+    assert rep.open_position is False
+
+
+def test_engine_rejects_nonpositive_price():
+    """价格为 0 的信号必须被跳过，不能除零"""
+    daily = make_daily([10.0] * 6)
+    sigs = [
+        Signal(date=daily[1].date, action=Action.BUY, price=0.0),
+        Signal(date=daily[2].date, action=Action.BUY, price=10.0),
+        Signal(date=daily[3].date, action=Action.SELL, price=11.0),
+    ]
+    rep = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy(sigs), "000001", daily,
+    )
+    assert rep.total_trades == 1
+
+
+# ============================================================
 # 已取缔的伪缠论策略：确保它不会悄悄回来
 # ============================================================
 

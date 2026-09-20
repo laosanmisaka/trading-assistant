@@ -30,11 +30,21 @@ class Action(str, Enum):
 
 @dataclass
 class Signal:
-    """单条交易信号。date 为成交日，price 为成交价。"""
+    """单条交易信号。date 为成交日，price 为成交价。
+
+    `weight` 是**本次委托量占「本轮满仓股数」的比例**（满仓股数 = 本轮开仓时
+    按可用资金能买满的整手数，一轮之内固定）：
+      - `BUY  weight=0.5` → 再买入满仓的 1/2（不会越过满仓）
+      - `SELL weight=0.5` → 卖出满仓的 1/2；`SELL weight=1.0` → 清仓
+    默认 1.0 即「全进全出」，与加入该字段之前的行为完全一致。
+    委托量按整手（100 股）四舍五入 —— 「卖一半」与「买回一半」用的是同一个数，
+    所以卖完再买回能精确回到原仓位，不会因取整慢慢偏离。
+    """
     date: str
     action: Action
     price: float = 0.0
     reason: str = ""
+    weight: float = 1.0
 
 
 class Strategy(ABC):
