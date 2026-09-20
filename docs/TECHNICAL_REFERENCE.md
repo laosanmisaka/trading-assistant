@@ -315,9 +315,19 @@ trading_assistant.db
 | `marks_from_klines(klines, code="", name="")` | K 线、代码、名称 | `dict` | `build_payload` + `marks_from_payload` 的组合入口。 |
 | `fetch_klines(code, period)` | 代码、周期 | `list[KLineData]` | 取行情（新浪源，`30min` 可回溯约 247 交易日）。 |
 
-标注结构：`{"daily": [{"dt","kind","price"}...], "trades": [...], "meta": {...}}`，
-`kind` 取 `buy`/`sell`。日线几何点由 `core/chan_points` 判定，成交点由
-`core/chan_strategy` 产出；UI 与 HTML 图共用同一套函数，不各算一套。
+标注结构：
+`{"geometry": [{"date","kind","price"}...],
+"trades": [{"buy_date","buy_price","sell_date","sell_price","return_pct"}...],
+"six_pulse": [同 trades 结构], "meta": {...}}`
+
+- `geometry` —— 日线几何买卖点，`core/chan_points` 判定
+- `trades` —— **缠论**多周期共振策略的成交，`core/chan_strategy` 产出
+- `six_pulse` —— **六脉神剑**（另一套独立策略，`core/six_pulse`）的成交，
+  日线级别、含 60 根预热。与 `trades` 不同源，画在同图上只为对照，
+  不要混读（见 `docs/STRATEGY_SIX_PULSE.md`）
+- 两组交易的 `sell_date` 为空串 = 数据末尾仍未平仓
+
+UI 与 HTML 图共用同一套函数，不各算一套。
 
 ### `core/six_pulse.py`（六脉神剑，**独立于缠论**）
 
@@ -486,7 +496,7 @@ trading_assistant.db
 | `_draw_intraday()` | 无 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。固定只显示最近 5 个交易日，按天分隔标注日期，上栏隐藏 X 轴刻度。绘图后存储价格/成交量数组到 axes 供滚轮 Y 轴自适应。 |
 | `_draw_kline()` | 无 | `None` | 将 K 线数据转为 DataFrame，设置标题后委托 `_draw_kline_manual`。 |
 | `_draw_kline_manual(df, title)` | DataFrame、标题 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。上栏手工绘制蜡烛图（自适应宽度）、MA 均线、止损/止盈线和**缠论买卖点标注**（`_draw_chan_marks`）；下栏绘制成交量。上栏隐藏 X 轴刻度，x 轴日期格式根据周期自适应。绘图后将 OHLC/成交量数组存储到 axes 供滚轮 Y 轴自适应。 |
-| `_draw_chan_marks(ax, df)` | 子图、DataFrame | `None` | 画 `chan_marks` 里的买卖点：**买点画在当日最低价下方的红色上三角，卖点画在最高价上方的绿色下三角**。批量 `collection`，不逐点建 artist（504 → 6）。只在 `period == "daily"` 时调用。 |
+| `_draw_chan_marks(ax, df)` | 子图、DataFrame | `None` | 画 `chan_marks` 里的三组点：**缠论策略点**（买=当日最低价下方红上三角、卖=最高价上方绿下三角）＋**日线几何点**（小三角）＋**六脉神剑点**（菱形，紫蓝买 / 洋红卖，画在更外圈一档以免与缠论点叠住）。按 `(marker, 买卖, 距离档)` 分组批量 `collection`，不逐点建 artist。图例只列实际画了的类别。只在 `period == "daily"` 时调用。 |
 | `set_alert_lines(stop_loss, take_profit)` | 止损价、止盈价 | `None` | 设置该图表页止损/止盈线。 |
 | `set_chan_marks(marks)` | 标注 dict | `None` | 设置本页的缠论标注（结构见 `core/chan_viz.marks_from_klines`）并重绘。 |
 | `ChartWidget` | QWidget | widget | 包含分时/日/周/月四个标签页。 |
