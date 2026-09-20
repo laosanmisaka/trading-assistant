@@ -44,7 +44,10 @@ czsc 的 `cxt_first_buy_V221126` / `cxt_second_bs_V230320` /
 二买：一买之后的下一个向下笔终点 Q（中间隔一个向上笔），Q.low > 一买 P.low
 三买：某中枢 Z 的**离开笔**之后，第一次回抽（向下笔）的终点 R，
       R.low > Z.zg（回调不回中枢）
-卖点（一卖 / 二卖 / 三卖）完全对称。
+卖点（一卖 / 二卖 / 三卖）完全对称，**但收敛方向要反过来**：同一段上涨里的
+多个一卖候选只保留 ``high`` **最大**的那个（2026-09-20 修 —— 原实现沿用了
+买侧的 ``min``，把一个上涨段里最低的高点标成一卖，并连带让二卖判不出来，
+详见 `_converge_by_center` 的 docstring）。
 
 ⚠️ 「离开」在两处含义不同，别混用（2026-09-18 跨 26 个日线中枢实测）：
 
@@ -122,11 +125,23 @@ def _center_key(z: dict) -> tuple[str, str]:
     return (str(_ts(z["sdt"])), str(_ts(z["edt"])))
 
 
-def _converge_by_center(cands: Sequence[tuple]) -> list[tuple]:
-    """按参照中枢分段收敛：同属一个中枢的候选只保留最低点
+def _converge_by_center(cands: Sequence[tuple], *, extreme: str = "low") -> list[tuple]:
+    """按参照中枢分段收敛：同属一个中枢的候选只保留那一段的**极值**点
 
     ``cands`` 元素为 ``(bi_idx, dt, price, center_key)``，按时间升序。
-    中枢换了 → 新的一段下跌开始，重新计数。
+    中枢换了 → 新的一段走势开始，重新计数。
+
+    ``extreme`` 必须按买卖方向分派：
+      - ``"low"``  买点（向下笔终点）取**最低价** —— 该段最值得买的位置；
+      - ``"high"`` 卖点（向上笔终点）取**最高价** —— 该段最值得卖的位置。
+
+    ⚠️ 2026-09-20 修：原实现对买卖两侧一律取 ``min``（是照买侧写的），
+    卖侧因此取到「这一段上涨里**最低**的那个高点」，位置标错；更麻烦的是
+    连带让二卖判不出来 —— 二卖要求后续向上笔 ``high < high0``，而 ``high0``
+    被压低了，真正的次高点就落不进条件里。示例：同组候选 112 / 118，
+    修复前标 112 且二卖消失，修复后标 118 且二卖正常。
+    测试：`tests/test_chan_points.py::test_first_sell_converges_to_highest`
+    （修复前的实现会让它失败）。
 
     为什么不能按「相邻候选更低就吞并」做链式收敛（2026-09-18 实测）：
     链式传播会跨越数月、跨越多个中枢，把互不相干的两段下跌并成一段。
@@ -134,6 +149,7 @@ def _converge_by_center(cands: Sequence[tuple]) -> list[tuple]:
     平安银行 `9.83 → 9.37 → 8.65 → 7.55 → 7.53` 这一串里，9.83 比
     8.38 高 17%、中间有完整反弹，是独立的一段，却被一路并掉。
     """
+    pick = min if extreme == "low" else max
     out: list[tuple] = []
     group: list[tuple] = []
     for item in cands:
@@ -141,10 +157,10 @@ def _converge_by_center(cands: Sequence[tuple]) -> list[tuple]:
             group.append(item)
         else:
             if group:
-                out.append(min(group, key=lambda x: x[2]))
+                out.append(pick(group, key=lambda x: x[2]))
             group = [item]
     if group:
-        out.append(min(group, key=lambda x: x[2]))
+        out.append(pick(group, key=lambda x: x[2]))
     return out
 
 
@@ -202,7 +218,7 @@ def buy_sell_points(
             continue
         cand_buys.append((i, dt, low, _center_key(z)))
 
-    first_buys = _converge_by_center(cand_buys)
+    first_buys = _converge_by_center(cand_buys, extreme="low")
     for i, dt, low, _ in first_buys:
         add("一买", i, dt, low, "Down")
 
@@ -217,7 +233,7 @@ def buy_sell_points(
             continue
         cand_sells.append((i, dt, high, _center_key(z)))
 
-    first_sells = _converge_by_center(cand_sells)
+    first_sells = _converge_by_center(cand_sells, extreme="high")
     for i, dt, high, _ in first_sells:
         add("一卖", i, dt, high, "Up")
 
