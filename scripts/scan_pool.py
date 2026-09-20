@@ -337,6 +337,93 @@ def _fmt(v, nd=2) -> str:
     return str(v)
 
 
+# ----------------------------------------------------------------------
+# 窗口阶梯：一次宽窗口取数 → 一次算出所有 W2 取值的等效成绩
+# ----------------------------------------------------------------------
+
+def offset_return_table(results: list, buckets=None) -> list[dict]:
+    """按 ``|gap_2tom|`` 分桶统计收益
+
+    每个桶是**独立**的一段（不累加），用来看"错开多远的那批笔长得怎么样"。
+    """
+    if buckets is None:
+        buckets = [(0, 0), (1, 2), (3, 5), (6, 10), (11, 20), (21, 10 ** 6)]
+
+    pairs: list[tuple[int, float]] = []
+    for res in results:
+        for t in res.trades:
+            if t.return_pct is None or t.buy.gap_2tom is None:
+                continue
+            pairs.append((t.buy.gap_2tom, t.return_pct))
+
+    out: list[dict] = []
+    for lo, hi in buckets:
+        sel = [r for g, r in pairs if lo <= abs(g) <= hi]
+        label = f"{lo}" if lo == hi else (f"{lo}~{hi}" if hi < 10 ** 6 else f">{lo - 1}")
+        out.append({
+            "偏移区间": label,
+            "笔数": len(sel),
+            "胜率%": round(len([r for r in sel if r > 0]) / len(sel) * 100, 1) if sel else None,
+            "平均收益%": round(sum(sel) / len(sel), 2) if sel else None,
+            "最佳%": round(max(sel), 2) if sel else None,
+            "最差%": round(min(sel), 2) if sel else None,
+        })
+    return out
+
+
+def window_ladder(results: list, thresholds=(0, 2, 5, 10, 15, 20, 30)) -> list[dict]:
+    """把同一批笔按 ``|gap_2tom| <= N`` **累加**，给出每个 W2 取值的等效成绩
+
+    为什么一次宽窗口的取数就能算出全部 W2 取值：
+    策略在窗口内取的是**最近**的那个 30 分钟买点，所以放宽窗口只会**新增**
+    原先配不上的日线二买，不会改变已有配对的选择。⇒ W2 小的结果集是 W2 大的
+    **子集**，单调嵌套。于是 `--max-gap-2tom 30` 跑一轮，把结果按 N 过滤累加，
+    就等于分别用每个 N 跑一轮。
+
+    ⚠️ 这条等价性依赖 `match_buy_points` "取最近" 的选取规则。改那个规则
+    （比如改成"取最远"或"取第一个"）会让本节失效 —— `tests/test_scan_pool.py`
+    用「阶梯 N=当前窗口 必须等于直接跑该窗口」把这条钉住。
+    """
+    pairs: list[tuple[int, float]] = []
+    for res in results:
+        for t in res.trades:
+            if t.return_pct is None or t.buy.gap_2tom is None:
+                continue
+            pairs.append((abs(t.buy.gap_2tom), t.return_pct))
+
+    out: list[dict] = []
+    for n in thresholds:
+        sel = [r for g, r in pairs if g <= n]
+        out.append({
+            "W2": f"±{n}",
+            "笔数": len(sel),
+            "胜率%": round(len([r for r in sel if r > 0]) / len(sel) * 100, 1) if sel else None,
+            "平均收益%": round(sum(sel) / len(sel), 2) if sel else None,
+            "最佳%": round(max(sel), 2) if sel else None,
+            "最差%": round(min(sel), 2) if sel else None,
+        })
+    return out
+
+
+def trade_rows(results: list) -> list[dict]:
+    """逐笔明细（供 CSV 审计：每个买点的偏移与收益，可自行分桶复核）"""
+    rows: list[dict] = []
+    for res in results:
+        for t in res.trades:
+            rows.append({
+                "代码": res.code,
+                "一买": t.buy.d1,
+                "二买": t.buy.d2,
+                "成交日": t.buy.dt,
+                "成交价": t.buy.price,
+                "间隔1to2": t.buy.gap_1to2,
+                "偏移2tom": t.buy.gap_2tom,
+                "卖点日": t.sell.dt if t.sell else "",
+                "收益率%": round(t.return_pct, 2) if t.return_pct is not None else "",
+            })
+    return rows
+
+
 def _dist_block(title: str, values: list[int], thresholds: list[int]) -> list[str]:
     """分布段落 —— 结论（覆盖率）在前，样本摘要在后"""
     st = offset_stats(values)
@@ -399,8 +486,38 @@ def render_report(rows: list[dict], diags: list[dict], results: list, *,
     lines += _dist_block("一买 → 二买 间隔（交易日，恒正）", gaps, [15, 20, 30, 40, 60])
     lines += _dist_block("日线二买 → 最近 30 分钟二买 偏移（交易日，**有符号**，"
                          "负 = 次级别买点更早）", offs, [2, 5, 10, 15, 20])
-    lines.append("读法：偏移覆盖率的 P90 落在哪一档，±窗口就取那一档 —— "
-                 "再放宽只是把不匹配的点硬凑成对（提密度不提精度）。")
+    lines.append("覆盖率读法（**仅供参考，不要据此定窗口**）：覆盖率高的档位表示"
+                 "「窗口取到该值时能捞到多少比例的日线二买」。但**捞得多 ≠ 赚得多** —— "
+                 "真正该看的是下面两节。")
+    lines.append("")
+
+    # ---- 偏移分桶：错开多远的那批笔各自长什么样 ----
+    obt = offset_return_table(results)
+    lines.append("### 3.1 偏移 → 收益（按 `|偏移|` 分段，不累加）")
+    lines.append("")
+    lines.append("| |偏移| 区间 | 笔数 | 胜率% | 平均收益% | 最佳% | 最差% |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for r in obt:
+        lines.append(f"| {r['偏移区间']} | {r['笔数']} | {_fmt(r['胜率%'])} | "
+                     f"{_fmt(r['平均收益%'])} | {_fmt(r['最佳%'])} | {_fmt(r['最差%'])} |")
+    lines.append("")
+
+    # ---- 窗口阶梯：每个 W2 取值的等效成绩 ----
+    ladder = window_ladder(results)
+    lines.append("### 3.2 窗口阶梯（按 `|偏移| <= N` **累加** = 每个 W2 取值的等效成绩）")
+    lines.append("")
+    lines.append("| W2 | 笔数 | 胜率% | 平均收益% | 最佳% | 最差% |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for r in ladder:
+        lines.append(f"| {r['W2']} | {r['笔数']} | {_fmt(r['胜率%'])} | "
+                     f"{_fmt(r['平均收益%'])} | {_fmt(r['最佳%'])} | {_fmt(r['最差%'])} |")
+    lines.append("")
+    lines.append("等价性：本表由**一次宽窗口取数**（`--max-gap-2tom` 取到最大档）"
+                 "按 N 过滤累加得出。成立的前提是策略取窗口内**最近**的次级别买点 ⇒ "
+                 "W2 小的结果集是 W2 大的子集。改选取规则会让本表失效。")
+    lines.append("读法：**别只看笔数**。若某档收益显著更差，说明那个距离段的配对是噪声，"
+                 "窗口就该收在它之前；若各档差不多，说明窗口大小对质量不敏感，"
+                 "取小的（少而精）即可。")
     lines.append("")
     return "\n".join(lines)
 
@@ -435,6 +552,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--codes", default="",
                    help="只扫指定代码（逗号分隔，名称从池里取）—— "
                         "用于定向补跑被限流打掉的那几只")
+    p.add_argument("--dump-trades", type=Path, default=None,
+                   help="逐笔明细 CSV（含每个买点的有符号偏移与收益），便于自行分桶复核")
     return p
 
 
@@ -492,6 +611,13 @@ def main(argv=None) -> int:
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
+
+    if args.dump_trades:
+        detail = pd.DataFrame(trade_rows(results))
+        dump = Path(args.dump_trades)
+        dump.parent.mkdir(parents=True, exist_ok=True)
+        detail.to_csv(dump, index=False, encoding="utf-8-sig")
+        print(f"逐笔明细：{dump}（{len(detail)} 行）")
 
     agg = aggregate(rows, results)
     print("\n" + "=" * 56)

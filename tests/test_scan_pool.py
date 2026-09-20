@@ -267,3 +267,97 @@ def test_no_cache_bypasses_fresh_cache(sp, tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="取数失败"):
         sp.load_klines("sh600519", cache_dir=cache, use_cache=False, attempts=2)
+
+
+# ----------------------------------------------------------------------
+# 窗口阶梯（一次宽窗口取数 → 算出所有 W2 取值的等效成绩）
+# ----------------------------------------------------------------------
+
+def _result_with_offsets(code, pairs):
+    """pairs = [(gap_2tom, 收益率%或 None)]；None 表示未平仓"""
+    from core.chan_strategy import BuySignal, ScanResult, SellSignal, Trade
+
+    res = ScanResult(code=code, source="geometry")
+    for i, (gap, r) in enumerate(pairs):
+        buy = BuySignal(dt=f"2026-01-{i + 2:02d} 10:30", price=10.0,
+                        d1="2026-01-02", d2="2026-01-05",
+                        gap_1to2=3, gap_2tom=gap)
+        if r is None:
+            res.trades.append(Trade(buy=buy))
+        else:
+            res.trades.append(Trade(buy=buy, sell=SellSignal(
+                dt=f"2026-02-{i + 2:02d}", price=10.0 * (1 + r / 100),
+                ma="MA10", ma_value=9.0, hold_days=20)))
+    return res
+
+
+def test_window_ladder_accumulates_by_absolute_offset(sp):
+    """阶梯按 |偏移| 累加 —— 每个 N 的行等于直接跑该窗口的结果"""
+    results = [_result_with_offsets("sh600519", [
+        (0, 10.0), (1, -10.0), (-3, 20.0), (-8, 30.0), (15, 40.0),
+    ])]
+
+    ladder = {r["W2"]: r for r in sp.window_ladder(results, thresholds=(0, 2, 5, 10))}
+
+    assert ladder["±0"]["笔数"] == 1                     # 只有偏移 0
+    assert ladder["±2"]["笔数"] == 2                     # +0, ±1
+    assert ladder["±5"]["笔数"] == 3                     # +|−3|
+    assert ladder["±10"]["笔数"] == 4                    # +|−8|，不含 15
+    assert ladder["±10"]["平均收益%"] == 12.5             # (10-10+20+30)/4
+    assert ladder["±2"]["胜率%"] == 50.0                  # +10 与 −10 各一
+
+
+def test_window_ladder_win_rate_and_open_trades(sp):
+    """未平仓的不计收益率；胜率按已平仓算"""
+    results = [_result_with_offsets("sh600519", [
+        (1, 10.0), (2, -5.0), (3, None),
+    ])]
+
+    row = [r for r in sp.window_ladder(results, thresholds=(5,))][0]
+
+    assert row["笔数"] == 2, "未平仓的不该进阶梯"
+    assert row["胜率%"] == 50.0
+    assert row["平均收益%"] == 2.5
+    assert row["最佳%"] == 10.0 and row["最差%"] == -5.0
+
+
+def test_window_ladder_is_monotone_in_trade_count(sp):
+    """笔数必须随 N 单调不减 —— 这是"阶梯等价于分别跑"的前提"""
+    results = [_result_with_offsets("sh600519", [(g, 1.0) for g in (0, 1, 4, 9, 19)])]
+
+    counts = [r["笔数"] for r in sp.window_ladder(results, (0, 2, 5, 10, 20))]
+
+    assert counts == sorted(counts)
+
+
+def test_offset_return_table_buckets_are_disjoint(sp):
+    """分桶互不重叠，且桶外样本不进任何桶"""
+    results = [_result_with_offsets("sh600519", [
+        (0, 1.0), (2, 2.0), (5, 3.0), (10, 4.0), (999, 5.0),
+    ])]
+
+    tbl = {r["偏移区间"]: r for r in sp.offset_return_table(
+        results, buckets=[(0, 0), (1, 2), (3, 10)])}
+
+    assert tbl["0"]["笔数"] == 1
+    assert tbl["1~2"]["笔数"] == 1
+    assert tbl["3~10"]["笔数"] == 2      # 3 与 10 都落进来，且不含 999
+    assert sum(r["笔数"] for r in tbl.values()) == 4
+
+
+def test_trade_rows_carries_offset_for_audit(sp):
+    """逐笔明细必须带上有符号偏移，便于自行分桶复核"""
+    results = [_result_with_offsets("sh600519", [(-8, 12.5), (3, None)])]
+
+    rows = sp.trade_rows(results)
+
+    assert len(rows) == 2
+    assert rows[0]["偏移2tom"] == -8 and rows[0]["收益率%"] == 12.5
+    assert rows[1]["偏移2tom"] == 3 and rows[1]["收益率%"] == "", "未平仓的收益留空"
+
+
+def test_window_ladder_handles_empty(sp):
+    """空输入不抛异常（全池取数失败时报告仍要能生成）"""
+    assert sp.window_ladder([], (0, 5))[0]["笔数"] == 0
+    assert sp.offset_return_table([])[0]["笔数"] == 0
+    assert sp.trade_rows([]) == []
