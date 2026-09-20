@@ -459,7 +459,7 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
 
 | 项 | 说明 | 建议 |
 | --- | --- | --- |
-| `core/backtest/engine.py` | 通用回测执行器（资金/佣金/印花税/回撤/资金曲线）。**不是死重**：`scripts/eval_six_pulse.py` 正在用它做六脉评估的成交与记账，`tests/test_backtest.py` 8 条用例专测它；本身不含策略 | **保留**（2026-09-20 拍板）。老三先问过是否删，说明依赖后决定留。它是项目里唯一一段「资金曲线」代码，组合回测迟早要用；接 `chan_strategy` 的适配器写法见 `core/backtest/strategy.py` docstring |
+| `core/backtest/engine.py` | 通用回测执行器（资金/佣金/印花税/回撤/资金曲线），**2026-09-20 起支持部分成交**（`Signal.weight` + `Trade.episode`，分级出口需要）。**不是死重**：`scripts/eval_six_pulse.py` 正在用它做六脉评估的成交与记账，`tests/test_backtest.py` 10 条用例专测它；本身不含策略 | **保留**（2026-09-20 拍板）。老三先问过是否删，说明依赖后决定留。它是项目里唯一一段「资金曲线」代码，组合回测迟早要用；接 `chan_strategy` 的适配器写法见 `core/backtest/strategy.py` docstring |
 | `technical.py::detect_bottom_fractal` | 无调用方（原调用方是已删的伪缠论策略）；`detect_top_fractal` 的对称构件 | 保留（不是伪缠论，成对删除会让分型模块残缺）；老三确认不要可删 |
 | DB 里 `alert_type='buy_point'` 的旧行 | 枚举值已删，存量库可能有旧行 | 无代码读取，不动 |
 | `ui/discipline_dialog.py` | 交易纪律清单。**自动弹窗已取消**（那属于买点提示），保留为右键菜单手动入口 | 保留 |
