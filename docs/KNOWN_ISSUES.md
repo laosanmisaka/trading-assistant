@@ -88,6 +88,11 @@ SELL_FIRST 单轮:     资金 50000 -> 60000    底仓 5000 -> 4000
 
 ## KI-004 买点扫描底分型确认取值疑似偏移一根
 
+> **2026-09-18：涉事链路已删除**（`core/buy_point_scanner.py` 整文件删除），
+> 本条目转为历史记录。**结论仍然成立且值得记住**：按注释修正后
+> `closes[idx+1] > lows[idx]` 在底分型定义下**恒为真**，等于这个「确认」
+> 从来没起过作用 —— 这也解释了它为什么不影响结果，所以没人发现。
+
 | 项 | 内容 |
 | --- | --- |
 | 位置 | `core/buy_point_scanner.py:111-114` |
@@ -241,7 +246,7 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 | 缺陷 | 位置 | 保护测试 | 断言要点 |
 | --- | --- | --- | --- |
 | UI 线程同步网络请求 | `ui/main_window.py` `_try_add_by_code` | `tests/test_ui_threading.py::TestAddByCodeIsAsync` | 5 条：不起同步调用 / 走 worker / 防重入 / 信号全接 / DB 命中不同步 |
-| 买点扫描线程泄漏 | `core/buy_point_scanner.py` `BuyPointScanWorker` | `tests/test_ui_threading.py::TestBuyPointScanSingleWorker` | 7 条：单轮单 worker / 运行中跳过 / 不累积引用 / 容忍已销毁对象 / batch_finished 接上 |
+| 标注计算线程泄漏 | `ui/chan_worker.py` `ChanMarkWorker`（原 `BuyPointScanWorker` 的位置） | `tests/test_ui_threading.py::TestChanMarkSingleFlight` | 8 条：单轮单 worker / 运行中跳过 / 缓存命中不建 worker / 不累积引用 / 容忍已销毁对象 / 信号全接 |
 | `is_trading_time()` 硬编码时段 | `utils/__init__.py` | `tests/test_trading_time.py` | 26 条：改 `config.TRADING_*` 必须立即生效（原实现改配置无效） |
 | 图表逐根绘制 | `ui/chart_widget.py` `_draw_kline_manual` | `tests/test_chart_candles.py` | 15 条：与逐根绘制逐坐标等价 / artist 数量与根数解耦 / dataLim 未退化 |
 | 数据源故障与无数据不可区分 | `data/market_data.py` | `tests/test_data_source_errors.py` | 11 条：源故障抛 `DataSourceError`、无数据返回 `[]`、异常带代码与原因、重试语义 |
@@ -249,7 +254,7 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 **两处批量改造都做过变异验证**（把实现改回旧写法，确认断言会失败）：
 
 - 回退 `_try_add_by_code` 为同步调用 → 3 条失败，且测试耗时从 0.53s 涨到 12.7s（复现了那次 UI 冻结）
-- 回退买点扫描为每股票一个 worker → 4 条失败
+- 回退买点扫描为每股票一个 worker → 4 条失败（链路已换成 `ChanMarkWorker`，契约测试一并迁移）
 - 回退交易时段为硬编码 → 5 条失败
 
 **改造量化**：

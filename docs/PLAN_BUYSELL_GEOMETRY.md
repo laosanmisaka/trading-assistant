@@ -219,14 +219,15 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
 
 ## 3. 影响面分级（「老一套不需要了」要拆开执行）
 
-### 3.1 可直接删（唯一用户就是要下线的那条链路）
+### 3.1 可直接删（唯一用户就是要下线的那条链路）—— ✅ 2026-09-18 已删
 
-| 对象 | 唯一引用者 |
-| --- | --- |
-| `core/buy_point_scanner.py` 的伪缠论判定 | `ui/main_window.py:35` |
-| `technical.py::calc_center_range`（分位数伪中枢） | `buy_point_scanner.py` |
-| `technical.py::check_pullback_to_center` | `buy_point_scanner.py` |
-| `technical.py::is_volume_contraction` | `buy_point_scanner.py` |
+| 对象 | 唯一引用者 | 处置 |
+| --- | --- | --- |
+| `core/buy_point_scanner.py` 的伪缠论判定 | `ui/main_window.py:35` | 整文件 `git rm` |
+| `technical.py::calc_center_range`（分位数伪中枢） | `buy_point_scanner.py` | 删除 |
+| `technical.py::check_pullback_to_center` | `buy_point_scanner.py` | 删除 |
+| `technical.py::is_volume_contraction` | `buy_point_scanner.py` | 删除 |
+| `technical.py::is_volume_expansion` | `buy_point_scanner.py` | 删除 |
 
 ### 3.2 **不能删**（老链路之外还有用户）
 
@@ -238,15 +239,21 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
 | `get_latest_top_fractal` | `alert_engine.py:15`（**止盈在用，活跃**） |
 | `find_stop_loss_price` | `alert_engine.py:15`（**止损在用，活跃**） |
 
-### 3.3 UI 与数据侧的连带项
+### 3.3 UI 与数据侧的连带项 —— ✅ 2026-09-18 已清
 
-- `ui/main_window.py`：买点扫描定时器 `_buypoint_timer`、`_scan_buy_points()`
-  (L631)、`_buy_point_states`、`_on_buy_point_result` (L664)
-- `ui/stock_table.py:211`：`"buy_point"` 黄色高亮
-- `data/models.py:124`：`BuyPointState`（`buy_point_triggered` = 综合买点 ≥2/3）
-- `config.py`：`GOLDEN_CROSS_LOOKBACK_DAYS` / `VOLUME_CONTRACTION_RATIO` /
-  `CENTER_LOOKBACK_WEEKS`
-- DB：`BuyPointState` 落库的字段
+- `ui/main_window.py`：~~买点扫描定时器 `_buypoint_timer`、`_scan_buy_points()` (L631)、
+  `_buy_point_states`、`_on_buy_point_result` (L664)~~ → 全部删除；
+  新增 `_request_chan_marks()` / `_on_chan_marks_ready()` / `_on_chan_marks_failed()` /
+  `_refresh_chan_marks()`，后台走 `ui/chan_worker.py::ChanMarkWorker`
+- `ui/stock_table.py`：~~`"buy_point"` 黄色高亮~~ → 删除「买点信号」列（10 列 → 9 列），
+  `highlight_rows()` 只留止损止盈红底；右键菜单新增「刷新缠论买卖点」
+- `ui/chart_widget.py`：新增 `set_chan_marks()` / `_draw_chan_marks()`，买点落在低点下方、
+  卖点落在高点上方的三角标注；只在日线页绘制
+- ~~`data/models.py:124 BuyPointState`~~ → 定义保留但**已无调用方**（见 §9 遗留项）
+- `config.py`：删除 `ENABLE_BUYPOINT_SCAN` / `BUYPOINT_SCAN_INTERVAL_MS` /
+  `STOCK_TABLE_COLUMNS` 的「买点信号」列 / `CHART_COLORS["alert_buy_point"]`；
+  `GOLDEN_CROSS_LOOKBACK_DAYS` **保留**（`core/backtest/strategy.py` 在用）
+- DB：`BuyPointState` 落库字段**未动**（无表结构变更，避免存量库兼容问题）
 
 ⇒ **执行顺序必须是「先停止调用 → 观察一个版本 → 再删文件」。**
 不能先删，否则 UI 直接起不来。
@@ -261,8 +268,13 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
 | 1 | `points_from_chan()` + `resample_daily` 上移 | ✅ 已做（+5 条单测） |
 | 2 | `scan_from_frame(..., source=...)` 双路并存 | ✅ 已做 |
 | 3 | 默认切 `geometry`，signal 路径标 legacy（暂不删） | ✅ 已做 |
-| 4 | UI 买点高亮改用新策略 | ⏸ **未做**（UI 那条出口目前是关的） |
-| 5 | 删 3.1 的四个对象 + 清理 config/DB/高亮 | ⏸ **未做**（先观察一个版本） |
+| 4 | UI 买点高亮改用新策略 | ✅ **已做（2026-09-18）** —— 口径改为「不做提醒，只在 K 线图上标注」 |
+| 5 | 删 3.1 的四个对象 + 清理 config/DB/高亮 | ✅ **已做（2026-09-18）** —— 见 §3.1 / §3.3 |
+
+**批 4 的口径变化**：原方案是「把策略输出接到 UI 提醒链路」（表格高亮 + 状态栏 + 托盘闪烁）。
+老三 2026-09-18 定：**不要提醒**，改为双击股票时在日线图上画买卖点标注。
+提醒链路此后只剩止损止盈一条。这样也绕开了「末中枢右边界盘中会变」对实时告警可信度的影响
+（见 §7 第 4 条）—— 标注是随图刷新的一次性快照，不当告警用。
 
 **批 0 不能跳过。** 在动手改之前先拿到「几何法会把交易笔数变成多少」这个数字，
 不然批 3 之后无法判断结果变化是**改进**还是**引入的错**。这次正是它把
@@ -318,20 +330,19 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
 3. **共振条件维持「日线一买 → 日线二买 → 30分二买」吗？**
    几何法顺手也能给 30 分钟一买/三买、日线三买，要不要纳入。
 4. ~~**UI 那套买点高亮：换成新策略的输出，还是先关掉？**~~
-   **已定（2026-09-18）：先关掉。** 已实施 —— `config.ENABLE_BUYPOINT_SCAN = False`，
-   `ui/main_window.py` 的买点扫描定时器不再启动（保护放在定时器启动处，不放进
-   `_scan_buy_points` 内部，否则会废掉 `tests/test_ui_threading.py` 里 6 处直接
-   调用它的线程泄漏用例）。方法本体与 `_buy_point_states` 高亮链保留未删。
-   新策略接 UI 仍是独立一件事（线程模型与性能预算未测；单只出图 2~3 秒可作参考）。
+   **已定并完成（2026-09-18）：不做提醒，改为 K 线图上标注。**
+   老链路（伪缠论扫描 + 表格高亮 + 状态栏 + 托盘闪烁）整体删除；
+   `ui/chan_worker.py::ChanMarkWorker` 承担后台计算，契约继承原 `BuyPointScanWorker`
+   （单飞 + `finished` 接 `deleteLater`，`tests/test_ui_threading.py` 钉死）。
+   标注与 HTML 缠论图**同源**（`core/chan_viz.marks_from_klines()`），不各算一套。
 5. ~~**要不要重跑历史统计**~~ **已做（2026-09-18）**：
    `docs/STRATEGY_CHAN_MULTIFREQ.md` 第 5 节已换成几何源的真实数字，
    旧的 cxt_* 数字收进折叠块标注「历史记录，勿引用作当前成绩」。
-6. **批 4/5 没做，要不要做？**
-   - 批 4「接 UI」：把策略输出接到提醒链路（现在老伪缠论那条出口是关的，
-     UI 上目前没有任何买点提示）。
-   - 批 5「删老链路」：`calc_center_range` / `check_pullback_to_center` /
-     `is_volume_contraction` / `buy_point_scanner` 这一套现在**没有任何调用方**
-     却还活着（唯一出口已关）。删之前建议观察一个版本。
+6. ~~**批 4/5 没做，要不要做？**~~ **已做（2026-09-18）**，见 §4。
+   - 批 4「接 UI」→ 改为**图上标注**（老三去掉了"提醒"这个需求）。
+   - 批 5「删老链路」→ `core/buy_point_scanner.py` 整文件删除，
+     `calc_center_range` / `check_pullback_to_center` / `is_volume_contraction` /
+     `is_volume_expansion` 四个函数删除；`grep` 复核无残留引用。
 
 ---
 
@@ -354,3 +365,38 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
 6. **样本量是当前最大的问题。** 8 笔买点、胜率 75% 这个数字**不要去用** ——
    样本太小，且窗口参数是在同一批数据上拍出来的（轻度自相关）。
    要下任何"这个策略能不能用"的结论，必须先扩标的池。
+
+   **2026-09-18/20 扩池结果（50 只流动性标的 / 1970 根 30 分钟 / 247 交易日）**：
+   50 只全部取数成功，**22 只有买点、共 24 笔（已平仓 23）**，胜率 73.9%、平均收益 +3.90%，
+   最佳 +22.92%（紫金矿业）、最差 −4.49%（通威股份），最大同时持仓 1。
+   单只约 0.5 笔/年。报告：`outputs/pool_geometry_40_10.md`
+   （`scripts/scan_pool.py` 产出，已被 .gitignore 忽略）。
+   ⚠️ 这个量级**仍不足以定参数**，只是把"样本量"从 8 笔推到 24 笔；
+   要看统计意义需要 100~300 只。
+
+   **窗口诊断（47 个样本，同日全量重算）**：
+   - 一买 → 二买间隔：范围 6~54 交易日，中位 26，P90 36.4 ⇒ `W1=40` 覆盖 **96%**（±60 才 100%）
+   - 日线二买 → 最近 30 分钟二买的有符号偏移：范围 −48~20，中位 −8，P90 7.0
+     ⇒ `W2=±10` 覆盖**只有 51%**；±15 为 64%、±20 为 72%
+   ⚠️ **这是本轮最需要老三拍板的一条**：`±10` 有一半的日线二买配不上次级别买点。
+   顺序是「先等一买、再等二买、再等 30 分钟二买」，三层递进本就稀有；
+   `±10` 是**保精度**的选择（宁可漏），`±20` 是**保密度**（72%，但匹配质量下降）。
+   样本 47 个仍偏少，建议随标的池继续扩大再复核。
+
+---
+
+## 8. 现状与遗留项（2026-09-18 收口）
+
+**已完成**：批 0~5 全部落地。当前买卖点只有 `core/chan_points.py` 几何判定一套；
+UI 只在日线图上标注，不做任何买点提醒。
+
+**遗留项（已知、暂不处理）**：
+
+| 项 | 说明 | 建议 |
+| --- | --- | --- |
+| `data/models.py::BuyPointState` + `AlertType.BUY_POINT` | 老链路留下的数据类，**已无任何调用方**（`grep` 确认只有定义处） | 纯死代码，可随下次 DB 层整理一并删 |
+| DB `buypoint` 相关字段 | 未做表结构变更，存量库保留旧字段 | 不动，避免兼容问题 |
+| `core/backtest/strategy.py`（策略名 `buypoint`） | **仍是同一套伪缠论规则**（周线底分型 + MACD 金叉 + 自算缩量回踩），只是把中枢/缩量逻辑内联了，没走 `chan_points` | 与桌面端口径不一致；若要用于评估新策略，应改成几何源 |
+| `ui/discipline_dialog.py` | 交易纪律清单。**自动弹窗已取消**（那属于买点提示），保留为右键菜单手动入口 | 保留 |
+| 卖点 | 仍为 MA5/MA10 双破。老三已说明后续要做多策略组合，**本轮不碰** | 等策略组合方案定了再动 |
+| 窗口参数 W1=40 / W2=±10 | 拍的值，非寻优结果；23 笔样本撑不起参数结论 | 扩池到 100~300 只后重标定 |

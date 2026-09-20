@@ -12,7 +12,7 @@
 
 **这是一个「架构分层意识正确、功能骨架完整、但正确性与工程卫生未收口」的半成品。**
 
-作为个人自用工具，它的可用度已经不错：分组管理、行情刷新、K 线/分时图、交易记录、止损止盈提醒、买点扫描都能跑通。但作为要交给别人接手、甚至要碰真金白银的系统，当前状态**不安全**——做 T 模块存在明确的资金计算缺陷，止损口径存在方向性疑问，而唯一能兜底的测试又依赖真实网络。
+作为个人自用工具，它的可用度已经不错：分组管理、行情刷新、K 线/分时图、交易记录、止损止盈提醒都能跑通（原「买点扫描」已于 2026-09-18 删除，买点改为在图上标注）。但作为要交给别人接手、甚至要碰真金白银的系统，当前状态**不安全**——做 T 模块存在明确的资金计算缺陷，止损口径存在方向性疑问，而唯一能兜底的测试又依赖真实网络。
 
 一句话：**可以研究、可以自用观察，不可以按现状用于任何自动化的交易决策。**
 
@@ -34,6 +34,8 @@
 **缓存架构有设计。** `MarketDataManager` 做了「内存 + SQLite」双层缓存，区分了「今日 bar」（内存，定时 flush）和「历史 K 线」（DB），并用 `get_klines()` 统一屏蔽数据来源。这是理解成本较高、但收益也较高的一步。
 
 **线程模型有考虑。** 所有网络请求走 QThread Worker（`StockSearchWorker`、`IncrementalRefreshWorker`、`InitialFetchWorker`、`BuyPointScanWorker`），不阻塞 GUI；且区分了「API 取」和「本地 DB 取」两套 Worker，说明有性能意识。
+
+> 2026-09-18：`BuyPointScanWorker` 已随老伪缠论买点链路删除，替代者是 `ui/chan_worker.py::ChanMarkWorker`（契约不变）。其余三个仍在。
 
 **异常兜底做得扎实。** `main.py` 注册了全局 `sys.excepthook` 和 Qt 消息处理器，未捕获异常会同时进日志、进 stderr、弹窗。`_on_incremental_complete_safe()` 这类「Worker 异常退出也要刷一次 UI」的安全网，说明作者吃过线程静默失败的亏。
 
@@ -141,6 +143,8 @@ for i in range(buy_idx, len(arr["lows"])):
 **`utils.is_trading_time()` 存在硬编码。** 使用硬编码时间对象，未引用 `config.TRADING_*` 常量——改配置不会生效。
 
 **`core/` 与 `data/` 反向依赖 PyQt。** `core/buy_point_scanner.py:9` 与 `data/market_data.py:6` 直接 `from PyQt5.QtCore import QThread, pyqtSignal`。业务层依赖 GUI 框架，导致 `core/` 无法脱离 QApplication 单测。Worker 类应上移到 `ui/services/`。
+
+**2026-09-18 更新：`core/` 这一侧已解决。** `core/buy_point_scanner.py` 删除后，新的后台 worker 落在 `ui/chan_worker.py`，`core/` 已不再 import PyQt5；`data/market_data.py` 仍依赖，留待后续处理。
 
 **网络失败被静默吞掉。** `data/market_data.py:122-124` 用裸 `except Exception` → `logger.error` + `return []`。调用方无法区分「数据源挂了」和「停牌无数据」，两者都会渲染成空图表。
 

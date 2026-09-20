@@ -15,7 +15,7 @@
 | 分型 | `technical.py` `_merge_contains` + `detect_top/bottom_fractal` | **实现正确**，与 czsc 逐点等价（见第 5 节） |
 | 笔 | 无 | 缺失 |
 | 线段 | 无 | 缺失 |
-| 中枢 | `technical.py:288` `calc_center_range` = 高点 75 分位 + 低点 25 分位 | **不是缠论中枢**，docstring 自述「简化算法」 |
+| 中枢 | `technical.py:288` `calc_center_range` = 高点 75 分位 + 低点 25 分位 | **不是缠论中枢**，docstring 自述「简化算法」。该函数已于 2026-09-18 删除 |
 
 即：**真分型 + 假中枢 + 无笔线段**。
 
@@ -128,7 +128,7 @@
 ## 6. 尚未完成
 
 - **切换调用方**：`core/alert_engine.py:226`（止盈顶分型）与
-  `core/buy_point_scanner.py:100/141`（周线底分型、缩量回踩中枢）仍走自研实现。
+  ~~`core/buy_point_scanner.py:100/141`（周线底分型、缩量回踩中枢）~~ —— 该链路已于 2026-09-18 整体删除，现在买卖点只有 `core/chan_points.py` 一套几何判定。
   切换会改变买点触发结果，需与老三确认后再动。
 - **30min 数据源**：项目目前只采集 `1min` 与 `60min`。czsc 的 `Freq.F30` 已就绪，
   但数据层尚未提供 30min。
