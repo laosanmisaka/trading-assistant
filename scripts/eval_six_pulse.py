@@ -12,11 +12,12 @@
 1. 读标的池（默认 `scripts/pool_liquid50.txt`）
 2. 取日线（新浪源、**前复权**）并**落盘缓存**到 `outputs/cache_daily/`
 3. 逐只跑 `core.six_pulse.SixPulseStrategy` + `core.backtest.engine`，
-   给出胜率 / 平均每笔 / 总收益 / 最大回撤 / 盈亏比，并与**买入持有**对照
+   给出轮级 / 笔级胜率、总收益 / 最大回撤 / 盈亏比，并与**买入持有**对照
 4. 三项诊断（回答"亏在哪"）：
    - **A 指标共线性**：六项多头占比、两两相关、实际共振率 vs 独立假设乘积
    - **B 买点前瞻收益**：所有共振首日后 5/10/20 日收益 ⇒ 买点是否在追高
-   - **C 出口对照扫**：MA5/10/20/30 与固定持有 10/20/40 日 ⇒ 买点错还是出口紧
+   - **C 出口对照扫**：分级出口 / 单线 MA5·10·20·30 / 固定持有 10·20·40 日
+     ⇒ 买点错还是出口紧
 
 ⚠️ 口径（数字怎么读）
 ---------------------
@@ -26,6 +27,9 @@
   买不进任何一手，会**静默跳过**该股全部信号（被误读成"无信号"）。
 - 佣金万 2.5（双边、最低 5 元）+ 印花税千 1（仅卖出）。
 - T 日**收盘**出信号，**T+1 开盘**成交（两端对称，无未来函数）。
+- 卖出默认走**分级出口**（破 MA5 卖半 / 站回 MA10 回补 / 破 MA20 清仓）。
+  分级出口下一轮持仓会拆成多笔 ⇒ **跨出口比较看「轮级」**（`merge_stats`
+  的 `episodes` / `ep_win_rate`），笔级胜率只在自己口径内可比。
 """
 from __future__ import annotations
 
@@ -164,6 +168,9 @@ def merge_stats(rows: list[dict]) -> dict:
     """把逐标的行合并成池级口径
 
     - **笔级**：所有标的的 trades 合并（胜率、平均每笔、盈亏比）
+    - **轮级（episode）**：按「一轮持仓」归并。全进全出时一轮 = 一笔；
+      分级出口（减半→回补→清仓）会把一轮拆成多笔，**笔级胜率会被拆细失真**，
+      轮级才是「这一轮赚没赚」。对比不同出口规则时要看轮级。
     - **区间级**：逐标的收益率**等权平均**（策略 vs 买入持有）
     """
     trades = [t for r in rows for t in r["_trades"]]
@@ -172,6 +179,19 @@ def merge_stats(rows: list[dict]) -> dict:
     gain = sum(t.profit for t in wins)
     loss = abs(sum(t.profit for t in losses))
     holds = [r["avg_hold"] for r in rows if r["trades"] > 0]
+
+    # 轮级归并：episode 编号是每只标的各自从 1 开始的，必须带上 code
+    episodes: dict[tuple, list] = {}
+    for r in rows:
+        for t in r["_trades"]:
+            episodes.setdefault((r["code"], t.episode), []).append(t)
+    ep_vals = list(episodes.values())
+    ep_returns: list[float] = []
+    for grp in ep_vals:
+        cost = sum(t.quantity * t.entry_price for t in grp)
+        if cost > 0:
+            ep_returns.append(sum(t.profit for t in grp) / cost)
+    ep_win = sum(1 for grp in ep_vals if sum(t.profit for t in grp) > 0)
 
     scanned = [r for r in rows if r["trades"] > 0]
     n = len(rows) or 1
@@ -184,6 +204,9 @@ def merge_stats(rows: list[dict]) -> dict:
         "profit_factor": (gain / loss) if loss > 0 else float("inf"),
         "total_gain": gain,
         "total_loss": loss,
+        "episodes": len(ep_vals),
+        "ep_win_rate": (ep_win / len(ep_vals)) if ep_vals else 0.0,
+        "ep_avg_pct": (sum(ep_returns) / len(ep_returns)) if ep_returns else 0.0,
         "avg_return": sum(r["total_return"] for r in rows) / n,
         "avg_buy_hold": sum(r["buy_hold"] for r in rows) / n,
         "avg_dd": sum(r["max_dd"] for r in rows) / n,
@@ -269,8 +292,12 @@ def forward_returns(frames: list[pd.DataFrame], horizons=HORIZONS) -> dict:
 def exit_sweep(pool_data: list[tuple[str, list[KLineData]]], capital: float) -> list[dict]:
     """出口对照扫 —— 买点固定，只换出口规则"""
     variants = [
-        ("MA5", dict(ma_exit=5)), ("MA10（本轮口径）", dict(ma_exit=10)),
-        ("MA20", dict(ma_exit=20)), ("MA30", dict(ma_exit=30)),
+        ("**分级：MA5 半 / 站回 MA10 补 / MA20 全**", dict(exit_mode="tiered")),
+        ("分级但不回补：MA5 半 / MA20 全", dict(exit_mode="tiered", reentry=False)),
+        ("单线 MA5", dict(exit_mode="ma", ma_exit=5)),
+        ("单线 MA10（旧口径）", dict(exit_mode="ma", ma_exit=10)),
+        ("单线 MA20", dict(exit_mode="ma", ma_exit=20)),
+        ("单线 MA30", dict(exit_mode="ma", ma_exit=30)),
         ("固定持有 10 日", dict(hold_days=10)),
         ("固定持有 20 日", dict(hold_days=20)),
         ("固定持有 40 日", dict(hold_days=40)),
@@ -313,7 +340,11 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     add(f"- 资金口径：每只**独立 {args.capital:,.0f} 元满仓**（整手），汇总等权平均")
     add("- 费用：佣金万 2.5（双边、最低 5 元）、印花税千 1（卖出）")
     add("- 买点：六指标共振首日（T 收盘确认）→ **T+1 开盘买入**")
-    add("- 卖点：收盘跌破 MA10（T 收盘确认）→ **T+1 开盘卖出**")
+    add("- 卖点：**分级出口**（T 收盘确认）→ **T+1 开盘成交**")
+    add("  - 收盘破 **MA5** → 卖一半；")
+    add("  - 已减半、且**先跌破过 MA10 又站回** → 买回一半（回补）；")
+    add("  - 收盘破 **MA20** → 全部卖出；")
+    add("  - MA20 优先于其余两档。旧口径「破 MA10 全清」见 §4 对照。")
     add("")
 
     add("## 1. 汇总")
@@ -326,8 +357,13 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     add(f"| 最大回撤（单只最差） | {st['max_dd']:.2%} | — |")
     add(f"| **在场时间占比** | {st['exposure']:.1%} | 100% |")
     add("")
+    add(f"**轮级口径**（{st['episodes']} 轮持仓）：胜率 **{st['ep_win_rate']:.1%}**、"
+        f"平均每轮 **{_pct(st['ep_avg_pct'])}**。"
+        f"分级出口会把一轮拆成多笔（减半 → 回补 → 清仓），"
+        f"所以**对比不同出口要看轮级**，笔级胜率会被拆细。")
+    add("")
     add(f"**笔级口径**（{st['codes_with_trades']} 只标的有交易、共 {st['trades']} 笔）："
-        f"胜率 **{st['win_rate']:.1%}**、平均每笔 **{_pct(st['avg_pct'])}**、"
+        f"胜率 {st['win_rate']:.1%}、平均每笔 {_pct(st['avg_pct'])}、"
         f"盈亏比 {_pf(st['profit_factor'])}、平均持有 {st['avg_hold']:.1f} 个交易日。")
     add("")
     add(f"⚠️ 逐只独立满仓、等权平均 ⇒ **不是组合资金曲线**，收益不可相加。"
@@ -379,16 +415,17 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     if sweep:
         add("## 4. 诊断 C：出口对照扫（买点固定，只换卖出口）")
         add("")
-        add("| 出口规则 | 笔数 | 胜率 | 平均每笔 | 平均区间收益 | 平均持有 |")
-        add("| --- | --- | --- | --- | --- | --- |")
+        add("| 出口规则 | 轮数 | **轮胜率** | 轮均收益 | 平均区间收益 | 在场时间 | 最大单只回撤 |")
+        add("| --- | --- | --- | --- | --- | --- | --- |")
         for s in sweep:
-            add(f"| {s['label']} | {s['trades']} | {s['win_rate']:.1%} | {_pct(s['avg_pct'])} "
-                f"| {_pct(s['avg_return'])} | {s['avg_hold']:.1f} 日 |")
+            add(f"| {s['label']} | {s['episodes']} | {s['ep_win_rate']:.1%} "
+                f"| {_pct(s['ep_avg_pct'])} | {_pct(s['avg_return'])} "
+                f"| {s['exposure']:.1%} | {s['max_dd']:.1%} |")
         add("")
-        add("读法：**出口越松、持有越久，成绩越靠近「买入持有」** —— 说明收益主要"
-            "来自在场时间（β）而不是择时（α）；反过来，越紧的出口被震荡与"
-            "双边费用磨损得越狠。若某个方向能显著超过买入持有，才说明这套出口"
-            "真的在创造价值。")
+        add("读法：以**轮胜率 / 轮均收益 / 平均区间收益**为主比较项（笔级受"
+            "「一轮拆几笔」影响，跨出口不可比）。注意「出口越松、持有越久，成绩越"
+            "靠近买入持有」这个基线关系 —— 若某个方向能显著超过买入持有，才说明"
+            "这套出口真的在创造价值。")
         add("")
 
     # ---- 逐标的 ----
@@ -466,7 +503,8 @@ def main(argv: list[str] | None = None) -> int:
     head = {"start": "", "end": ""}
 
     strat = six_pulse.SixPulseStrategy()
-    print(f"标的池 {len(pool)} 只 | 日线 {args.days} 根 | 资金 {args.capital:,.0f} | 出口 MA10")
+    print(f"标的池 {len(pool)} 只 | 日线 {args.days} 根 | 资金 {args.capital:,.0f} | "
+          f"出口 分级：MA5 半 / 站回 MA10 补 / MA20 全")
 
     for i, (code, nm) in enumerate(pool, 1):
         try:
@@ -498,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sweep: list[dict] = []
     if not args.no_sweep:
-        print("诊断：出口对照扫（7 种出口规则，只走本地缓存）…")
+        print("诊断：出口对照扫（9 种出口规则，只走本地缓存）…")
         sweep = exit_sweep(pool_data, args.capital)
 
     report = render_report(rows, frames, names, head, fwd, sweep, args)
@@ -508,8 +546,9 @@ def main(argv: list[str] | None = None) -> int:
 
     st = merge_stats(rows)
     print()
-    print(f"汇总：{st['codes']} 只（{st['codes_with_trades']} 只有交易）/ {st['trades']} 笔 | "
-          f"胜率 {st['win_rate']:.1%} | 平均每笔 {st['avg_pct']:+.2%} | "
+    print(f"汇总：{st['codes']} 只（{st['codes_with_trades']} 只有交易）/ "
+          f"{st['episodes']} 轮 {st['trades']} 笔 | "
+          f"轮胜率 {st['ep_win_rate']:.1%} 轮均 {st['ep_avg_pct']:+.2%} | "
           f"平均区间收益 {st['avg_return']:+.2%}（买入持有 {st['avg_buy_hold']:+.2%}）")
     if failures:
         print(f"⚠️ 取数失败 {len(failures)} 只：" + ", ".join(c for c, _ in failures))

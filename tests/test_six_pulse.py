@@ -151,17 +151,21 @@ class TestIndicators:
 # ======================================================================
 
 class TestStrategy:
-    def test_signals_alternate(self, daily):
-        """买卖交替、首条必为买入（状态机保证不会 T+0）"""
+    def test_first_signal_is_buy_and_no_double_buy(self, daily):
+        """首条必为买入；且**不会连买两次**（分级出口下卖可以连卖：减半→清仓）"""
         sig = SixPulseStrategy().generate_signals(daily)
         assert sig, "合成数据应产生信号"
         acts = [s.action for s in sig]
         assert acts[0] == Action.BUY
         for a, b in zip(acts, acts[1:]):
-            assert a != b
+            assert not (a == Action.BUY and b == Action.BUY), "没有加仓逻辑就不会连买"
 
     def test_fill_price_is_next_open(self, daily, ind):
-        """成交价 = 信号**次日**开盘价；买点日期是共振触发日的次日"""
+        """成交价 = 信号**次日**开盘价；开仓买入落在共振日次日
+
+        ⚠️ 只有 `weight == 1.0` 的买入（开仓）必须来自共振首日；
+        `weight == 0.5` 的买入是分级出口的**回补**，与共振无关。
+        """
         sig = SixPulseStrategy().generate_signals(daily)
         pos = {k.date: i for i, k in enumerate(daily)}
         for s in sig:
@@ -171,8 +175,8 @@ class TestStrategy:
 
         dates = [k.date for k in daily]
         trig = {dates[i + 1] for i in range(len(daily) - 1) if ind["buy_signal"].iloc[i]}
-        buys = {s.date for s in sig if s.action == Action.BUY}
-        assert buys <= trig, "买入信号必须落在共振日次日（不被持仓过滤掉的部分）"
+        opens_new = {s.date for s in sig if s.action == Action.BUY and s.weight >= 1.0}
+        assert opens_new <= trig, "开仓买入必须落在共振日次日"
 
     def test_no_lookahead(self, daily):
         """截断数据不改变历史信号 —— 无未来函数"""
@@ -196,20 +200,102 @@ class TestStrategy:
         assert min(pos[s.date] for s in sig) > 100
 
     def test_hold_days_exit(self, daily):
-        """hold_days 出口：卖出日 = 买入日 + N（持有 N 个交易日）"""
+        """hold_days 出口：卖出日 = 买入日 + N（持有 N 个交易日），且全进全出"""
         sig = SixPulseStrategy(hold_days=10).generate_signals(daily)
         pos = {k.date: i for i, k in enumerate(daily)}
         pairs = list(zip(sig[0::2], sig[1::2]))
         assert pairs
         for b, s in pairs:
             assert b.action == Action.BUY and s.action == Action.SELL
+            assert b.weight == 1.0 and s.weight == 1.0
             assert pos[s.date] - pos[b.date] == 10
             assert "持有 10 日" in s.reason
 
     def test_ma_exit_reason(self, daily):
-        sig = SixPulseStrategy(ma_exit=20).generate_signals(daily)
+        """`exit_mode="ma"` 保留旧的单线出口（全进全出）"""
+        sig = SixPulseStrategy(ma_exit=20, exit_mode="ma").generate_signals(daily)
         sells = [s for s in sig if s.action == Action.SELL]
         assert sells and all(s.reason == "破 MA20" for s in sells)
+        assert all(s.weight == 1.0 for s in sells)
+
+    def test_bad_exit_mode_raises(self):
+        with pytest.raises(ValueError):
+            SixPulseStrategy(exit_mode="whatever")
+
+
+# ======================================================================
+# 分级出口（MA5 减半 / 站稳回补 / MA20 清仓）
+# ======================================================================
+
+class TestTieredExit:
+    """老三 2026-09-20 指定的出口口径"""
+
+    def test_default_is_tiered(self):
+        assert SixPulseStrategy().exit_mode == "tiered"
+
+    def test_reasons_and_weights_are_consistent(self, daily):
+        """每条信号的 weight 必须与它的 reason 对得上，且只出现四种口径"""
+        sig = SixPulseStrategy().generate_signals(daily)
+        allowed = {
+            "六脉共振首日": 1.0,
+            "破 MA5（减半仓）": 0.5,
+            "站回 MA10（回补半仓）": 0.5,
+            "破 MA20（清仓）": 1.0,
+        }
+        assert sig
+        for s in sig:
+            assert s.reason in allowed, f"意外的出口口径：{s.reason}"
+            assert s.weight == allowed[s.reason]
+            if s.reason == "站回 MA10（回补半仓）":
+                assert s.action == Action.BUY
+            else:
+                assert s.action == (Action.BUY if s.reason == "六脉共振首日" else Action.SELL)
+
+    def test_tiered_actually_triggers_each_tier(self, daily):
+        """合成数据（涨—跌—盘）应至少触发一次减半，否则这条规则只是纸面存在"""
+        sig = SixPulseStrategy().generate_signals(daily)
+        reasons = [s.reason for s in sig]
+        assert "破 MA5（减半仓）" in reasons
+        assert "破 MA20（清仓）" in reasons
+
+    def test_buyback_requires_breaking_below_reentry_line_first(self, daily):
+        """回补的前提是**先跌破过** MA10，不是只要站上 MA10 就买回
+
+        否则价格在 MA5 与 MA10 之间来回时会反复回补，出口退化成噪声。
+        """
+        df = to_frame(daily)
+        ind = compute_indicators(df)
+        close = df["close"].to_numpy(dtype=float)
+        reentry = ind["ma_reentry"].to_numpy(dtype=float)
+        pos = {k.date: i for i, k in enumerate(daily)}
+        sig = SixPulseStrategy().generate_signals(daily)
+
+        half_dec: int | None = None
+        checked = 0
+        for s in sig:
+            i = pos[s.date] - 1                    # 决策日 = 成交日的前一根
+            if s.action == Action.SELL and s.weight < 1.0:
+                half_dec = i
+            elif s.action == Action.SELL and s.weight >= 1.0:
+                half_dec = None                    # 清仓，本轮结束
+            elif s.action == Action.BUY and s.weight < 1.0:
+                assert half_dec is not None, "回补之前必须有一次减半"
+                assert any(close[j] < reentry[j] for j in range(half_dec + 1, i + 1)), \
+                    "回补前必须先跌破过回补线"
+                half_dec = None
+                checked += 1
+        assert checked > 0, "合成数据里应至少出现一次回补，否则用例没覆盖到"
+
+    def test_engine_integration_with_partial_positions(self, daily):
+        """分级出口能在引擎里跑通：多笔同属一轮持仓"""
+        from core.backtest.engine import BacktestEngine as _Engine
+        rep = _Engine(initial_capital=1_000_000).run_on_data(
+            SixPulseStrategy(), "TEST", daily,
+        )
+        assert rep.total_trades > 0
+        eps = {t.episode for t in rep.trades}
+        assert len(eps) < rep.total_trades, "分级出口下一轮会被拆成多笔"
+        assert rep.trades[-1].episode == max(eps)
 
 
 # ======================================================================
