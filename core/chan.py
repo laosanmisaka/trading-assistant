@@ -331,7 +331,10 @@ def centers(result: ChanResult) -> list[dict]:
             "mid": float(zs.zz),
             "sdt": zs.sdt,
             "edt": zs.edt,
-            "is_valid": bool(zs.is_valid),
+            # ⚠️ `ZS.is_valid` 是**方法**（Rust 侧签名 `(self, /)`），不是 property。
+            # 原写法 `bool(zs.is_valid)` 取的是绑定方法对象，**恒为 True** ——
+            # 字段一直在撒谎（2026-09-20 修）。必须调用。
+            "is_valid": bool(zs.is_valid()),
         })
     return out
 

@@ -6,7 +6,7 @@
 - 完整分析见 `docs/PROJECT_ASSESSMENT.md`
 - 任务清单复核意见见 `docs/TASK_LIST_REVIEW.md`
 - **待原开发者回复的业务口径确认清单见 `docs/BUSINESS_RULES_CONFIRMATION.md`**
-- 最后更新：2026-09-17
+- 最后更新：2026-09-20
 
 ---
 
@@ -230,6 +230,91 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 
 ---
 
+## KI-009 几何买卖点的「确认滞后」—— 策略回测偏乐观的来源
+
+| 项 | 内容 |
+| --- | --- |
+| 位置 | `core/chan_strategy.py::_effective_day`（`confirm_offset=1`）、`points_from_structures`（30 分钟点零顺延） |
+| 状态 | **已量化，未修 —— 改法待老三拍板** |
+| 当前影响 | 几何源的策略成绩（50 只 / 24 笔 / 胜率 73.9% / 平均 +3.90%）**偏乐观，只能当下限中的上限看** |
+| 诊断工具 | `python scripts/diag_geom_lag.py`（报告 `outputs/geom_lag.md`） |
+
+**未来函数有两层，此前只处理了第一层。**
+
+- 第一层「价格要等 T 收盘才知道」已处理：日线点延后到次一交易日生效。
+- **第二层没处理**：一笔的终点要等**后续反向笔成型**才会被锁定。T 当天 czsc 给出的
+  `bi_list[-1]` 是**正在延伸的暂定笔**，终点随时会被改写；只有后面出现新笔，
+  T 才不再是可能被抹掉的点。
+
+**实测**（2020-07 ~ 2026-09 日线，50 只标的池）：
+
+| 口径 | 含义 | 结果 |
+| --- | --- | --- |
+| A：`confirm_dt` = 下一笔终点 | 保守上界（分型比整笔快） | 一买 408 点，中位滞后 **9 个交易日**、P90 = 23、最大 122 |
+| B：切片重算 + 锁定条件 | 实测（只喂到 t，要求该笔后面已有新笔） | 抽样 18 点，滞后 **+4 ~ +16 个交易日**，中位 ≈ 6.5 |
+
+⇒ **`offset=1` 能覆盖的比例是 0%**，「T+1 生效」这个口径系统性地早于真实可行动时刻。
+
+> ⚠️ 只看「该点是否出现在切片结果里」会误判成 **+1 天** —— 暂定末端笔的终点
+> 也会出现在列表里。必须加上「后面已有新笔」才算锁定。
+
+**同源的两处次要问题**（见 `docs/STRATEGY_CHAN_MULTIFREQ.md` §2.3 待补）：
+
+1. **一买的按中枢收敛是全量事后选择** —— 候选会被几个月后出现的更低点吞掉；
+   实盘会买在早期候选上，而回测里那笔交易不存在 ⇒ **成交集合本身就不同**，
+   不只是时点偏移。`points_from_structures` 又是从**完整笔序列**推点事件。
+2. `match_buy_points` 取「离 d2 最近」的触发点，**用了窗口右半的信息**：
+   窗口内有 d2−6 与 d2+1 两个点时它选 d2+1，而实盘在 d2 时刻只拿得到 d2−6。
+   `tests/test_chan_strategy.py::test_match_picks_m30_nearest_to_d2` 把这个行为
+   钉成了规格 —— 若改口径，那条测试要一起改。
+
+**修复方向（两条，未拍板）**：
+
+- (a) 把 `_effective_day` 的固定 `offset=1` 改成**按该笔的实际确认日动态取**
+  （需把「确认日」从笔序列里算出来并传进策略层）；
+- (b) 接受滞后，把口径与实测分布写死进文档，明确回测成绩是乐观上界。
+
+两条路都必须**重跑策略评估**才能给出新的成绩数字，当前没有可信的替代值。
+
+---
+
+## KI-010 一致性/声明性问题四项
+
+| 项 | 位置 | 状态 |
+| --- | --- | --- |
+| `ZS.is_valid` 恒为 True | `core/chan.py::centers()` | **已修（2026-09-20）** |
+| 三买可从「已死亡」的中枢产生 | `core/chan_points.py` 三买循环 | 未修，见下 |
+| 窗口阶梯与「分别用每个 N 跑」不等价 | `scripts/scan_pool.py::window_ladder` | 未修，见下 |
+| czsc 版本未锁死 | `requirements.txt` | 未修，见下 |
+
+**1. `is_valid` 恒真（已修）**
+czsc 1.0.1 的 `ZS.is_valid` 是**方法**（Rust 侧签名 `(self, /)`），
+`bool(zs.is_valid)` 取的是绑定方法对象 ⇒ 恒 True。已改为 `bool(zs.is_valid())`。
+此前无消费方，所以没造成过错误结果，但字段一直在撒谎。
+
+**2. 三买可由已终结的中枢产出**
+三买循环对每个中枢找「向上突破 → 首次回抽不回落」，**没有「中枢已被三卖终结」
+的判定**：同一中枢理论上可以既产三买又产三卖。模块 docstring 未声明这条偏差。
+影响面：策略层只消费一买/二买/30 分钟二买 ⇒ **实际污染的是图上的标注**。
+
+**3. 窗口阶梯的等价性不成立**
+`window_ladder` 的 docstring 论证「宽窗口下的配对是窄窗口的超集」时，
+**漏了 `match_buy_points` 的 `used_bars` 占用规则**（每个 30 分钟 bar 只触发
+一次、先到先得）。宽窗口下较早的 d2 可以抢走窄窗口下本属于后面 d2 的 bar，
+于是窄窗口的结果里有宽窗口没有的配对 ⇒ **不是子集关系**。
+`tests/test_scan_pool.py` 现有的阶梯用例只验证**过滤算术**，没有
+「阶梯 N == 直接用 N 跑一轮」的端到端断言。
+⇒ `docs/PLAN_BUYSELL_GEOMETRY.md` §7 的阶梯表（甜点区 ±15~20）**精确性要打折**。
+实际数据上触发概率不高（占用冲突需两只 d2 的窗口重叠且共用同一个 bar）。
+
+**4. czsc 版本区间**
+`czsc>=1.0.1,<2`。桥接层与策略层的全部口径都是按 **1.0.1 实测**写的
+（见 `core/chan.py` docstring、`docs/CZSC_INTEGRATION.md`）。已封上限避免
+2.x 静默算错，但 1.0.x 内部的 patch 版本仍未锁；要完全可复现需
+`pip freeze` 出锁文件或直接钉 `==1.0.1`。
+
+---
+
 ## 附表：已修复并有测试保护的项
 
 | 缺陷 | 位置 | 保护测试 |
@@ -240,6 +325,14 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 | 每日止损跨天失效 | `ui/main_window.py` `_check_daily_stop_loss` | `tests/test_regressions.py::TestDailyStopLossSchedule` |
 | 回测 O(n²) | ~~`core/backtest/strategy.py` `WeeklyAggregator`~~ | ~~`TestWeeklyAggregatorEquivalence`~~ → **2026-09-20 作废**：伪缠论回测策略整体取缔，该文件与用例一并删除，缺陷自然消失 |
 | DB 连接重复设 journal_mode | `data/database.py` `_connect()` / `init_db()` | 无断言，仅实测数据（见 KI-006） |
+| 一卖收敛取 min（方向反了） | `core/chan_points.py::_converge_by_center` | `tests/test_chan_points.py::test_first_sell_converges_to_highest` |
+| 切股票时缠论标注残留 | `ui/chart_widget.py::load_data` | `tests/test_chart_marks.py`（3 条） |
+| 单飞期间被丢弃的标注请求永不执行 | `ui/main_window.py::_request_chan_marks` | `tests/test_ui_threading.py::TestChanMarkPendingQueue`（3 条） |
+| `ZS.is_valid` 恒真 | `core/chan.py::centers()` | 无断言（字段无消费方，见 KI-010） |
+
+**第三批（2026-09-20，外部审查驱动）**：一卖方向、UI 标注残留、单飞排队三处均为
+**变异验证过**的实现级修复 —— 其中一卖那条在修复前会实测产出「一卖标错位置 +
+二卖整条消失」（复现于 `test_first_sell_converges_to_highest` 的构造）。
 
 **第二批补齐（2026-09-17，测试总数 140 → 204）**：
 
