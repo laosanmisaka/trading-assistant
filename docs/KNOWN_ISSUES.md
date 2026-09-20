@@ -238,7 +238,7 @@ confirm_close = w_arr["closes"][idx + 2]   # 再下一根的收盘价
 | `flush_today_bars` KeyError | `data/market_data_manager.py` | `tests/test_regressions.py::TestFlushTodayBars` |
 | 托盘退出僵尸进程 | `ui/main_window.py` `closeEvent` / `_quit_app` | `tests/test_regressions.py::TestTrayExit` |
 | 每日止损跨天失效 | `ui/main_window.py` `_check_daily_stop_loss` | `tests/test_regressions.py::TestDailyStopLossSchedule` |
-| 回测 O(n²) | `core/backtest/strategy.py` `WeeklyAggregator` | `tests/test_backtest.py::TestWeeklyAggregatorEquivalence` |
+| 回测 O(n²) | ~~`core/backtest/strategy.py` `WeeklyAggregator`~~ | ~~`TestWeeklyAggregatorEquivalence`~~ → **2026-09-20 作废**：伪缠论回测策略整体取缔，该文件与用例一并删除，缺陷自然消失 |
 | DB 连接重复设 journal_mode | `data/database.py` `_connect()` / `init_db()` | 无断言，仅实测数据（见 KI-006） |
 
 **第二批补齐（2026-09-17，测试总数 140 → 204）**：

@@ -150,7 +150,7 @@ for i in range(buy_idx, len(arr["lows"])):
 
 **数据库连接模式浪费严重。** `data/database.py` 有 38 处 `_connect()` 调用点，每处都是「开连接 → 操作 → 关连接」。每只股票每轮刷新约产生 10 次独立连接建立。建议模块级共享连接（WAL 已开启，支持并发读）+ 持仓摘要改聚合 SQL。
 
-**回测引擎是 O(n²)。** `core/backtest/strategy.py:149` 与 `160-163`，在 `while i < n` 循环内每次调用 `_resample_weekly(daily[:i+1])` 与 `detect_macd_golden_cross(closes[:i+1], ...)`，即对逐日增长的前缀反复全量重算周线重采样与 MACD。注意：前缀切片本身是为避免未来函数（`test_buypoint_strategy_no_lookahead` 覆盖了这点），必须保留；可优化的是把 EMA/MACD 一次算完全序列后按 `i` 取值，周线重采样改增量维护。
+**回测引擎是 O(n²)。** ~~`core/backtest/strategy.py:149` 与 `160-163`~~ —— **2026-09-20 作废**：该文件里的 `BuyPointStrategy`（伪缠论回测策略）整体取缔，O(n²) 随之消失。原问题描述保留在此仅作历史记录：`while i < n` 循环内每次调用 `_resample_weekly(daily[:i+1])` 与 `detect_macd_golden_cross(closes[:i+1], ...)`，对逐日增长的前缀反复全量重算；曾用 `WeeklyAggregator` 增量维护把 1000 天从 3.02s 降到 0.44s。**注意这条教训仍然有效**：以后给 `core/backtest/engine.py` 接新策略时，别在每日循环里对前缀做全量重算。
 
 **数据源策略碎片化。** 日线走新浪、1min 走通达信、60min 走东方财富、分时又回新浪，四处重试逻辑各自实现。建议抽象 `DataSource` 接口 + 统一 fallback 链。次要一点：`utils/cache.py` 的 `cached()` 装饰器定义了但全项目未使用。
 

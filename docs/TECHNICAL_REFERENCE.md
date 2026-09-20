@@ -93,7 +93,7 @@ trading_assistant.db
 | `DB_PATH` | SQLite 数据库文件名。 |
 | `TAKE_PROFIT_LIMITUP_RATIO` | 初始止盈比例。 |
 | `TOP_FRACTAL_LOOKBACK` | 顶分型回溯配置；当前未直接使用。 |
-| `GOLDEN_CROSS_LOOKBACK_DAYS` | MACD 金叉回溯天数。**仅 `core/backtest` 在用**，桌面端已无引用。 |
+| ~~`GOLDEN_CROSS_LOOKBACK_DAYS`~~ | **已于 2026-09-20 删除**（唯一用户是伪缠论回测策略 `BuyPointStrategy`，该策略整体取缔）。买点参数现在全在 `core.chan_strategy` 的 `DEFAULT_*` 常量里。 |
 | ~~`VOLUME_CONTRACTION_RATIO`~~ / ~~`CENTER_LOOKBACK_WEEKS`~~ | **已于 2026-09-18 删除**，随伪缠论买点链路一并移除。 |
 | `CHART_COLORS`, `MA_PERIODS` | 图表颜色和均线周期配置。 |
 | `TDX_HOST`, `TDX_PORT`, `TDX_TIMEOUT` | 通达信 MOOTDX 行情服务器配置。 |
@@ -117,7 +117,7 @@ trading_assistant.db
 | `RealtimeQuote` | `code`, `name`, `price`, `change_pct`, `change_amt`, `volume`, `turnover`, `high`, `low`, `open`, `pre_close`, `timestamp` | 行情快照。 |
 | `KLineData` | `code`, `date`, `open`, `high`, `low`, `close`, `volume`, `period` | K 线数据。 |
 | `AlertState` | 止损价、止盈价、触发状态、手动覆写状态 | `AlertEngine` 内存状态。 |
-| `BuyPointState` | 三个买点条件、综合触发、详情、检查时间 | **死代码**（2026-09-18 起）：老伪缠论扫描器的内存状态，原属 `BuyPointScanner`。定义保留，已无调用方。 |
+| ~~`BuyPointState`~~ | **已于 2026-09-20 删除**（老伪缠论扫描器的内存状态，早已无调用方）。`AlertType.BUY_POINT` 同时删除。 |
 
 ## 6. 入口与工具
 

@@ -229,15 +229,17 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
 | `technical.py::is_volume_contraction` | `buy_point_scanner.py` | 删除 |
 | `technical.py::is_volume_expansion` | `buy_point_scanner.py` | 删除 |
 
-### 3.2 **不能删**（老链路之外还有用户）
+### 3.2 **不能删**（老链路之外还有用户）—— 2026-09-20 复查后更新
 
-| 对象 | 其它用户 |
-| --- | --- |
-| `kline_to_arrays` | `alert_engine` / `core/backtest/strategy.py` / `core/trading/data_provider.py` |
-| `detect_macd_golden_cross` | `core/backtest/strategy.py` |
-| `get_latest_bottom_fractal` | `core/backtest/strategy.py` |
-| `get_latest_top_fractal` | `alert_engine.py:15`（**止盈在用，活跃**） |
-| `find_stop_loss_price` | `alert_engine.py:15`（**止损在用，活跃**） |
+| 对象 | 其它用户 | 现状 |
+| --- | --- | --- |
+| `kline_to_arrays` | `alert_engine` / `core/trading/data_provider.py` | 保留（原本还列了 backtest，该用户已随伪缠论策略删除） |
+| ~~`detect_macd_golden_cross`~~ | ~~`core/backtest/strategy.py`~~ | **已删**（唯一用户是伪缠论策略） |
+| ~~`get_latest_bottom_fractal`~~ | ~~`core/backtest/strategy.py`~~ | **已删**（同上） |
+| `get_latest_top_fractal` | `alert_engine.py:15`（**止盈在用，活跃**） | 保留 |
+| `find_stop_loss_price` | `alert_engine.py:15`（**止损在用，活跃**） | 保留 |
+| `calc_ma` / `calc_ema` / `calc_macd` | `core/trading/data_provider.py` | 保留 |
+| `detect_bottom_fractal` | 无（`get_latest_bottom_fractal` 已删） | **保留**（`detect_top_fractal` 的对称构件，不是伪缠论） |
 
 ### 3.3 UI 与数据侧的连带项 —— ✅ 2026-09-18 已清
 
@@ -249,11 +251,11 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
   `highlight_rows()` 只留止损止盈红底；右键菜单新增「刷新缠论买卖点」
 - `ui/chart_widget.py`：新增 `set_chan_marks()` / `_draw_chan_marks()`，买点落在低点下方、
   卖点落在高点上方的三角标注；只在日线页绘制
-- ~~`data/models.py:124 BuyPointState`~~ → 定义保留但**已无调用方**（见 §9 遗留项）
+- ~~`data/models.py:124 BuyPointState`~~ → **2026-09-20 已删**（连同 `AlertType.BUY_POINT`）
 - `config.py`：删除 `ENABLE_BUYPOINT_SCAN` / `BUYPOINT_SCAN_INTERVAL_MS` /
   `STOCK_TABLE_COLUMNS` 的「买点信号」列 / `CHART_COLORS["alert_buy_point"]`；
-  `GOLDEN_CROSS_LOOKBACK_DAYS` **保留**（`core/backtest/strategy.py` 在用）
-- DB：`BuyPointState` 落库字段**未动**（无表结构变更，避免存量库兼容问题）
+  `GOLDEN_CROSS_LOOKBACK_DAYS` 也于 **2026-09-20 删除**（唯一用户是伪缠论回测策略）
+- DB：`BuyPointState` 从未落库（`data/database.py` 里查无此物），无表结构变更
 
 ⇒ **执行顺序必须是「先停止调用 → 观察一个版本 → 再删文件」。**
 不能先删，否则 UI 直接起不来。
@@ -378,25 +380,81 @@ def points_from_chan(bars_30m, bars_daily, *, lookback=DEFAULT_LOOKBACK):
    - 一买 → 二买间隔：范围 6~54 交易日，中位 26，P90 36.4 ⇒ `W1=40` 覆盖 **96%**（±60 才 100%）
    - 日线二买 → 最近 30 分钟二买的有符号偏移：范围 −48~20，中位 −8，P90 7.0
      ⇒ `W2=±10` 覆盖**只有 51%**；±15 为 64%、±20 为 72%
-   ⚠️ **这是本轮最需要老三拍板的一条**：`±10` 有一半的日线二买配不上次级别买点。
-   顺序是「先等一买、再等二买、再等 30 分钟二买」，三层递进本就稀有；
-   `±10` 是**保精度**的选择（宁可漏），`±20` 是**保密度**（72%，但匹配质量下降）。
-   样本 47 个仍偏少，建议随标的池继续扩大再复核。
+
+   ### ⚠️ W2 的关键发现：覆盖率不是判据，**偏移 → 收益**才是
+
+   2026-09-20 加做「窗口阶梯」（一次宽窗口取数，把同一批笔按 `|偏移| ≤ N` 累加，
+   等于分别用每个 N 跑一轮；等价性由 `tests/test_scan_pool.py` 钉住）：
+
+   | W2 | 笔数 | 胜率% | 平均收益% |
+   | --- | --- | --- | --- |
+   | ±0 | **0** | -- | -- |
+   | ±2 | 9 | 55.6 | +1.61 |
+   | ±5 | 13 | 69.2 | +2.58 |
+   | ±10 | 23 | 73.9 | +3.90 |
+   | ±15 | 28 | 75.0 | +4.07 |
+   | ±20 | 31 | 77.4 | +3.92 |
+   | ±30 | 39 | 71.8 | +3.79 |
+
+   按 `|偏移|` 分段（不累加）看，形状是**倒 U**：
+
+   | \|偏移\| | 笔数 | 胜率% | 平均收益% |
+   | --- | --- | --- | --- |
+   | 0 | 0 | -- | -- |
+   | 1~2 | 9 | 55.6 | +1.61 |
+   | 3~5 | 4 | 100.0 | +4.75 |
+   | 6~10 | 10 | 80.0 | +5.62 |
+   | 11~20 | 8 | 87.5 | +3.98 |
+   | >20 | 8 | 50.0 | +3.26 |
+
+   另一个切面（按符号）：
+
+   | 偏移 | 笔数 | 胜率% | 平均收益% |
+   | --- | --- | --- | --- |
+   | 负（30 分买点**更早**） | 24 | 75.0 | **+5.22** |
+   | 正（更晚） | 15 | 66.7 | +1.49 |
+
+   **结论：数据不支持「W2 越小越好」。** 三点：
+   1. **`±0` 直接归零** —— 47 个日线二买里没有一个的 30 分钟二买落在同一天。
+      三级共振在**当日**几乎不存在，窗口实际上就是「允许两级买点错开多久」这个参数。
+   2. **`±2` 剩下的是最差的一批**（9 笔、胜率 55.6%、平均 +1.61%），是所有档里最低的。
+      窗口从 ±2 放宽到 ±10 是**净改善**，因为新纳入的 3~10 日距离段是最好的。
+   3. 超过 ±20 开始变差（±30 → 71.8% / +3.79%），甜点区在 **±15~20**。
+
+   ⚠️ **但这三条都不硬**：每档样本只有 4~10 笔，总样本 39 笔（已平仓）且
+   **高度集中在 2026-07~09 一个市场状态**；`|偏移|` 与收益的相关系数只有 0.04
+   （不是单调关系，倒 U 形状可能只是噪声）。**要据此改参数，必须先扩样本。**
+
+   **老三 2026-09-20 的指令是「W2 越小越好」，与上述数据方向相反。**
+   已把数据摊开请他复核：若他坚持收紧，代价是**±2 时只剩 9 笔且质量最差**，
+   更小则策略归零。当前**代码默认仍是 ±10**（`chan_strategy.DEFAULT_MAX_GAP_2TOM`），
+   **未按其指令改动**，等确认。
 
 ---
 
-## 8. 现状与遗留项（2026-09-18 收口）
+## 8. 现状与遗留项（2026-09-20 收口）
 
-**已完成**：批 0~5 全部落地。当前买卖点只有 `core/chan_points.py` 几何判定一套；
-UI 只在日线图上标注，不做任何买点提醒。
+**已完成**：批 0~5 全部落地，**伪缠论两轮取缔完成**。当前买卖点只有
+`core/chan_points.py` 几何判定一套；UI 只在日线图上标注，不做任何买点提醒。
+
+**伪缠论取缔清单（两轮，全部完成）**
+
+| 轮次 | 删除对象 |
+| --- | --- |
+| 2026-09-18 | `core/buy_point_scanner.py`（整文件）· `technical.py` 的 `calc_center_range` / `check_pullback_to_center` / `is_volume_contraction` / `is_volume_expansion` · `config.ENABLE_BUYPOINT_SCAN` / `BUYPOINT_SCAN_INTERVAL_MS` · 表格「买点信号」列 · `CHART_COLORS["alert_buy_point"]` |
+| 2026-09-20 | `core/backtest/strategy.py::BuyPointStrategy` + `_resample_weekly` + `WeeklyAggregator` · `core/backtest/__main__.py`（只跑 buypoint 的 CLI）· `config.GOLDEN_CROSS_LOOKBACK_DAYS` · `data/models.py::BuyPointState` + `AlertType.BUY_POINT` · `technical.py` 的 `get_latest_bottom_fractal` / `detect_golden_cross` / `detect_macd_golden_cross` / `detect_death_cross` |
+
+防回潮：`tests/test_backtest.py::test_fake_chan_strategy_is_gone` /
+`test_fake_chan_entry_hooks_are_gone` 用 `hasattr` 断言这些名字不存在，
+防止有人从旧提交里把它们恢复回来。
 
 **遗留项（已知、暂不处理）**：
 
 | 项 | 说明 | 建议 |
 | --- | --- | --- |
-| `data/models.py::BuyPointState` + `AlertType.BUY_POINT` | 老链路留下的数据类，**已无任何调用方**（`grep` 确认只有定义处） | 纯死代码，可随下次 DB 层整理一并删 |
-| DB `buypoint` 相关字段 | 未做表结构变更，存量库保留旧字段 | 不动，避免兼容问题 |
-| `core/backtest/strategy.py`（策略名 `buypoint`） | **仍是同一套伪缠论规则**（周线底分型 + MACD 金叉 + 自算缩量回踩），只是把中枢/缩量逻辑内联了，没走 `chan_points` | 与桌面端口径不一致；若要用于评估新策略，应改成几何源 |
+| `core/backtest/engine.py` | 通用回测执行器（资金/佣金/印花税/回撤/资金曲线），**当前无内置策略**（伪缠论策略已删），生产代码无调用方，仅测试覆盖 | **保留** —— 它是项目里唯一一段「资金曲线」代码，组合回测迟早要用；接 `chan_strategy` 的适配器写法见 `core/backtest/strategy.py` docstring |
+| `technical.py::detect_bottom_fractal` | 无调用方（原调用方是已删的伪缠论策略）；`detect_top_fractal` 的对称构件 | 保留（不是伪缠论，成对删除会让分型模块残缺）；老三确认不要可删 |
+| DB 里 `alert_type='buy_point'` 的旧行 | 枚举值已删，存量库可能有旧行 | 无代码读取，不动 |
 | `ui/discipline_dialog.py` | 交易纪律清单。**自动弹窗已取消**（那属于买点提示），保留为右键菜单手动入口 | 保留 |
 | 卖点 | 仍为 MA5/MA10 双破。老三已说明后续要做多策略组合，**本轮不碰** | 等策略组合方案定了再动 |
-| 窗口参数 W1=40 / W2=±10 | 拍的值，非寻优结果；23 笔样本撑不起参数结论 | 扩池到 100~300 只后重标定 |
+| 窗口参数 W1=40 / W2=±10 | 拍的值，非寻优结果。39 笔样本且集中在单一市场状态 ⇒ **撑不起参数结论** | 扩池到 100~300 只后重标定；见 §7 第 6 条的阶梯表 |
