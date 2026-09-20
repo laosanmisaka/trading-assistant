@@ -19,12 +19,9 @@
 保留是因为它不是伪缠论、且成对删除会让分型模块残缺。**老三确认不要可一并删。**
 """
 
-from typing import Optional, Tuple
+from typing import Tuple
 import numpy as np
 from data.models import KLineData
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
 
 
 def calc_ma(closes: np.ndarray, period: int) -> np.ndarray:
