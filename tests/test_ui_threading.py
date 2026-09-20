@@ -149,6 +149,7 @@ def _bare_window(**attrs):
     win._chan_mark_worker = None
     win._name_sync_worker = None
     win._chan_marks = {}
+    win._pending_chan_code = ""
     win._current_stock_code = ""
     win.chart_widget = _FakeChart()
     for key, value in attrs.items():
@@ -321,8 +322,10 @@ class TestChanMarkSingleFlight:
         assert len(mark_workers) == 4, "每轮创建 1 个，不应随股票数放大"
         assert win._chan_mark_worker is mark_workers[-1], "只应保留最新一轮的引用"
         for worker in mark_workers:
-            assert worker.finished.slots == [worker.deleteLater], (
-                "每个 worker 都必须接 deleteLater 回收，否则又是泄漏")
+            assert worker.finished.slots == [
+                win._on_chan_worker_finished, worker.deleteLater], (
+                "每个 worker 都必须接 deleteLater 回收（否则又是泄漏），"
+                "并先接补算回调（否则排队请求永不执行）")
 
     def test_tolerates_destroyed_worker(self, qapp, mark_workers):
         """上一轮 worker 已随 deleteLater 销毁（isRunning 抛 RuntimeError）
@@ -344,7 +347,9 @@ class TestChanMarkSingleFlight:
         assert worker.marks_ready.slots == [win._on_chan_marks_ready]
         assert worker.failed.slots == [win._on_chan_marks_failed], (
             "failed 必须接上，否则取数失败时界面毫无反应")
-        assert worker.finished.slots == [worker.deleteLater]
+        assert worker.finished.slots == [
+            win._on_chan_worker_finished, worker.deleteLater]
+        assert win._pending_chan_code == "", "正常启动一轮不应留下排队记录"
 
 
 class TestChanMarkCallbacks:
@@ -388,3 +393,51 @@ class TestChanMarkCallbacks:
         win._refresh_chan_marks()
         assert len(mark_workers) == 1
         assert mark_workers[0].code == CODE
+
+
+class TestChanMarkPendingQueue:
+    """单飞期间被丢弃的请求必须排队补算（2026-09-20 加）
+
+    原实现直接 `return` 丢弃：「A 还在算时双击 B」会让 B **永远**没有标注 ——
+    B 的请求被丢，A 算完时 `code` 已不是当前股票（不上屏），而换股票时旧标注
+    已被 `load_data` 清空，图上就一直是空的，用户只能再双击一次。
+    """
+
+    def test_dropped_request_is_requeued_and_retried(self, qapp, mark_workers):
+        win = _bare_window(_current_stock_code=CODE)
+        win._request_chan_marks(CODE)              # A 开始算
+        win._request_chan_marks("000001")          # B 被单飞丢弃 → 排队
+
+        assert len(mark_workers) == 1, "单飞：不得为 B 另起线程"
+        assert win._pending_chan_code == "000001"
+
+        win._current_stock_code = "000001"         # 用户确实停在 B 上
+        mark_workers[0]._running = False           # A 这一轮结束
+        win._on_chan_worker_finished()
+
+        assert len(mark_workers) == 2, "排队中的请求必须被补算"
+        assert mark_workers[1].code == "000001"
+        assert win._pending_chan_code == "", "补算后必须清空排队，否则会无限重试"
+
+    def test_pending_dropped_when_user_moved_on(self, qapp, mark_workers):
+        """排队期间用户又切走 → 那只不必补算（省一次 2~3 秒的计算）"""
+        win = _bare_window(_current_stock_code=CODE)
+        win._request_chan_marks(CODE)
+        win._request_chan_marks("000001")
+
+        win._current_stock_code = "600000"         # 又切走了
+        mark_workers[0]._running = False
+        win._on_chan_worker_finished()
+
+        assert len(mark_workers) == 1, "已不是当前股票的排队请求不该补算"
+        assert win._pending_chan_code == ""
+
+    def test_no_pending_is_noop(self, qapp, mark_workers):
+        """没有排队记录时，worker 结束不该凭空起新线程"""
+        win = _bare_window(_current_stock_code=CODE)
+        win._request_chan_marks(CODE)
+        mark_workers[0]._running = False
+
+        win._on_chan_worker_finished()
+
+        assert len(mark_workers) == 1

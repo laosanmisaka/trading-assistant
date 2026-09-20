@@ -187,6 +187,13 @@ class ChartTabWidget(QWidget):
         self.code = code
         self.klines = []
         self.intraday_data = []
+        # 换股票必须**立刻清掉**上一只的缠论标注（2026-09-20 修）。
+        # 标注是按「日期字符串 → 横轴下标」映射的（见 `_draw_chan_marks`），
+        # 而所有 A 股共用同一份交易日历 —— 旧股票的买卖点日期几乎必然能在
+        # 新股票的日线里命中下标，于是**股票 A 的买卖点会画到股票 B 的图上**。
+        # 叠加「上一轮 worker 未跑完时新请求被单飞丢弃」（main_window），
+        # 这些错标会一直残留到手动刷新。清空后最坏只是暂时无标注。
+        self.chan_marks = {}
 
         if self.period == "intraday":
             # 从 klines_minute 表读最近 5 天的 1min 数据

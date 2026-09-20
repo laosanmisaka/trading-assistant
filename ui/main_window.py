@@ -65,6 +65,8 @@ class MainWindow(QMainWindow):
         self._current_group_id: int = -1
         self._current_stock_code: str = ""
         self._chan_marks: dict[str, dict] = {}   # code → 缠论买卖点标注（内存缓存）
+        # 单飞期间被丢弃的请求（2026-09-20 加）—— 见 `_request_chan_marks`
+        self._pending_chan_code: str = ""
         self._chan_mark_worker = None            # 单飞的标注计算 worker
         self._tray_flash_timer: QTimer = None
         self._tray_flash_on: bool = False
@@ -648,7 +650,13 @@ class MainWindow(QMainWindow):
         if prev is not None:
             try:
                 if prev.isRunning():
-                    logger.debug("上一轮缠论买卖点计算尚未完成，跳过")
+                    # 静默丢弃会让新股票**永远**没有标注：换股票时旧标注已被
+                    # `load_data` 清空，而这一轮的 ready 回调又因
+                    # `code != 当前股票` 不上屏 —— 图上一直是空的，用户只能
+                    # 再双击一次。所以记下来，等当前这轮结束再补算
+                    # （见 `_on_chan_worker_finished`）。
+                    logger.debug(f"上一轮缠论买卖点计算尚未完成，{code} 排队等待")
+                    self._pending_chan_code = code
                     return
             except RuntimeError:
                 pass  # 底层对象已随 deleteLater 销毁
@@ -658,6 +666,7 @@ class MainWindow(QMainWindow):
         self._chan_mark_worker = ChanMarkWorker(code)
         self._chan_mark_worker.marks_ready.connect(self._on_chan_marks_ready)
         self._chan_mark_worker.failed.connect(self._on_chan_marks_failed)
+        self._chan_mark_worker.finished.connect(self._on_chan_worker_finished)
         self._chan_mark_worker.finished.connect(self._chan_mark_worker.deleteLater)
         self._chan_mark_worker.start()
 
@@ -678,6 +687,20 @@ class MainWindow(QMainWindow):
         if code == self._current_stock_code:
             self.chart_widget.set_chan_marks(code, None)
             self.status_bar.showMessage(f"{code} 缠论买卖点计算失败：{message}", 8000)
+
+    def _on_chan_worker_finished(self):
+        """worker 结束 —— 补算单飞期间被丢弃的请求（2026-09-20 加）
+
+        没有这一步，「A 还在算时双击 B」会让 B **永远**拿不到标注：B 的请求
+        被丢弃，A 算完时 `code` 已不是当前股票（回调不上屏），而换股票时旧
+        标注已被 `load_data` 清空 —— 图上就一直是空的，用户只能再双击一次。
+
+        只在排队的那只**仍是当前股票**时才补算：中途又切走就没有必要算。
+        """
+        pending, self._pending_chan_code = self._pending_chan_code, ""
+        if pending and pending == self._current_stock_code:
+            logger.debug(f"补算排队中的缠论买卖点：{pending}")
+            self._request_chan_marks(pending)
 
     def _refresh_chan_marks(self, code: str = ""):
         """强制重算（右键菜单 / 视图菜单）—— 盘中重取或换参数后用"""
