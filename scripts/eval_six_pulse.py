@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""「六脉神剑」策略批量评估 —— 50 只流动性标的池
+"""「六脉神剑」策略批量评估 —— 默认 520 只池 / 2025-01-01 起
 
-    python scripts/eval_six_pulse.py                     # 默认：MA10 出口 + 全套诊断
-    python scripts/eval_six_pulse.py --days 750          # 换评估区间长度
-    python scripts/eval_six_pulse.py --no-sweep          # 跳过出口对照扫
+    python scripts/eval_six_pulse.py                     # 默认口径（全套诊断）
+    python scripts/eval_six_pulse.py --no-sweep          # 跳过出口对照扫（快）
+    python scripts/eval_six_pulse.py --start ""          # 跑全历史（2020-07 起）
+    python scripts/eval_six_pulse.py --entry-ma 0        # 关掉买点均线过滤
+    python scripts/eval_six_pulse.py --pool scripts/pool_liquid50.txt   # 换回小池
     python scripts/eval_six_pulse.py --codes sh600519,sz000858
     python scripts/eval_six_pulse.py --out outputs/six_pulse.md
 
 做什么
 ------
-1. 读标的池（默认 `scripts/pool_liquid50.txt`）
+1. 读标的池（默认 `scripts/pool_liquid500.txt`，520 只）
 2. 取日线（新浪源、**前复权**）并**落盘缓存**到 `outputs/cache_daily/`
 3. 逐只跑 `core.six_pulse.SixPulseStrategy` + `core.backtest.engine`，
    给出轮级 / 笔级胜率、总收益 / 最大回撤 / 盈亏比，并与**买入持有**对照
@@ -30,6 +32,12 @@
 - 卖出默认走**分级出口**（破 MA5 卖半 / 站回 MA10 回补 / 破 MA20 清仓）。
   分级出口下一轮持仓会拆成多笔 ⇒ **跨出口比较看「轮级」**（`merge_stats`
   的 `episodes` / `ep_win_rate`），笔级胜率只在自己口径内可比。
+- **统计区间**默认从 `--start`（2025-01-01）起：更早的日线只用来预热指标与
+  均线，**不下单、不统计**（策略侧由 `SixPulseStrategy(trade_from=...)` 保证）。
+  `--start ""` 可跑全历史。
+- **买点过滤**默认 `--entry-ma 20`：共振首日**必须收盘站上 MA20** 才开仓。
+  背景见 `docs/STRATEGY_SIX_PULSE.md` §3.4 —— 不过滤时 28% 的买点进场当天
+  就已跌破 MA20 离场线，56% 的轮次在 3 日内被扫出。
 """
 from __future__ import annotations
 
@@ -51,9 +59,10 @@ from core.backtest.engine import BacktestEngine             # noqa: E402
 from data.models import KLineData                           # noqa: E402
 from scan_pool import load_pool                             # noqa: E402
 
-DEFAULT_POOL = Path(__file__).with_name("pool_liquid50.txt")
+DEFAULT_POOL = Path(__file__).with_name("pool_liquid500.txt")
 DAILY_CACHE = ROOT / "outputs" / "cache_daily"
 DEFAULT_CAPITAL = 1_000_000.0
+DEFAULT_START = "2025-01-01"
 HORIZONS = (5, 10, 20)
 
 
@@ -133,22 +142,35 @@ def load_daily(
 # 单只评估
 # ======================================================================
 
-def eval_one(code: str, daily: list[KLineData], strategy, capital: float) -> dict:
-    """跑一只 → 结果行 dict（含笔级、区间级与买入持有基线）"""
+def eval_one(code: str, daily: list[KLineData], strategy, capital: float,
+             start: str | None = None) -> dict:
+    """跑一只 → 结果行 dict（含笔级、区间级与买入持有基线）
+
+    `start`（`"YYYY-MM-DD"`）：**统计区间起点**。数据仍全量喂给策略作指标预热，
+    策略自身通过 `trade_from` 保证起点前不开仓 ⇒ 起点前资金恒为初始值，
+    `total_return` / `max_drawdown` 天然就是起点后的成绩。
+    只有 `bars`（在场时间占比的分母）与 `buy_hold`（基线）需要按 `start` 重算 ——
+    否则 6 年分母会把 1.7 年的在场时间摊薄。
+    """
     engine = BacktestEngine(initial_capital=capital)
     rep = engine.run_on_data(strategy, code, daily)
 
     idx = {k.date: i for i, k in enumerate(daily)}
+    i0 = 0
+    if start:
+        i0 = next((i for i, k in enumerate(daily) if k.date >= start), len(daily))
+        if i0 >= len(daily):
+            i0 = len(daily) - 1                    # 区间内无数据：退化到最后一根
     holds = [
         idx[t.exit_date] - idx[t.entry_date]
         for t in rep.trades
         if t.entry_date in idx and t.exit_date in idx
     ]
-    first, last = daily[0].close, daily[-1].close
+    first, last = daily[i0].close, daily[-1].close
     return {
         "code": code,
-        "bars": len(daily),
-        "start": daily[0].date,
+        "bars": len(daily) - i0,
+        "start": daily[i0].date,
         "end": daily[-1].date,
         "trades": rep.total_trades,
         "win_rate": rep.win_rate,
@@ -223,11 +245,16 @@ def merge_stats(rows: list[dict]) -> dict:
 # 诊断
 # ======================================================================
 
-def collinearity(frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, float, float]:
+def collinearity(frames: list[pd.DataFrame], start: str | None = None
+                 ) -> tuple[pd.DataFrame, float, float]:
     """六项指标的共线性 —— 返回 `(拼接后的布尔表, 实际共振率, 独立假设乘积)`
 
     实际共振率远高于独立假设乘积 ⇒ 六项并不独立，共振并不稀有。
+    `start` 非空时只统计该日期起的样本（回测区间口径）。
     """
+    if start:
+        frames = [f[f["date"] >= start] for f in frames]
+        frames = [f for f in frames if len(f)]
     sub = pd.concat([f[list(six_pulse.PULSE_NAMES)] for f in frames], ignore_index=True)
     ints = sub.astype(int)
     actual = float((ints.sum(axis=1) == 6).mean())
@@ -235,13 +262,15 @@ def collinearity(frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, float, float
     return ints, actual, independent
 
 
-def forward_returns(frames: list[pd.DataFrame], horizons=HORIZONS) -> dict:
+def forward_returns(frames: list[pd.DataFrame], horizons=HORIZONS,
+                    start: str | None = None) -> dict:
     """共振买点后 h 日收益，以及**同标的任意日**的同口径基准
 
     两端都用「T+1 开盘买入、T+1+h 收盘卖出」，基准是同一只标的上所有可比较
     起点的同口径收益均值 ⇒ 两者之差即**择时带来的超额**（≈0 就说明没有 alpha）。
 
     `frames` 为 `six_pulse.compute_indicators()` 的输出（含 OHLC 与信号列）。
+    `start` 非空时起点不早于该日期（回测区间口径）。
     返回 ``{h: {"n", "codes", "mean", "median", "pos", "base_mean", "excess"}}``；
     均值与基准按**逐标的等权**，中位/为正占比按合并样本。
     """
@@ -252,11 +281,16 @@ def forward_returns(frames: list[pd.DataFrame], horizons=HORIZONS) -> dict:
         closes = df["close"].to_numpy(dtype=float)
         opens = df["open"].to_numpy(dtype=float)
         buy = df["buy_signal"].to_numpy()
+        dates = df["date"].tolist()
         n = len(df)
+        i0 = six_pulse.WARMUP
+        if start:
+            i0 = next((i for i, d in enumerate(dates) if d >= start), n)
+            i0 = max(i0, six_pulse.WARMUP)
         for h in horizons:
             sig: list[float] = []
             base: list[float] = []
-            for i in range(six_pulse.WARMUP, n - 1):
+            for i in range(i0, n - 1):
                 j = i + 1 + h
                 if j >= n:
                     break
@@ -289,13 +323,14 @@ def forward_returns(frames: list[pd.DataFrame], horizons=HORIZONS) -> dict:
     return out
 
 
-def exit_sweep(pool_data: list[tuple[str, list[KLineData]]], capital: float) -> list[dict]:
-    """出口对照扫 —— 买点固定，只换出口规则"""
+def exit_sweep(pool_data: list[tuple[str, list[KLineData]]], capital: float,
+               start: str | None = None, entry_ma: int | None = 20) -> list[dict]:
+    """出口对照扫 —— 买点固定，只换出口规则（买点过滤与区间起点保持一致）"""
     variants = [
         ("**分级：MA5 半 / 站回 MA10 补 / MA20 全**", dict(exit_mode="tiered")),
         ("分级但不回补：MA5 半 / MA20 全", dict(exit_mode="tiered", reentry=False)),
         ("单线 MA5", dict(exit_mode="ma", ma_exit=5)),
-        ("单线 MA10（旧口径）", dict(exit_mode="ma", ma_exit=10)),
+        ("单线 MA10", dict(exit_mode="ma", ma_exit=10)),
         ("单线 MA20", dict(exit_mode="ma", ma_exit=20)),
         ("单线 MA30", dict(exit_mode="ma", ma_exit=30)),
         ("固定持有 10 日", dict(hold_days=10)),
@@ -304,8 +339,10 @@ def exit_sweep(pool_data: list[tuple[str, list[KLineData]]], capital: float) -> 
     ]
     rows: list[dict] = []
     for label, kw in variants:
-        strat = six_pulse.SixPulseStrategy(**kw)
-        per_code = [eval_one(code, daily, strat, capital) for code, daily in pool_data]
+        full = dict(kw, entry_ma=entry_ma, trade_from=start)
+        strat = six_pulse.SixPulseStrategy(**full)
+        per_code = [eval_one(code, daily, strat, capital, start=start)
+                    for code, daily in pool_data]
         st = merge_stats(per_code)
         st["label"] = label
         rows.append(st)
@@ -337,9 +374,16 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     add(f"- 标的池：`{Path(args.pool).name}`（{st['codes']} 只）")
     add(f"- 数据：日线 {args.days} 根、**前复权**、新浪源"
         f"（{head['start']} ~ {head['end']}）")
+    if args.start:
+        add(f"- **统计区间：{head['start']} 起** —— {args.start} 之前的数据"
+            f"仅用于指标与均线预热，不下单、不统计（`trade_from`）")
     add(f"- 资金口径：每只**独立 {args.capital:,.0f} 元满仓**（整手），汇总等权平均")
     add("- 费用：佣金万 2.5（双边、最低 5 元）、印花税千 1（卖出）")
-    add("- 买点：六指标共振首日（T 收盘确认）→ **T+1 开盘买入**")
+    if args.entry_ma:
+        add(f"- 买点：六指标共振首日 **且收盘站上 MA{args.entry_ma}**"
+            f"（T 收盘确认）→ **T+1 开盘买入**")
+    else:
+        add("- 买点：六指标共振首日（**无均线过滤**，T 收盘确认）→ **T+1 开盘买入**")
     add("- 卖点：**分级出口**（T 收盘确认）→ **T+1 开盘成交**")
     add("  - 收盘破 **MA5** → 卖一半；")
     add("  - 已减半、且**先跌破过 MA10 又站回** → 买回一半（回补）；")
@@ -372,7 +416,7 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     add("")
 
     # ---- 诊断 A ----
-    ints, actual, independent = collinearity(frames)
+    ints, actual, independent = collinearity(frames, start=args.start or None)
     add("## 2. 诊断 A：六项指标共线性（共振到底稀不稀有）")
     add("")
     add("| 指标 | 多头天数占比 |")
@@ -446,9 +490,11 @@ def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str,
     add("- **不是组合回测**：逐只独立满仓、等权平均；同一时点多只出信号时，"
         "真实组合做不到同时满仓。要看资金曲线得用 `core.backtest.engine` "
         "接组合层（截至本轮未做）。")
-    add("- **区间长度固定**（`--days`），窗口起点不同结果会变；"
-        "1500 根 ≈ 6 年，覆盖 2021 熊市、2022 弱市、2024-09 后反弹，"
-        "但**只有一个市场样本**，不足以谈稳健性。")
+    add("- **区间可截断**：`--days` 控制取数长度（预热用），`--start` 控制**统计起点**。"
+        "两者都会改变结果；`--start 2025-01-01` 之后只有一个多月的市场样本，"
+        "**样本量大减、绝对数字别外推**。")
+    add("- **买点过滤是样本内试出来的**：`entry_ma=20` 的阈值来自同一批标的的"
+        "诊断（`outputs/exit_chase.md`），方向可信、幅度不可当承诺。")
     add("- **前复权数据**：新浪 `stock_zh_a_daily(adjust=\"qfq\")`，"
         "历史价格会随分红送股变化，跨日复跑数字可能微调。")
     add("- 未处理涨跌停无法成交、停牌、退市；整手约束下高价股的资金利用率偏低。")
@@ -478,6 +524,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sleep", type=float, default=1.0, help="取数后的间隔秒数")
     p.add_argument("--attempts", type=int, default=3, help="单只取数重试次数")
     p.add_argument("--no-sweep", action="store_true", help="跳过出口对照扫")
+    p.add_argument("--start", default=DEFAULT_START,
+                   help=f"统计区间起点 YYYY-MM-DD（此前数据仅预热），默认 {DEFAULT_START}；"
+                        f"传空字符串 = 跑全历史")
+    p.add_argument("--entry-ma", type=int, default=20,
+                   help="买点过滤均线周期，默认 20；0 = 关闭过滤")
     p.add_argument("--out", default="", help="报告输出路径（默认 outputs/six_pulse.md）")
     return p
 
@@ -502,9 +553,12 @@ def main(argv: list[str] | None = None) -> int:
     failures: list[tuple[str, str]] = []
     head = {"start": "", "end": ""}
 
-    strat = six_pulse.SixPulseStrategy()
+    strat = six_pulse.SixPulseStrategy(entry_ma=args.entry_ma or None,
+                                       trade_from=args.start or None)
     print(f"标的池 {len(pool)} 只 | 日线 {args.days} 根 | 资金 {args.capital:,.0f} | "
-          f"出口 分级：MA5 半 / 站回 MA10 补 / MA20 全")
+          f"出口 分级：MA5 半 / 站回 MA10 补 / MA20 全 | "
+          f"买点过滤 {('MA%d' % args.entry_ma) if args.entry_ma else '关闭'} | "
+          f"区间 {args.start or '全部'}")
 
     for i, (code, nm) in enumerate(pool, 1):
         try:
@@ -517,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [{i}/{len(pool)}] {code} {nm} 取数失败：{exc}")
             continue
 
-        row = eval_one(code, daily, strat, args.capital)
+        row = eval_one(code, daily, strat, args.capital, start=args.start or None)
         rows.append(row)
         pool_data.append((code, daily))
         frames.append(six_pulse.compute_indicators(six_pulse.to_frame(daily)))
@@ -525,19 +579,20 @@ def main(argv: list[str] | None = None) -> int:
             head["start"], head["end"] = row["start"], row["end"]
         flag = "缓存" if cached else "取数"
         print(f"  [{i}/{len(pool)}] {code} {nm} {flag} {row['bars']}根 "
-              f"笔数={row['trades']} 区间收益={row['total_return']:+.2%}")
+              f"笔数={row['trades']} 区间收益={row['total_return']:+.2%}", flush=True)
 
     if not rows:
         print("没有任何标的数据，无法出报告")
         return 1
 
-    print("诊断：买点前瞻收益 …")
-    fwd = forward_returns(frames)
+    print("诊断：买点前瞻收益 …", flush=True)
+    fwd = forward_returns(frames, start=args.start or None)
 
     sweep: list[dict] = []
     if not args.no_sweep:
-        print("诊断：出口对照扫（9 种出口规则，只走本地缓存）…")
-        sweep = exit_sweep(pool_data, args.capital)
+        print("诊断：出口对照扫（9 种出口规则，只走本地缓存）…", flush=True)
+        sweep = exit_sweep(pool_data, args.capital, start=args.start or None,
+                           entry_ma=args.entry_ma or None)
 
     report = render_report(rows, frames, names, head, fwd, sweep, args)
     out = Path(args.out) if args.out else ROOT / "outputs" / "six_pulse.md"
