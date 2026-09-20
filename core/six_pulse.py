@@ -37,7 +37,13 @@ B2/B3/B4 是同一价格区间的不同刻度，周期都挤在 5~24 根内。
 
 买卖点
 ------
-- **买点**：`B1&…&B6` 全真且**前一日不全真**（共振首日）。
+- **买点**：`B1&…&B6` 全真且**前一日不全真**（共振首日），
+  且（`entry_ma` 非空时）**收盘价站上 `entry_ma` 日均线**。
+  这条过滤是 2026-09-20 加的，用来修一个自洽性缺陷：B5 只要求 `C > BBI`
+  （MA3/6/12/24 的均值），弱势里 BBI 低于 MA20 —— 买进当天"跌破 MA20 才卖"
+  这个离场条件就已经成立，次一交易日直接被扫出去。实测 6146 个共振买点里
+  **28.0% 当天收盘在 MA20 下方**，对应 56% 的超短轮（1~3 日）与 −35.7 的对数贡献。
+  诊断见 `scripts/diag_exit_chase.py`（报告 `outputs/exit_chase.md`）。
 - **卖点**（2026-09-20 老三改口径，`exit_mode="tiered"` 默认）：
   破 **MA5** 卖一半 → 跌破 MA10 后又**站回** MA10 时**回补**一半 →
   破 **MA20** 全清。旧的单线口径（破 MA10 全清）保留为 `exit_mode="ma"`。
@@ -127,7 +133,7 @@ def to_frame(daily: list[KLineData]) -> pd.DataFrame:
 
 def compute_indicators(df: pd.DataFrame, ma_exit: int = 10,
                        ma_reduce: int = 5, ma_reentry: int = 10,
-                       ma_stop: int = 20) -> pd.DataFrame:
+                       ma_stop: int = 20, entry_ma: int | None = None) -> pd.DataFrame:
     """按原公式算 B1~B6，并派生 `all6` / `buy_signal` / `sell_signal`
 
     `sell_signal` = 收盘跌破 `ma_exit` 日均线（默认 10）—— 单线出口口径。
@@ -135,6 +141,10 @@ def compute_indicators(df: pd.DataFrame, ma_exit: int = 10,
     另附加**分级出口**所需的三条均线数值列（`ma_reduce` / `ma_reentry` /
     `ma_stop`，默认 5 / 10 / 20 日），供 `SixPulseStrategy` 的 `tiered` 出口
     与诊断使用。这三列是**均线值**不是布尔信号。
+
+    `entry_ma` 非空时额外输出 `ma_entry` 列（买点过滤用的均线值），
+    但**不改 `buy_signal`** —— 过滤在 `SixPulseStrategy` 里做，
+    这样 `buy_signal` 始终是"原始六脉共振首日"，诊断可对比过滤前后。
 
     除零（连续一字板导致 `HHV==LLV`、`REF` 差为 0）产生 NaN/inf 的地方，
     布尔比较结果为 False —— 即该 bar 不算多头，不会炸。
@@ -187,6 +197,9 @@ def compute_indicators(df: pd.DataFrame, ma_exit: int = 10,
     result["ma_reduce"] = _ma(c, ma_reduce)
     result["ma_reentry"] = _ma(c, ma_reentry)
     result["ma_stop"] = _ma(c, ma_stop)
+    # 买点过滤用的均线（数值列；`entry_ma` 为空时不加列）
+    if entry_ma:
+        result["ma_entry"] = _ma(c, int(entry_ma))
     return result
 
 
@@ -216,11 +229,24 @@ class SixPulseStrategy(Strategy):
     `hold_days` 仍是**仅供对照实验**的备用出口（固定持有 N 个交易日，全进全出），
     优先级高于 `exit_mode`；用来区分「买点选错」与「出口太紧」。
 
+    买点过滤
+    --------
+    `entry_ma`（默认 **20**，`None` 或 `0` = 关闭）—— 买点当天收盘必须站上该均线。
+    修的是「买点与出场线不自洽」：B5 只要求 `C > BBI`，弱势里 BBI 低于 MA20，
+    进场当天就已满足"跌破 MA20 才卖"。实测（`outputs/exit_chase.md`）：
+    加这条过滤把单位在场收益从 29.9 抬到 52.9，而几乎不增加在场时间。
+
+    ⚠️ 阈值 20 是在同一只 50 只池上试出来的（样本内），方向可信、幅度别当承诺。
+
     参数
     ----
     warmup : 前 N 根不产生信号（指标预热，避免初值干扰）
     ma_exit : `exit_mode="ma"` 时的单线出口周期，默认 10
     ma_reduce / ma_reentry / ma_stop : 分级出口的三条均线，默认 5 / 10 / 20
+    entry_ma : 买点过滤均线周期，默认 20（`None`/`0` 关闭）
+    trade_from : 早于此日期（`"YYYY-MM-DD"`，闭区间起点）不产生任何信号。
+        **回测区间控制**：数据仍从更早处取以预热指标与均线（`warmup`），
+        但统计区间从这里开始。`None` = 不限。
     reentry : **仅供对照实验**。`False` 时关掉「回补」这一步 —— 破 MA5 减半后
         只等破 MA20 清仓，不再补回来。用来回答「成绩差是减半本身造成的，
         还是回补这一步造成的」。生产口径保持 True。
@@ -231,7 +257,8 @@ class SixPulseStrategy(Strategy):
     def __init__(self, warmup: int = WARMUP, ma_exit: int = 10,
                  hold_days: int | None = None, exit_mode: str = "tiered",
                  ma_reduce: int = 5, ma_reentry: int = 10, ma_stop: int = 20,
-                 reentry: bool = True):
+                 reentry: bool = True, entry_ma: int | None = 20,
+                 trade_from: str | None = None):
         if exit_mode not in ("tiered", "ma"):
             raise ValueError(f"exit_mode 只能是 'tiered' 或 'ma'，收到 {exit_mode!r}")
         self.warmup = int(warmup)
@@ -242,6 +269,9 @@ class SixPulseStrategy(Strategy):
         self.ma_reentry = int(ma_reentry)
         self.ma_stop = int(ma_stop)
         self.reentry = bool(reentry)
+        # 0 / None 都表示关闭买点过滤
+        self.entry_ma = int(entry_ma) if entry_ma else None
+        self.trade_from = str(trade_from) if trade_from else None
 
     def generate_signals(self, daily: list[KLineData]) -> list[Signal]:
         """逐日信号；成交日 = 信号次日，成交价 = 次日开盘价
@@ -253,7 +283,8 @@ class SixPulseStrategy(Strategy):
 
         df = to_frame(daily)
         ind = compute_indicators(df, ma_exit=self.ma_exit, ma_reduce=self.ma_reduce,
-                                 ma_reentry=self.ma_reentry, ma_stop=self.ma_stop)
+                                 ma_reentry=self.ma_reentry, ma_stop=self.ma_stop,
+                                 entry_ma=self.entry_ma)
         dates = df["date"].tolist()
         closes = df["close"].to_numpy(dtype=float)
         opens = df["open"].to_numpy(dtype=float)
@@ -262,7 +293,15 @@ class SixPulseStrategy(Strategy):
         ma_reduce = ind["ma_reduce"].to_numpy(dtype=float)
         ma_reentry = ind["ma_reentry"].to_numpy(dtype=float)
         ma_stop = ind["ma_stop"].to_numpy(dtype=float)
+        ma_entry = (ind["ma_entry"].to_numpy(dtype=float)
+                    if self.entry_ma else None)
         n = len(dates)
+
+        # 起点：预热区之后、且不早于 trade_from
+        i_start = self.warmup
+        if self.trade_from:
+            while i_start < n and dates[i_start] < self.trade_from:
+                i_start += 1
 
         def emit(i: int, action: Action, weight: float, reason: str) -> None:
             """T=i 收盘确认 → i+1 开盘成交"""
@@ -278,9 +317,10 @@ class SixPulseStrategy(Strategy):
         half_sold = False      # 已按 MA5 减半
         broke_reentry = False  # 减半后曾跌破回补线
 
-        for i in range(self.warmup, n):
+        for i in range(i_start, n):
             if not holding:
-                if buy[i]:
+                # 买点过滤：收盘必须站上 MA(entry_ma)（NaN 比较为 False ⇒ 不买）
+                if buy[i] and (ma_entry is None or closes[i] > ma_entry[i]):
                     emit(i, Action.BUY, 1.0, "六脉共振首日")
                     holding, entry_i = True, i + 1
                     half_sold = broke_reentry = False

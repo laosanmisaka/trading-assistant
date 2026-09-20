@@ -334,3 +334,90 @@ class TestEngineIntegration:
         rich = BacktestEngine(initial_capital=1_000_000).run_on_data(strat, "EXP", expensive)
         assert poor.total_trades == 0, "10 万买不起一手高价股"
         assert rich.total_trades > 0, "100 万应能成交"
+
+
+# ======================================================================
+# 买点过滤（entry_ma）—— 2026-09-20 加
+# ======================================================================
+
+class TestEntryFilter:
+    """买点当天收盘必须站上 MA(entry_ma)，修「买点与出场线不自洽」
+
+    背景：B5 只要求 `C > BBI`（MA3/6/12/24 均值），弱势里 BBI 低于 MA20 ⇒
+    进场当天就已满足"跌破 MA20 才卖"，次一交易日被扫出去。
+    实测 28.0% 的共振买点当天收盘在 MA20 下方，对应 56% 的超短轮。
+    """
+
+    def test_default_is_ma20(self):
+        assert SixPulseStrategy().entry_ma == 20
+
+    def test_zero_or_none_disables(self):
+        """0 / None 都表示关闭过滤（CLI 传 0 关过滤）"""
+        assert SixPulseStrategy(entry_ma=0).entry_ma is None
+        assert SixPulseStrategy(entry_ma=None).entry_ma is None
+
+    def test_filter_is_subset_and_above_ma(self, daily):
+        """过滤只**减少**开仓买点，且每个保留下来的开仓当天收盘都在 MA20 上方"""
+        closes = to_frame(daily)["close"]
+        ma20 = closes.rolling(20).mean().to_numpy(dtype=float)
+        px = closes.to_numpy(dtype=float)
+        pos = {k.date: i for i, k in enumerate(daily)}
+
+        on = SixPulseStrategy(entry_ma=20).generate_signals(daily)
+        off = SixPulseStrategy(entry_ma=None).generate_signals(daily)
+        opens_on = {s.date for s in on if s.action == Action.BUY and s.weight >= 1.0}
+        opens_off = {s.date for s in off if s.action == Action.BUY and s.weight >= 1.0}
+
+        assert opens_on <= opens_off, "过滤不能凭空造出买点"
+        for d in opens_on:
+            i = pos[d] - 1                       # 决策日（成交日的前一根）
+            assert px[i] > ma20[i], "保留的开仓必须站上 MA20"
+
+    def test_filter_is_actually_binding(self, daily):
+        """合成数据里必须真的滤掉一些，否则用例只是纸面覆盖"""
+        on = SixPulseStrategy(entry_ma=20).generate_signals(daily)
+        off = SixPulseStrategy(entry_ma=None).generate_signals(daily)
+        assert len(on) < len(off)
+
+    def test_disabled_matches_legacy(self, daily):
+        """关掉过滤 == 加过滤之前的旧行为（逐条一致）"""
+        a = [(s.date, s.action, s.weight, s.reason)
+             for s in SixPulseStrategy(entry_ma=None).generate_signals(daily)]
+        b = [(s.date, s.action, s.weight, s.reason)
+             for s in SixPulseStrategy(entry_ma=0).generate_signals(daily)]
+        assert a == b and a
+
+    def test_ma_entry_column_optional(self, daily):
+        df = to_frame(daily)
+        assert "ma_entry" not in compute_indicators(df, entry_ma=None).columns
+        assert "ma_entry" in compute_indicators(df, entry_ma=20).columns
+
+
+# ======================================================================
+# 回测区间起点（trade_from）
+# ======================================================================
+
+class TestTradeFrom:
+    """`trade_from` —— 数据全量喂入预热，但起点之前不下单（回测区间口径）"""
+
+    def test_nothing_before_start(self, daily):
+        cut = daily[150].date
+        sig = SixPulseStrategy(trade_from=cut).generate_signals(daily)
+        assert sig, "起点之后应该有信号"
+        assert min(s.date for s in sig) > cut
+
+    def test_first_signal_is_open_not_addon(self, daily):
+        """起点前不可能有持仓 ⇒ 起点后第一条必是开仓买入，不会是回补或卖出"""
+        cut = daily[150].date
+        sig = SixPulseStrategy(trade_from=cut).generate_signals(daily)
+        assert sig[0].action == Action.BUY
+        assert sig[0].weight == 1.0
+
+    def test_start_beyond_data_gives_empty(self, daily):
+        assert SixPulseStrategy(trade_from="2099-01-01").generate_signals(daily) == []
+
+    def test_no_start_matches_none(self, daily):
+        """不传 `trade_from` == 旧行为"""
+        a = [(s.date, s.action) for s in SixPulseStrategy().generate_signals(daily)]
+        b = [(s.date, s.action) for s in SixPulseStrategy(trade_from=None).generate_signals(daily)]
+        assert a == b and a
