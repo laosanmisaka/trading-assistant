@@ -319,6 +319,25 @@ trading_assistant.db
 `kind` 取 `buy`/`sell`。日线几何点由 `core/chan_points` 判定，成交点由
 `core/chan_strategy` 产出；UI 与 HTML 图共用同一套函数，不各算一套。
 
+### `core/six_pulse.py`（六脉神剑，**独立于缠论**）
+
+日线六指标共振策略，买点移植自通达信公式（仓库根 `lmsj.txt`）。实现
+`core.backtest.strategy.Strategy`，可直接交给 `BacktestEngine`。
+口径与实测结论见 `docs/STRATEGY_SIX_PULSE.md`。
+
+| 函数/类 | 输入 | 返回 | 说明 |
+| --- | --- | --- | --- |
+| `ema(s, n)` / `sma_tdx(s, n, m)` | Series、周期 | Series | 通达信 `EMA` / `SMA`（**加权**平均，不是简单均线） |
+| `to_frame(daily)` | `list[KLineData]` | DataFrame | 转日线表 |
+| `compute_indicators(df, ma_exit=10)` | 日线表、卖出均线周期 | DataFrame | OHLC + `B1`~`B6` / `all6` / `buy_signal` / `sell_signal` |
+| `SixPulseStrategy(warmup=60, ma_exit=10, hold_days=None)` | — | 策略 | 共振首日买入、破 MA10 卖出；`hold_days` **仅供对照实验** |
+| `SixPulseStrategy.generate_signals(daily)` | 日线 | `list[Signal]` | T 日收盘确认、**T+1 开盘**成交 |
+
+实测（50 只 / 1500 根日线，2026-09-20）：4466 笔、胜率 30.5%、平均每笔 +0.18%、
+平均区间收益 **+11.33%** vs 买入持有 **+62.39%**；买点相对"任意日起"的超额
+≈ 0 ⇒ **无 alpha**，不建议实盘。评估脚本 `scripts/eval_six_pulse.py`，
+测试 `tests/test_six_pulse.py`（19 条，全离线）。
+
 ## 9. 做 T 模块
 
 该模块位于 `core/trading/`，当前未接入主窗口。

@@ -17,9 +17,10 @@
 - 缠论买卖点: 日线几何买卖点 + 多周期共振策略，标注在日线 K 线图上；
   **不做提醒**（2026-09-18 起，原「买点扫描」链路已删除）。
 - 做 T 框架: 模型接口、模拟模型、交易状态机、回测模拟器。当前未接入主 UI，投入使用前需要补齐验证。
-- 回测引擎: `core/backtest/engine.py` 提供资金/佣金/印花税/回撤/资金曲线的通用执行器，
-  但**当前没有内置策略** —— 原内置的 `BuyPointStrategy` 属于伪缠论体系，已于 2026-09-20 整体取缔。
-  详见 `docs/PLAN_BUYSELL_GEOMETRY.md` §8。
+- 回测引擎: `core/backtest/engine.py` 提供资金/佣金/印花税/回撤/资金曲线的通用执行器。
+  原内置的 `BuyPointStrategy` 属于伪缠论体系，已于 2026-09-20 整体取缔；
+  现有一个独立的日线策略 **六脉神剑**（`core/six_pulse.py`，实现 `Strategy` 接口），
+  实测结论见 `docs/STRATEGY_SIX_PULSE.md`。
 
 ## 环境要求
 
@@ -94,7 +95,8 @@ trading-assistant/
 │   ├── chan_points.py        <- 几何买卖点判定
 │   ├── chan_strategy.py      <- 多周期共振策略
 │   ├── chan_viz.py           <- 缠论 K 线图（HTML）
-│   ├── backtest/             <- 通用回测执行器（当前**无内置策略**）
+│   ├── six_pulse.py          <- 六脉神剑（六指标共振，日线；独立于缠论）
+│   ├── backtest/             <- 通用回测执行器 + 策略接口
 │   └── trading/
 ├── data/
 │   ├── models.py
@@ -103,7 +105,7 @@ trading-assistant/
 │   └── market_data_manager.py
 ├── ui/
 ├── utils/
-├── scripts/                  <- 离线工具（标的池扫描 / 窗口标定）
+├── scripts/                  <- 离线工具（标的池扫描 / 窗口标定 / 策略评估）
 │   ├── pool_liquid50.txt     <- 50 只流动性标的池
 │   └── scan_pool.py
 ├── visualize_chan.py         <- 缠论单文件 HTML 图入口

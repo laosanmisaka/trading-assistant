@@ -1,0 +1,111 @@
+DIFF:=EMA(CLOSE,5)-EMA(CLOSE,10);
+DEA:=EMA(DIFF,3);
+B1:=DIFF>DEA;
+MACD金叉:IF(B1,1,0),COLORRED;
+RSV1:=(CLOSE-LLV(LOW,8))/(HHV(HIGH,8)-LLV(LOW,8))*100;
+K:=SMA(RSV1,3,1);
+D:=SMA(K,3,1);
+DRAWICON(K>D,2,1);
+DRAWICON(K<D,2,2);
+DRAWTEXT(ISLASTBAR=1,2,'.KDJ'),COLORFFFFFF;
+B2:=K>D;
+KDJ金叉:IF(B2,2,0),COLORRED;
+LC:=REF(CLOSE,1);
+RSI1:=(SMA(MAX(CLOSE-LC,0),5,1))/(SMA(ABS(CLOSE-LC),5,1))*100;
+RSI2:=(SMA(MAX(CLOSE-LC,0),13,1))/(SMA(ABS(CLOSE-LC),13,1))*100;
+DRAWICON(RSI1>RSI2,3,1);
+DRAWICON(RSI1<RSI2,3,2);
+DRAWTEXT(ISLASTBAR=1,3,'.RSI'),COLORFFFFFF;
+B3:=RSI1>RSI2;
+RSI金叉:IF(B3,3,0),COLORRED;
+RSV:=-(HHV(HIGH,13)-CLOSE)/(HHV(HIGH,13)-LLV(LOW,13))*100;
+LWR1:=SMA(RSV,3,1);
+LWR2:=SMA(LWR1,3,1);
+DRAWICON(LWR1>LWR2,4,1);
+DRAWICON(LWR1<LWR2,4,2);
+DRAWTEXT(ISLASTBAR=1,4,'.LWR'),COLORFFFFFF;
+B4:=LWR1>LWR2;
+LWR金叉:IF(B4,4,0),COLORRED;
+BBI:=(MA(CLOSE,3)+MA(CLOSE,6)+MA(CLOSE,12)+MA(CLOSE,24))/4;
+DRAWICON(CLOSE>BBI,5,1);
+DRAWICON(CLOSE<BBI,5,2);
+DRAWTEXT(ISLASTBAR=1,5,'.BBI'),COLORFFFFFF;
+B5:=CLOSE>BBI;
+BBI金叉:IF(B5,5,0),COLORRED;
+MTM:=CLOSE-REF(CLOSE,1);
+MMS:=100*EMA(EMA(MTM,5),3)/EMA(EMA(ABS(MTM),5),3);
+MMM:=100*EMA(EMA(MTM,13),8)/EMA(EMA(ABS(MTM),13),8);
+DRAWICON(MMS>MMM,6,1);
+DRAWICON(MMS<MMM,6,2);
+DRAWTEXT(ISLASTBAR=1,6,'.MTM'),COLORFFFFFF;
+B6:=MMS>MMM;
+MTM金叉:IF(B6,6,0),COLORRED;
+涨买入:IF((B1 AND B2 AND B3 AND B4 AND B5 AND B6) AND REF(B1 AND B2 AND B3 AND B4 AND B5 AND B6,1)=0,7,0),COLORYELLOW,LINETHICK2;
+上涨:IF(B1 AND B2 AND B3 AND B4 AND B5 AND B6,7,0),COLORYELLOW,LINETHICK2;
+晴天:BARSLASTCOUNT(B1 AND B2 AND B3 AND B4 AND B5 AND B6),LINETHICK0;
+雨天:BARSLASTCOUNT(MACD金叉+KDJ金叉+RSI金叉+LWR金叉+BBI金叉+MTM金叉>0 AND MACD金叉+KDJ金叉+RSI金叉+LWR金叉+BBI金叉+MTM金叉<21 ),LINETHICK0;
+雪天:BARSLASTCOUNT(MACD金叉+KDJ金叉+RSI金叉+LWR金叉+BBI金叉+MTM金叉=0),LINETHICK0;
+
+
+这段代码是一个基于通达信（TDX）平台的副图技术指标公式，通常被称为‌“六脉神剑”‌或其变种。该指标通过综合判断 MACD、KDJ、RSI、LWR、BBI 和 MTM 六种常见技术指标的多头状态，来寻找共振买入点。
+
+以下是对该公式的详细解析、逻辑说明及使用建议：
+
+1. 指标核心逻辑
+该指标将六个子指标的状态分别定义为 B1 到 B6，当且仅当这六个条件‌同时满足‌时，视为强烈的多头共振信号。
+
+‌B1 (MACD趋势)‌: DIFF > DEA。即快线大于慢线，代表短期趋势强于中期趋势，处于多头区域。
+注：此处参数为 EMA(5) 和 EMA(10)，比标准的 MACD(12,26) 更敏感。
+‌B2 (KDJ动能)‌: K > D。即 K 线大于 D 线，代表短期买入动能占优。
+‌B3 (RSI强弱)‌: RSI1(5) > RSI2(13)。即短期相对强弱指标高于长期，代表股价近期走势强于前期平均。
+‌B4 (LWR威廉)‌: LWR1 > LWR2。LWR 是反向指标，但在该公式逻辑中，LWR1 > LWR2 通常对应股价上涨或低位反弹阶段（具体取决于 LWR 的计算方向，此处遵循源码逻辑，视为多头信号）。
+‌B5 (BBI多空)‌: CLOSE > BBI。收盘价站在多空指数之上，视为多头市场。
+‌B6 (MTM动量)‌: MMS > MMM。短期动量线大于长期动量线，代表上涨加速度增加。
+2. 输出信号说明
+‌图标显示 (DRAWICON)‌:
+
+在副图的 1-6 行位置，分别显示各指标的多空状态。
+1 号图标（通常为红箭头或笑脸）表示该单项指标看多。
+2 号图标（通常为绿箭头或哭脸）表示该单项指标看空。
+右侧文字 .KDJ, .RSI 等用于标识各行对应的指标。
+‌金叉标记‌:
+
+MACD金叉, KDJ金叉 等变量虽然命名为“金叉”，但实际上在代码中定义为 IF(Bx, x, 0)，即只要处于多头状态（如 K>D）就赋值，而不仅仅是交叉的那一刻。这些变量主要用于后续“雨天”和“雪天”的计数统计。
+‌核心买卖信号‌:
+
+‌涨买入 (黄色粗线, 值7)‌:
+条件：B1 至 B6 全部为真（六指齐发），‌且‌ 前一天不满足此条件。
+含义：‌六指标共振的第一天‌，视为最佳买入点。
+‌上涨 (黄色粗线, 值7)‌:
+条件：B1 至 B6 全部为真。
+含义：只要六指标保持共振多头状态，该线持续显示为 7。用于持股参考。
+‌环境状态 (LINETHICK0, 不画图仅数值)‌:
+
+‌晴天‌: 六指标连续共振多头的天数。数值越大，代表多头趋势越稳定。
+‌雨天‌: 至少有1个但不超过20个指标发出多头信号的天数。代表市场处于震荡或局部多头状态。
+‌雪天‌: 所有6个指标均为空头（金叉值和为0）的天数。代表市场处于全面弱势或下跌趋势。
+3. 使用建议与注意事项
+‌共振的有效性‌:
+
+“涨买入”信号出现时，意味着短中线趋势、动能、强弱、多空分界同时向好，成功率通常较高。
+但由于条件苛刻（6个指标同时向好），信号出现的频率较低，适合捕捉主升浪或强力反弹起点。
+‌参数敏感性‌:
+
+该公式中的 MACD 使用了 EMA(5,10)，KDJ 使用了 8日 周期，相比默认参数更为灵敏。这在震荡市中可能会产生较多假信号，建议在趋势明显的行情中使用。
+‌结合“晴天”数值‌:
+
+当“涨买入”出现后，观察“晴天”数值。如果“晴天”持续增加，说明共振状态保持良好，可继续持有。
+如果“晴天”中断（即任一指标转弱），虽然“上涨”信号消失，但不一定立即卖出，需结合其他止损策略。
+‌规避“雪天”‌:
+
+当“雪天”数值较大时，说明市场处于全面空头排列，此时应空仓观望，避免抄底。
+‌代码安装‌:
+
+打开通达信软件 -> 功能 -> 公式系统 -> 公式管理器 -> 技术指标公式 -> 新建。
+将上述代码完整复制粘贴到编辑区。
+画线方法选择“副图”。
+命名如“六脉神剑”并保存。
+4. 潜在优化方向
+‌过滤噪音‌: 可以加入成交量条件（如 VOL > MA(VOL,5)）或均线过滤（如 CLOSE > MA(CLOSE,60)），以确保共振发生在上升趋势或底部放量阶段，避免在下跌中继中出现假共振。
+‌LWR 逻辑确认‌: LWR 指标在不同软件中定义可能略有差异（有的越高越弱，有的越低越弱）。请确保您使用的通达信版本中，LWR1 > LWR2 确实对应股价上涨逻辑。如果发现 LWR 信号与其他指标经常背离，可能需要调整 LWR 的判断条件。
+此公式是一个典型的多指标共振交易系统，核心思想是‌“宁可错过，不可做错”‌，通过多重过滤来提高交易信号的可靠性。
