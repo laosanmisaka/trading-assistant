@@ -4,7 +4,8 @@
     python visualize_chan.py 600519 --period 30 --out outputs/chan_600519.html
 
 图层：中枢 / 笔 / 分型 / 一~三买卖点 / 日线一买二买生效日 / 策略买卖点 /
-日线 MA5·MA10。详见 `core/chan_viz.py` 的模块说明。
+**六脉神剑买卖点（菱形，独立策略对照）** / 日线 MA5·MA10。
+详见 `core/chan_viz.py` 的模块说明。
 """
 
 import sys

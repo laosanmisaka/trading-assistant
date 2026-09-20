@@ -283,6 +283,30 @@ def test_payload_strategy_hit_lands_on_signal_bar(payload):
         assert t["buy"]["idx"] == t["buy"]["signal_idx"] + 1
 
 
+def test_payload_six_pulse_block_is_self_consistent(payload):
+    """六脉块（独立策略）结构与图内下标自洽 —— UI 直接消费它
+
+    ⚠️ 与缠论策略的关键区别：六脉用的是**同一份合成日线**（保证两根策略
+    共用一条 X 轴），不是评估报告里那 1500 根日线。交易日数必须与 meta 对上。
+    """
+    from core import six_pulse
+
+    sp = payload["six_pulse"]
+    n = payload["meta"]["bars"]
+    assert sp["warmup_bars"] == six_pulse.WARMUP
+    assert sp["daily_bars"] == payload["meta"]["trading_days"], \
+        "六脉必须用同一份合成日线，否则两根策略的 X 轴不可比"
+    assert len(sp["buys"]) == len(sp["trades"])
+    assert len(sp["sells"]) <= len(sp["buys"]), "未平仓那笔没有卖点"
+    for t in sp["trades"]:
+        assert 0 <= t["buy_idx"] < n
+        assert t["buy_price"] > 0
+        if t["sell_idx"] is not None:
+            assert 0 <= t["sell_idx"] < n
+            assert t["sell_price"] is not None
+            assert t["return_pct"] is not None
+
+
 def test_payload_zoom_within_range(payload):
     z = payload["zoom"]
     n = payload["meta"]["bars"]
@@ -430,6 +454,15 @@ def _fake_payload_for_marks():
              "sell": {"dt": "2026-01-07", "price": 12.0, "return_pct": 9.09}},
             {"buy": {"dt": "2026-01-07 14:00", "price": 12.5}, "sell": None},
         ]},
+        # 六脉神剑：独立策略的另一套买卖点（第二笔未平仓）
+        "six_pulse": {"trades": [
+            {"buy_idx": 0, "buy_dt": "2026-01-05", "buy_price": 10.2,
+             "sell_idx": 1, "sell_dt": "2026-01-06", "sell_price": 11.4,
+             "return_pct": 11.76},
+            {"buy_idx": 2, "buy_dt": "2026-01-07", "buy_price": 12.6,
+             "sell_idx": None, "sell_dt": "", "sell_price": None,
+             "return_pct": None},
+        ]},
     }
 
 
@@ -451,11 +484,32 @@ def test_marks_from_payload_maps_index_to_date():
     ], "未平仓那笔的 sell_date 必须是空串（不是 None 也不是乱码日期）"
 
 
+def test_marks_from_payload_six_pulse_is_separate():
+    """六脉神剑导出成**独立一组** —— 不能并进 geometry/trades 混成一锅
+
+    UI 靠这个分组把菱形画在更外圈、并与缠论点分开上图例；一旦被并进
+    trades，图上就分不出哪笔是缠论、哪笔是六脉了。
+    """
+    from core.chan_viz import marks_from_payload
+
+    marks = marks_from_payload(_fake_payload_for_marks())
+
+    assert marks["six_pulse"] == [
+        {"buy_date": "2026-01-05", "buy_price": 10.2,
+         "sell_date": "2026-01-06", "sell_price": 11.4, "return_pct": 11.76},
+        {"buy_date": "2026-01-07", "buy_price": 12.6,
+         "sell_date": "", "sell_price": None, "return_pct": None},
+    ], "未平仓那笔同样用空串表示卖点（与缠论组口径一致）"
+    # 原两组不受影响 —— 六脉是第三组，不是替换
+    assert len(marks["geometry"]) == 2 and len(marks["trades"]) == 2
+
+
 def test_marks_from_payload_tolerates_empty_payload():
     """空 payload 不抛异常 —— UI 拿到空标注只是不画点"""
     from core.chan_viz import marks_from_payload
 
-    assert marks_from_payload({}) == {"geometry": [], "trades": []}
+    assert marks_from_payload({}) == {"geometry": [], "trades": [],
+                                      "six_pulse": []}
 
 
 def test_marks_from_klines_matches_payload(payload):
@@ -477,4 +531,4 @@ def test_marks_from_klines_carries_meta():
 
     marks = marks_from_klines(make_klines(420), code="600000", name="测试股")
     assert marks["meta"]["code"] == "sh600000"
-    assert set(marks) == {"geometry", "trades", "meta"}
+    assert set(marks) == {"geometry", "trades", "six_pulse", "meta"}

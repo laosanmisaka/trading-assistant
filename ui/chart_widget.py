@@ -33,6 +33,15 @@ CHAN_DAILY_COLORS = {
     "一买": "#7b1fa2", "二买": "#e65100", "三买": "#f9a825",
     "一卖": "#004d40", "二卖": "#1b5e20", "三卖": "#2e7d32",
 }
+# 六脉神剑（独立策略，叠在同图上做位置对照）—— 菱形标记 + 外圈一档，
+# 与缠论策略的三角/圆点形状区分开。色值与 core/chan_viz.STYLE 同源。
+SIX_PULSE_BUY_COLOR = "#0277bd"
+SIX_PULSE_SELL_COLOR = "#ad1457"
+
+# 标注离当根 K 线极值的距离（买点向下取、卖点向上取）。六脉比缠论**外圈
+# 一档**，这样同一根 bar 上两类点都出现时不会叠在一起。
+_BUY_NEAR, _SELL_NEAR = 0.985, 1.015
+_BUY_FAR, _SELL_FAR = 0.968, 1.032
 
 
 # ---- 中文字体配置 ----
@@ -461,20 +470,30 @@ class ChartTabWidget(QWidget):
     # ================================================================
 
     def _draw_chan_marks(self, ax, df) -> list[tuple]:
-        """在有 K 线的主轴上标注缠论买卖点 → 返回额外的图例代理项
+        """在有 K 线的主轴上标注买卖点 → 返回额外的图例代理项
 
         数据（``self.chan_marks``）来自 `core.chan_viz.marks_from_klines`，
-        形态是**按日期**给出的点：日线几何买卖点（一/二/三 买与卖）+ 策略
-        实际成交点。这里只做「日期 → 横轴下标」映射，把买点画在当根 K 线
-        的低点下方、卖点画在高点上方。
+        形态是**按日期**给出的点，三组：
+
+        - ``geometry``：日线几何买卖点（一/二/三 买与卖）
+        - ``trades``：缠论多周期共振策略的实际成交
+        - ``six_pulse``：**独立策略**六脉神剑的成交（六指标共振 + MA10 出口）
+
+        前两组同源（都出自缠论几何判定），第三组不同源。叠在同一张日线图上
+        是为了让老三**比较两套策略买点的位置**，不是把两者混成一套信号
+        （见 `core/chan_viz` docstring 第 4 条）。
+
+        这里只做「日期 → 横轴下标」映射：买点画在当根 K 线低点下方、卖点画在
+        高点上方；六脉比缠论**外圈一档**，避免两类点落在同一位置叠住。
 
         为什么不用 `ax.scatter` 逐个画、而是一次画一批：与蜡烛批量化同因 ——
-        250 根上逐点建 artist 会让缩放/重绘变慢。整个函数只产生
-        **2 个 collection**（买一批、卖一批）。
+        250 根上逐点建 artist 会让缩放/重绘变慢。每个 (marker, 买卖) 组合
+        只产生 1 个 collection。
         """
         geometry = self.chan_marks.get("geometry") or []
         trades = self.chan_marks.get("trades") or []
-        if not geometry and not trades:
+        six = self.chan_marks.get("six_pulse") or []
+        if not geometry and not trades and not six:
             return []
 
         date_to_x = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(df.index)}
@@ -482,7 +501,7 @@ class ChartTabWidget(QWidget):
         highs = df["High"].to_numpy(dtype=float)
         lows = df["Low"].to_numpy(dtype=float)
 
-        # 每项: (x, 标记色, 尺寸, 文字, 是否买点)
+        # 每项: (x, 色, 尺寸, 文字, marker, 是否买点, K 线极值缩放)
         items: list[tuple] = []
 
         for p in geometry:
@@ -490,15 +509,18 @@ class ChartTabWidget(QWidget):
             if i is None or not 0 <= i < n:
                 continue
             kind = str(p.get("kind", ""))
+            buy = kind.endswith("买")
             items.append((i, CHAN_DAILY_COLORS.get(kind, "#888888"), 45, kind,
-                          kind.endswith("买")))
+                          "^" if buy else "v", buy,
+                          _BUY_NEAR if buy else _SELL_NEAR))
 
         for t in trades:
             i = date_to_x.get(str(t.get("buy_date")))
             if i is not None and 0 <= i < n:
                 price = t.get("buy_price")
                 items.append((i, CHAN_BUY_COLOR, 130,
-                              "买 " + (f"{price:.2f}" if price else ""), True))
+                              "买 " + (f"{price:.2f}" if price else ""),
+                              "^", True, _BUY_NEAR))
             j = date_to_x.get(str(t.get("sell_date"))) if t.get("sell_date") else None
             if j is not None and 0 <= j < n:
                 price = t.get("sell_price")
@@ -506,38 +528,79 @@ class ChartTabWidget(QWidget):
                 label = "卖 " + (f"{price:.2f}" if price else "")
                 if pct is not None:
                     label += f" ({pct:+.2f}%)"
-                items.append((j, CHAN_SELL_COLOR, 130, label, False))
+                items.append((j, CHAN_SELL_COLOR, 130, label, "v", False, _SELL_NEAR))
+
+        for t in six:
+            i = date_to_x.get(str(t.get("buy_date")))
+            if i is not None and 0 <= i < n:
+                price = t.get("buy_price")
+                items.append((i, SIX_PULSE_BUY_COLOR, 105,
+                              "六脉 " + (f"{price:.2f}" if price else ""),
+                              "D", True, _BUY_FAR))
+            j = date_to_x.get(str(t.get("sell_date"))) if t.get("sell_date") else None
+            if j is not None and 0 <= j < n:
+                price = t.get("sell_price")
+                pct = t.get("return_pct")
+                label = "六脉 " + (f"{price:.2f}" if price else "")
+                if pct is not None:
+                    label += f" ({pct:+.2f}%)"
+                items.append((j, SIX_PULSE_SELL_COLOR, 105, label,
+                              "D", False, _SELL_FAR))
 
         if not items:
             return []
 
-        for is_buy in (True, False):
-            group = [it for it in items if it[4] is is_buy]
-            if not group:
-                continue
+        # 按 (marker, 买卖, 距离档) 分组，每组一次 scatter
+        groups: list[tuple] = []
+        for it in items:
+            key = (it[4], it[5], it[6])
+            if key not in groups:
+                groups.append(key)
+        for marker, is_buy, yscale in groups:
+            group = [it for it in items
+                     if (it[4], it[5], it[6]) == (marker, is_buy, yscale)]
             xs = [it[0] for it in group]
-            ys = [lows[it[0]] * 0.985 if is_buy else highs[it[0]] * 1.015
+            ys = [lows[it[0]] * yscale if is_buy else highs[it[0]] * yscale
                   for it in group]
-            ax.scatter(xs, ys, marker="^" if is_buy else "v",
-                       c=[it[1] for it in group], s=[it[2] for it in group],
-                       zorder=6, linewidths=0)
-            for (xi, color, _size, text, buy) in group:
-                ax.annotate(text, (xi, lows[xi] * 0.985 if buy else highs[xi] * 1.015),
+            ax.scatter(xs, ys, marker=marker, c=[it[1] for it in group],
+                       s=[it[2] for it in group], zorder=6, linewidths=0)
+            for (xi, color, _size, text, _mk, buy, ys_i) in group:
+                if not text:
+                    continue
+                ax.annotate(text, (xi, lows[xi] * ys_i if buy else highs[xi] * ys_i),
                             textcoords="offset points",
                             xytext=(0, -6 if buy else 6),
                             ha="center", va="top" if buy else "bottom",
                             fontsize=6, color=color, zorder=7)
 
-        return [
-            (Line2D([], [], marker="^", color="none", markerfacecolor=CHAN_BUY_COLOR,
-                    markersize=9, label="策略买点"), "策略买点"),
-            (Line2D([], [], marker="v", color="none", markerfacecolor=CHAN_SELL_COLOR,
-                    markersize=9, label="策略卖点"), "策略卖点"),
-            (Line2D([], [], marker="^", color="none", markerfacecolor="#e65100",
-                    markersize=6, label="日线买点"), "日线买点"),
-            (Line2D([], [], marker="v", color="none", markerfacecolor="#1b5e20",
-                    markersize=6, label="日线卖点"), "日线卖点"),
-        ]
+        # 图例只列实际画了的类别（空组别占位会让图例显得像没画出来）
+        legend: list[tuple] = []
+        if trades:
+            legend += [
+                (Line2D([], [], marker="^", color="none",
+                        markerfacecolor=CHAN_BUY_COLOR, markersize=9,
+                        label="策略买点"), "策略买点"),
+                (Line2D([], [], marker="v", color="none",
+                        markerfacecolor=CHAN_SELL_COLOR, markersize=9,
+                        label="策略卖点"), "策略卖点"),
+            ]
+        if geometry:
+            legend += [
+                (Line2D([], [], marker="^", color="none", markerfacecolor="#e65100",
+                        markersize=6, label="日线买点"), "日线买点"),
+                (Line2D([], [], marker="v", color="none", markerfacecolor="#1b5e20",
+                        markersize=6, label="日线卖点"), "日线卖点"),
+            ]
+        if six:
+            legend += [
+                (Line2D([], [], marker="D", color="none",
+                        markerfacecolor=SIX_PULSE_BUY_COLOR, markersize=7,
+                        label="六脉买点"), "六脉买点"),
+                (Line2D([], [], marker="D", color="none",
+                        markerfacecolor=SIX_PULSE_SELL_COLOR, markersize=7,
+                        label="六脉卖点"), "六脉卖点"),
+            ]
+        return legend
 
     # 外部接口
     def set_alert_lines(self, stop_loss: float, take_profit: float):

@@ -19,6 +19,7 @@
 | 策略日线条件 | `chan_points` 几何 | 竖线：日线一买 / 日线二买「生效日」（笔终点次日） |
 | 策略买卖点 | `chan_strategy.scan` | 三重共振触发 + 均线卖出（几何源，默认） |
 | 策略命中二买 | `chan_strategy` | 被策略真正用到的那个 30 分钟二买 bar |
+| 六脉买点 / 卖点 | `core/six_pulse.py` | **独立策略**（六指标共振 + MA10 出口），日线级别，菱形标记 |
 
 ======================================================================
 三条必须在图上说清楚的口径（否则图会骗人）
@@ -62,6 +63,22 @@
    —— 那段里 `cxt_*` 不出信号。策略改几何源后没有这个截断（几何点由全量
    笔/中枢算出），底纹已删除，`--init-n` 参数一并去掉。
 
+4. **六脉神剑是独立策略，叠在同一张图上只为比较买点位置。**
+
+   2026-09-20 老三要求「两套策略的买卖点画在一起比较好比较」。要点：
+
+   - 它**不参与**缠论那套结构，买点来自 `six_pulse` 的六指标共振首日，
+     卖点来自跌破 MA10 —— 与缠论的三重共振/均线出口是两套独立的判定。
+   - 为了 X 轴严格可比，六脉用的是**同一份合成日线**（30 分钟聚合而来，
+     约 247 个交易日），**不是**评估报告里那 1500 根日线。因此图上的六脉
+     样本远少于 `outputs/six_pulse.md`，前 `six_pulse.WARMUP`（60）根
+     日线是指标预热区、不出信号 —— 少就是少，如实画出来，不补点。
+   - 形状上区分开：缠论策略点是**圆点 + 白字「买/卖」**，六脉是**菱形**，
+     避免在同一根 bar 上叠出两个「买」字看不清是谁。
+   - 已知结论见 `docs/STRATEGY_SIX_PULSE.md`：六脉买点实测**无 alpha**
+     （5/10/20 日超额 −0.01%/+0.05%/+0.02%）。画它是为了**对照**，
+     不是为了暗示它可用。
+
 ======================================================================
 性能（"拖着拖着就卡住"的处理）
 ======================================================================
@@ -103,6 +120,8 @@ import pandas as pd
 from core import chan as chan_mod
 from core import chan_points
 from core import chan_strategy
+from core import six_pulse
+from core.backtest.strategy import Action
 from data.models import KLineData
 from utils.logger import get_logger
 
@@ -135,6 +154,8 @@ STYLE = {
             "一卖": "#4db6ac", "二卖": "#81c784", "三卖": "#a5d6a7"},
     "strategy_buy": "#d32f2f", "strategy_sell": "#2e7d32",
     "strategy_hit": "#1565c0",
+    # 六脉神剑（独立策略，叠加对比用）—— 用形状区分于缠论策略的圆点
+    "six_buy": "#0277bd", "six_sell": "#ad1457",
 }
 
 # 图例顺序
@@ -500,6 +521,39 @@ def build_payload(
                             for x in strat.m30_buy2_bars)
                 if i >= 0 and any(t["buy"]["signal_idx"] == i for t in trades)]
 
+    # ---- 5b. 六脉神剑（独立策略，叠在同图上做位置对照）----
+    # 用**同一份合成日线** daily_df，两根策略才共用一条 X 轴；若改用
+    # `fetch_kline` 那 1500 根日线，时间范围与这张图对不上、比不了。
+    # 成交口径与 `six_pulse.SixPulseStrategy` 一致（T 日收盘确认 → T+1
+    # **开盘**成交）⇒ 买卖点都标**当日首根** bar。注意这与缠论策略不同：
+    # 缠论买点同样在开盘（首根），但卖点按当日**收盘**成交、标末根。
+    # 未平仓的最后一笔不造卖点（同 marks_from_payload 的「空 = 未平仓」约定）。
+    six_trades: list[dict] = []
+    if len(daily_df) >= six_pulse.WARMUP + 2:
+        sigs = six_pulse.SixPulseStrategy().generate_signals(
+            _to_klines(daily_df, "daily", code))
+        cur: Optional[dict] = None
+        for sg in sigs:
+            i = _day_first_idx(sg.date)
+            if i < 0:
+                continue
+            if sg.action == Action.BUY:
+                cur = {"buy_idx": i, "buy_dt": str(sg.date)[:10],
+                       "buy_price": round(float(sg.price), 3),
+                       "sell_idx": None, "sell_dt": "", "sell_price": None,
+                       "return_pct": None}
+                six_trades.append(cur)
+            elif sg.action == Action.SELL and cur is not None:
+                cur["sell_idx"] = i
+                cur["sell_dt"] = str(sg.date)[:10]
+                cur["sell_price"] = round(float(sg.price), 3)
+                if cur["buy_price"]:
+                    cur["return_pct"] = round(
+                        (cur["sell_price"] / cur["buy_price"] - 1) * 100, 2)
+                cur = None
+    logger.info(f"{code}: 六脉神剑 买点 {len(six_trades)} 次"
+                f"（图内合成日线 {len(daily_df)} 根，预热 {six_pulse.WARMUP} 根）")
+
     # ---- 6. 默认视窗 ----
     # 铺满全量：主图层是**日线**级别的中枢与买卖点（一个中枢跨数月、一年
     # 只有 5~9 个点），聚焦到几百根 bar 反而看不出结构。抠细节用底部滑条
@@ -519,6 +573,7 @@ def build_payload(
         "策略买点": len(trades),
         "日线买卖点": sum(len(x) for x in packed_daily.values()),
         "30分钟买卖点": sum(len(x) for x in packed_m30.values()),
+        "六脉买点": len(six_trades),
     }
 
     payload = {
@@ -565,6 +620,16 @@ def build_payload(
             "m30_hits": m30_hits,
             "trades": trades,
         },
+        # 六脉神剑：独立策略（六指标共振 + MA10 出口），日线级别。
+        # `warmup_bars` 是它在这份合成日线上的预热根数 —— 图上那段不会有点。
+        "six_pulse": {
+            "warmup_bars": six_pulse.WARMUP,
+            "daily_bars": int(len(daily_df)),
+            "trades": six_trades,
+            "buys": [[t["buy_idx"], t["buy_price"]] for t in six_trades],
+            "sells": [[t["sell_idx"], t["sell_price"]] for t in six_trades
+                      if t["sell_idx"] is not None],
+        },
         "zoom": {"startValue": start, "endValue": end},
     }
     return payload
@@ -584,12 +649,15 @@ def marks_from_payload(payload: dict) -> dict:
     ----
     ``{"geometry": [{"date", "kind", "price"}, ...],
        "trades":   [{"buy_date", "buy_price", "sell_date", "sell_price",
-                     "return_pct"}, ...]}``
+                     "return_pct"}, ...],
+       "six_pulse": [同 trades 结构]}``
 
     - ``geometry``：日线级别的几何买卖点（一/二/三 买与卖）—— 与 HTML 图上
       的「日线买卖点」是同一批点
     - ``trades``：策略实际成交（`chan_strategy` 三重共振买入 + 均线卖出）
-    - ``sell_date`` 为空串 = 数据末尾仍未平仓（收益也是 None）
+    - ``six_pulse``：**独立策略**六脉神剑的成交（六指标共振买入 + 破 MA10 卖出），
+      与 ``trades`` 不同源；画在同一张图上只作位置对照，两者的买卖点不要混读
+    - 两处的 ``sell_date`` 为空串 = 数据末尾仍未平仓（收益也是 None）
     """
     dates = payload.get("dates") or []
     geo: list[dict] = []
@@ -612,9 +680,21 @@ def marks_from_payload(payload: dict) -> dict:
             "return_pct": sell.get("return_pct"),
         })
 
+    six: list[dict] = []
+    for t in payload.get("six_pulse", {}).get("trades", []):
+        six.append({
+            "buy_date": str(t.get("buy_dt", ""))[:10],
+            "buy_price": float(t.get("buy_price") or 0.0),
+            "sell_date": str(t.get("sell_dt", ""))[:10],
+            "sell_price": (float(t["sell_price"])
+                           if t.get("sell_price") is not None else None),
+            "return_pct": t.get("return_pct"),
+        })
+
     geo.sort(key=lambda p: p["date"])
     trades.sort(key=lambda t: t["buy_date"])
-    return {"geometry": geo, "trades": trades}
+    six.sort(key=lambda t: t["buy_date"])
+    return {"geometry": geo, "trades": trades, "six_pulse": six}
 
 
 def marks_from_klines(klines, code: str = "", name: str = "") -> dict:
@@ -851,6 +931,27 @@ if (sSell.length) {
   series.push(stratMarker('策略卖点', sSell, ST.strategy_sell, -30, '卖'));
 }
 
+// ---- 六脉神剑：独立策略（日线级别），菱形标记 ----
+// 与缠论策略点靠**形状**区分：缠论是圆点 + 白字「买/卖」，六脉是菱形无字。
+// 口径不同（六脉只在日线上算、预热 60 根），叠在同一张图上只为比位置，
+// 不是把两者合成一套信号。见模块 docstring 第 4 条。
+function sixMarker(name, data, color, dy) {
+  return {
+    name: name, type: 'scatter', xAxisIndex: 0, yAxisIndex: 0, z: 19,
+    data: data, symbol: 'diamond', symbolSize: 21, symbolOffset: [0, dy],
+    itemStyle: {color: color, borderColor: '#fff', borderWidth: 1.4,
+                shadowBlur: 3, shadowColor: 'rgba(0,0,0,0.2)'},
+    animation: false, emphasis: {scale: 1.3}
+  };
+}
+var SIX = CFG.six_pulse || {buys: [], sells: [], trades: []};
+if (SIX.buys.length) {
+  series.push(sixMarker('六脉买点', SIX.buys, ST.six_buy, 30));
+}
+if (SIX.sells.length) {
+  series.push(sixMarker('六脉卖点', SIX.sells, ST.six_sell, -30));
+}
+
 // 成交量（副图）
 series.push({
   name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, z: 2,
@@ -871,7 +972,8 @@ var counts = CFG.meta.counts;
 // 图例顺序 = 判读优先级。条目近 20 个、一行放不下，ECharts 会折行；
 // 若按 series 原顺序排，「策略买点 / 策略卖点」会被挤到末尾一行，
 // 而它们恰恰是这张图最需要看的两个点，所以显式排序提到最前。
-var LEGEND_FIRST = ['策略买点', '策略卖点', '策略命中二买', '日线中枢',
+var LEGEND_FIRST = ['策略买点', '策略卖点', '六脉买点', '六脉卖点',
+                    '策略命中二买', '日线中枢',
                     '日线一买', '日线二买', '日线三买',
                     '日线一卖', '日线二卖', '日线三卖', '成交点'];
 var legendData = series.map(function (s) { return s.name; });
@@ -892,6 +994,7 @@ var option = {
   title: {
     text: '默认铺满全量　·　日线中枢 ' + counts['日线中枢'] + ' 个　日线买卖点 '
           + counts['日线买卖点'] + ' 个　策略买点 ' + counts['策略买点']
+          + ' 次　六脉买点 ' + (counts['六脉买点'] || 0)
           + ' 次　（底部滑条 / 滚轮可缩放）',
     left: 'center', top: 6,
     textStyle: {fontSize: 13, fontWeight: 'normal', color: '#555'}
@@ -946,6 +1049,26 @@ var option = {
                x.sell.price + '<br/>' + x.sell.ma + ' 被跌破（确认日 ' +
                x.sell.confirm_dt + '），持有 ' + x.sell.hold_days +
                ' 交易日</div>';
+        }
+      });
+      (SIX.trades || []).forEach(function (x) {
+        if (x.buy_idx === idx) {
+          s += '<div style="margin-top:4px;padding-top:4px;' +
+               'border-top:1px dashed #ccc">' +
+               '<b style="color:' + ST.six_buy + '">六脉买点</b> @' +
+               x.buy_price + '<br/><span style="color:#888">六指标共振首日 → ' +
+               '次日开盘买入</span>' +
+               (x.sell_dt ? '' : '<br/><span style="color:#888">（数据末尾仍未平仓）</span>') +
+               '</div>';
+        }
+        if (x.sell_idx === idx) {
+          s += '<div style="margin-top:4px;padding-top:4px;' +
+               'border-top:1px dashed #ccc">' +
+               '<b style="color:' + ST.six_sell + '">六脉卖点</b> @' +
+               x.sell_price +
+               (x.return_pct == null ? '' : '<br/>本笔 ' +
+                (x.return_pct >= 0 ? '+' : '') + x.return_pct + '%') +
+               '</div>';
         }
       });
       s += '</div>';
@@ -1026,6 +1149,7 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
         ("30分卖点", f"一 {mp.get('一卖', 0)} / 二 {mp.get('二卖', 0)} / "
                      f"三 {mp.get('三卖', 0)}"),
         ("策略买点", counts.get("策略买点", 0)),
+        ("六脉买点", counts.get("六脉买点", 0)),
     ]
     meta_html = "".join(
         f'<span class="box">{k}：<b>{v}</b></span>' for k, v in chips)
@@ -1075,6 +1199,15 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
         "<b>不是资金曲线</b> —— 同一时刻多笔持仓时，这些收益不能相加成"
         "组合收益。顶部「最大同时持仓」标出实际重叠了几笔，大于 1 时标红。"
         "这是为了先把「信号本身对不对」验清楚，资金约束留到组合回测再接。</li>"
+        "<li><b>菱形标记是六脉神剑，另一套独立策略，只借这张图比位置。</b>"
+        "买点＝六个指标（MACD / KDJ / RSI / LWR / BBI / MTM，原文见 "
+        "<code>lmsj.txt</code>）同一天全部转多的第一天，卖点＝跌破日线 MA10；"
+        "同样是 T 日收盘确认、<b>T+1 开盘</b>成交。它<b>不参与</b>缠论结构，"
+        "两者买卖点不要混读。图上它用的是<b>同一份合成日线</b>（约 247 个交易日），"
+        "前 60 根是指标预热区、不出信号 —— 因此这里看到的六脉样本远少于"
+        "评估报告的 1500 根。实测结论：<b>该买点没有 alpha</b>"
+        "（5/10/20 日超额 −0.01% / +0.05% / +0.02%，见 "
+        "<code>docs/STRATEGY_SIX_PULSE.md</code>），画出来是<b>对照</b>用的。</li>"
         "</ol>"
         "<div style='margin-top:6px;color:#888'>"
         "行情：新浪财经前复权分钟 K 线；缠论：czsc 1.0.1 "

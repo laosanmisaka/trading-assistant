@@ -53,6 +53,13 @@ N 个交易日"），默认 `None` 即仍走 MA 卖点。它的用途是定位�
 两者互相独立，共用 `core.backtest.engine` 的执行/绩效口径（资金、佣金、
 印花税、回撤）。`SixPulseStrategy` 实现 `core.backtest.strategy.Strategy`，
 可直接交给 `BacktestEngine.run_on_data()`。
+
+可视化
+------
+`core/chan_viz`（`python visualize_chan.py <代码>`）把本策略的买卖点以
+**菱形**标在缠论 K 线图的同一张图上（与缠论策略的圆点区分开），供两者
+对照买点位置。注意图上用的是**同一份合成日线**（约 247 个交易日），
+不是评估用的 1500 根日线 —— 样本少得多，且前 60 根是预热区、不出信号。
 """
 from __future__ import annotations
 

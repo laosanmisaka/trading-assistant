@@ -373,6 +373,83 @@ class TestChanMarksDrawing:
         assert widget.canvas.fig.get_axes() == [], "没有行情时不该重绘"
         assert widget.chan_marks == {"geometry": [], "trades": []}
 
+    def test_no_six_pulse_keeps_old_artist_count(self, qapp):
+        """没有六脉数据时不多出 collection、图例也不多出条目（老行为不变）"""
+        df = _df(n=60)
+        widget = _daily_widget(df, _marks_for(df))
+        ax_price = widget.canvas.fig.get_axes()[0]
+
+        assert len(ax_price.collections) == 4
+        labels = [t.get_text() for t in ax_price.get_legend().get_texts()]
+        assert "六脉买点" not in labels and "六脉卖点" not in labels
+
+    def test_six_pulse_drawn_outside_chan_marks(self, qapp):
+        """六脉神剑是独立策略：形状与缠论点不同、且画在更外圈
+
+        两套策略的买点会落在同一根 bar 上（实测有重叠），如果形状/位置
+        一样就看不出是两套信号 —— 这正是不该混读的那件事。
+        """
+        df = _df(n=60)
+        date = lambda i: df.index[i].strftime("%Y-%m-%d")     # noqa: E731
+        marks = _marks_for(df)
+        marks["six_pulse"] = [
+            # 与 geometry 的「一买」同一天，故意压在同一根 bar 上
+            {"buy_date": date(5), "buy_price": float(df["Close"].iloc[5]),
+             "sell_date": date(30), "sell_price": float(df["Close"].iloc[30]),
+             "return_pct": -1.2},
+        ]
+        widget = _daily_widget(df, marks)
+        ax_price = widget.canvas.fig.get_axes()[0]
+
+        # 蜡烛 2 + 缠论（买/卖）2 + 六脉（买/卖）2 = 6
+        assert len(ax_price.collections) == 6
+        chan_buy, six_buy = ax_price.collections[2], ax_price.collections[-2]
+        six_sell = ax_price.collections[-1]
+
+        # 形状必须不同（三角 vs 菱形），否则图上看不出是两套信号
+        assert (six_buy.get_paths()[0].vertices.shape[0]
+                != chan_buy.get_paths()[0].vertices.shape[0])
+
+        # 位置更外圈一档 —— 同一天的缠论买点与六脉买点不能叠在一起
+        for (x, y) in six_buy.get_offsets():
+            assert y < float(df["Low"].iloc[int(x)]) * 0.985, "六脉买点要在缠论买点外侧"
+        for (x, y) in six_sell.get_offsets():
+            assert y > float(df["High"].iloc[int(x)]) * 1.015, "六脉卖点要在缠论卖点外侧"
+
+    def test_legend_lists_six_pulse(self, qapp):
+        """图例要显式列出六脉两项，否则图上的菱形没有出处"""
+        df = _df(n=60)
+        marks = _marks_for(df)
+        marks["six_pulse"] = [
+            {"buy_date": df.index[15].strftime("%Y-%m-%d"), "buy_price": 1.0,
+             "sell_date": "", "sell_price": None, "return_pct": None},
+        ]
+        widget = _daily_widget(df, marks)
+        ax_price = widget.canvas.fig.get_axes()[0]
+
+        labels = [t.get_text() for t in ax_price.get_legend().get_texts()]
+        for expect in ("策略买点", "策略卖点", "日线买点", "日线卖点",
+                       "六脉买点", "六脉卖点"):
+            assert expect in labels, f"图例缺少「{expect}」"
+
+    def test_six_pulse_only_when_daily_tab(self, qapp):
+        """六脉也是日线级别的，周线页不画"""
+        from ui.chart_widget import ChartTabWidget
+
+        df = _df(n=60)
+        marks = _marks_for(df)
+        marks["six_pulse"] = [
+            {"buy_date": df.index[15].strftime("%Y-%m-%d"), "buy_price": 1.0,
+             "sell_date": "", "sell_price": None, "return_pct": None},
+        ]
+        widget = ChartTabWidget("weekly")
+        widget.canvas.fig.clear()
+        widget.chan_marks = marks
+        widget._draw_kline_manual(df, "test")
+
+        ax_price = widget.canvas.fig.get_axes()[0]
+        assert len(ax_price.collections) == 2, "周线页不该画任何标注"
+
 
 class TestChanMarksWiring:
     """ChartWidget 把标注只投给日线页，且拒绝串台"""
