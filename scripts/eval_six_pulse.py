@@ -1,0 +1,521 @@
+# -*- coding: utf-8 -*-
+"""「六脉神剑」策略批量评估 —— 50 只流动性标的池
+
+    python scripts/eval_six_pulse.py                     # 默认：MA10 出口 + 全套诊断
+    python scripts/eval_six_pulse.py --days 750          # 换评估区间长度
+    python scripts/eval_six_pulse.py --no-sweep          # 跳过出口对照扫
+    python scripts/eval_six_pulse.py --codes sh600519,sz000858
+    python scripts/eval_six_pulse.py --out outputs/six_pulse.md
+
+做什么
+------
+1. 读标的池（默认 `scripts/pool_liquid50.txt`）
+2. 取日线（新浪源、**前复权**）并**落盘缓存**到 `outputs/cache_daily/`
+3. 逐只跑 `core.six_pulse.SixPulseStrategy` + `core.backtest.engine`，
+   给出胜率 / 平均每笔 / 总收益 / 最大回撤 / 盈亏比，并与**买入持有**对照
+4. 三项诊断（回答"亏在哪"）：
+   - **A 指标共线性**：六项多头占比、两两相关、实际共振率 vs 独立假设乘积
+   - **B 买点前瞻收益**：所有共振首日后 5/10/20 日收益 ⇒ 买点是否在追高
+   - **C 出口对照扫**：MA5/10/20/30 与固定持有 10/20/40 日 ⇒ 买点错还是出口紧
+
+⚠️ 口径（数字怎么读）
+---------------------
+- 每只标的**独立 100 万满仓**（整手买入），汇总时**等权平均** —— 这是
+  "同一策略在 N 只票上分别满仓"的结果，**不是**组合资金曲线，收益不可相加。
+- 初始资金 100 万是必需的：茅台一手 ≈ 15 万，10 万资金时 engine 因整手约束
+  买不进任何一手，会**静默跳过**该股全部信号（被误读成"无信号"）。
+- 佣金万 2.5（双边、最低 5 元）+ 印花税千 1（仅卖出）。
+- T 日**收盘**出信号，**T+1 开盘**成交（两端对称，无未来函数）。
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:               # 允许 `python scripts/eval_six_pulse.py` 直接跑
+    sys.path.insert(0, str(ROOT))
+
+from core import chan_viz, six_pulse                        # noqa: E402
+from core.backtest.engine import BacktestEngine             # noqa: E402
+from data.models import KLineData                           # noqa: E402
+from scan_pool import load_pool                             # noqa: E402
+
+DEFAULT_POOL = Path(__file__).with_name("pool_liquid50.txt")
+DAILY_CACHE = ROOT / "outputs" / "cache_daily"
+DEFAULT_CAPITAL = 1_000_000.0
+HORIZONS = (5, 10, 20)
+
+
+# ======================================================================
+# 取数（带落盘缓存）
+# ======================================================================
+
+def _cache_file(cache_dir: Path, sym: str, days: int) -> Path:
+    return Path(cache_dir) / f"{sym}_{days}.csv"
+
+
+def _dump_cache(path: Path, daily: list[KLineData]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "date": [k.date for k in daily],
+        "open": [k.open for k in daily],
+        "high": [k.high for k in daily],
+        "low": [k.low for k in daily],
+        "close": [k.close for k in daily],
+        "volume": [k.volume for k in daily],
+    }).to_csv(path, index=False)
+
+
+def _to_klines(df: pd.DataFrame, code: str) -> list[KLineData]:
+    return [
+        KLineData(code=code, date=str(r.date), open=float(r.open), high=float(r.high),
+                  low=float(r.low), close=float(r.close), volume=int(r.volume),
+                  period="daily")
+        for r in df.itertuples(index=False)
+    ]
+
+
+def load_daily(
+    code: str,
+    days: int,
+    *,
+    cache_dir: Path = DAILY_CACHE,
+    use_cache: bool = True,
+    cache_days: int = 0,
+    attempts: int = 3,
+    polite_sleep: float = 1.0,
+) -> tuple[list[KLineData], bool]:
+    """取一只标的的日线 → ``(klines, 是否走了缓存)``
+
+    缓存判据：文件存在、非空、且 mtime 距今不超过 `cache_days` 天
+    （默认 0 = 只认今天）。日线当天不变，跨日复查用 `--cache-days N`，
+    前提是**中间没有新交易日**。
+    """
+    sym = chan_viz.normalize_code(code)
+    f = _cache_file(cache_dir, sym, days)
+
+    if use_cache and f.exists() and f.stat().st_size > 0:
+        age = (date.today() - datetime.fromtimestamp(f.stat().st_mtime).date()).days
+        if age <= cache_days:
+            return _to_klines(pd.read_csv(f, dtype={"date": str}), sym), True
+
+    from data.market_data import fetch_kline
+
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            daily = fetch_kline(sym, "daily", days=days)
+            if not daily:
+                raise RuntimeError("数据源正常应答但无日线（停牌或代码不存在）")
+            _dump_cache(f, daily)
+            if polite_sleep:
+                time.sleep(polite_sleep)
+            return daily, False
+        except Exception as exc:                     # noqa: BLE001 — 网络源，重试
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(2.0 * attempt)
+    raise RuntimeError(f"取数失败：{last_exc}")
+
+
+# ======================================================================
+# 单只评估
+# ======================================================================
+
+def eval_one(code: str, daily: list[KLineData], strategy, capital: float) -> dict:
+    """跑一只 → 结果行 dict（含笔级、区间级与买入持有基线）"""
+    engine = BacktestEngine(initial_capital=capital)
+    rep = engine.run_on_data(strategy, code, daily)
+
+    idx = {k.date: i for i, k in enumerate(daily)}
+    holds = [
+        idx[t.exit_date] - idx[t.entry_date]
+        for t in rep.trades
+        if t.entry_date in idx and t.exit_date in idx
+    ]
+    first, last = daily[0].close, daily[-1].close
+    return {
+        "code": code,
+        "bars": len(daily),
+        "start": daily[0].date,
+        "end": daily[-1].date,
+        "trades": rep.total_trades,
+        "win_rate": rep.win_rate,
+        "avg_pct": rep.avg_profit_pct,
+        "total_return": rep.total_return,
+        "max_dd": rep.max_drawdown,
+        "profit_factor": rep.profit_factor,
+        "avg_hold": (sum(holds) / len(holds)) if holds else 0.0,
+        "hold_sum": sum(holds),
+        "buy_hold": (last / first - 1.0) if first else 0.0,
+        "open_position": rep.open_position,
+        "_trades": rep.trades,
+    }
+
+
+def merge_stats(rows: list[dict]) -> dict:
+    """把逐标的行合并成池级口径
+
+    - **笔级**：所有标的的 trades 合并（胜率、平均每笔、盈亏比）
+    - **区间级**：逐标的收益率**等权平均**（策略 vs 买入持有）
+    """
+    trades = [t for r in rows for t in r["_trades"]]
+    wins = [t for t in trades if t.profit > 0]
+    losses = [t for t in trades if t.profit <= 0]
+    gain = sum(t.profit for t in wins)
+    loss = abs(sum(t.profit for t in losses))
+    holds = [r["avg_hold"] for r in rows if r["trades"] > 0]
+
+    scanned = [r for r in rows if r["trades"] > 0]
+    n = len(rows) or 1
+    return {
+        "codes": len(rows),
+        "codes_with_trades": len(scanned),
+        "trades": len(trades),
+        "win_rate": (len(wins) / len(trades)) if trades else 0.0,
+        "avg_pct": (sum(t.profit_pct for t in trades) / len(trades)) if trades else 0.0,
+        "profit_factor": (gain / loss) if loss > 0 else float("inf"),
+        "total_gain": gain,
+        "total_loss": loss,
+        "avg_return": sum(r["total_return"] for r in rows) / n,
+        "avg_buy_hold": sum(r["buy_hold"] for r in rows) / n,
+        "avg_dd": sum(r["max_dd"] for r in rows) / n,
+        "max_dd": max((r["max_dd"] for r in rows), default=0.0),
+        "avg_hold": (sum(holds) / len(holds)) if holds else 0.0,
+        "win_codes": sum(1 for r in rows if r["total_return"] > 0),
+        # 在场时间占比 —— 用来看"收益是择时挣的还是在场时间挣的"
+        "exposure": (sum(r["hold_sum"] for r in rows) / sum(r["bars"] for r in rows))
+        if rows else 0.0,
+    }
+
+
+# ======================================================================
+# 诊断
+# ======================================================================
+
+def collinearity(frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, float, float]:
+    """六项指标的共线性 —— 返回 `(拼接后的布尔表, 实际共振率, 独立假设乘积)`
+
+    实际共振率远高于独立假设乘积 ⇒ 六项并不独立，共振并不稀有。
+    """
+    sub = pd.concat([f[list(six_pulse.PULSE_NAMES)] for f in frames], ignore_index=True)
+    ints = sub.astype(int)
+    actual = float((ints.sum(axis=1) == 6).mean())
+    independent = float(ints.mean().prod())
+    return ints, actual, independent
+
+
+def forward_returns(frames: list[pd.DataFrame], horizons=HORIZONS) -> dict:
+    """共振买点后 h 日收益，以及**同标的任意日**的同口径基准
+
+    两端都用「T+1 开盘买入、T+1+h 收盘卖出」，基准是同一只标的上所有可比较
+    起点的同口径收益均值 ⇒ 两者之差即**择时带来的超额**（≈0 就说明没有 alpha）。
+
+    `frames` 为 `six_pulse.compute_indicators()` 的输出（含 OHLC 与信号列）。
+    返回 ``{h: {"n", "codes", "mean", "median", "pos", "base_mean", "excess"}}``；
+    均值与基准按**逐标的等权**，中位/为正占比按合并样本。
+    """
+    all_sig: dict[int, list[float]] = {h: [] for h in horizons}
+    per_code: dict[int, list[tuple[float, float]]] = {h: [] for h in horizons}
+
+    for df in frames:
+        closes = df["close"].to_numpy(dtype=float)
+        opens = df["open"].to_numpy(dtype=float)
+        buy = df["buy_signal"].to_numpy()
+        n = len(df)
+        for h in horizons:
+            sig: list[float] = []
+            base: list[float] = []
+            for i in range(six_pulse.WARMUP, n - 1):
+                j = i + 1 + h
+                if j >= n:
+                    break
+                entry = opens[i + 1]
+                if entry <= 0:
+                    continue
+                r = closes[j] / entry - 1.0
+                base.append(r)
+                if bool(buy[i]):
+                    sig.append(r)
+            if sig and base:
+                all_sig[h].extend(sig)
+                per_code[h].append((float(np.mean(sig)), float(np.mean(base))))
+
+    out: dict[int, dict] = {}
+    for h in horizons:
+        pairs = per_code[h]
+        if not pairs:
+            out[h] = {"n": 0}
+            continue
+        vals = np.asarray(all_sig[h], dtype=float)
+        sig_mean = float(np.mean([p[0] for p in pairs]))
+        base_mean = float(np.mean([p[1] for p in pairs]))
+        out[h] = {
+            "n": len(vals), "codes": len(pairs),
+            "mean": sig_mean, "median": float(np.median(vals)),
+            "pos": float((vals > 0).mean()),
+            "base_mean": base_mean, "excess": sig_mean - base_mean,
+        }
+    return out
+
+
+def exit_sweep(pool_data: list[tuple[str, list[KLineData]]], capital: float) -> list[dict]:
+    """出口对照扫 —— 买点固定，只换出口规则"""
+    variants = [
+        ("MA5", dict(ma_exit=5)), ("MA10（本轮口径）", dict(ma_exit=10)),
+        ("MA20", dict(ma_exit=20)), ("MA30", dict(ma_exit=30)),
+        ("固定持有 10 日", dict(hold_days=10)),
+        ("固定持有 20 日", dict(hold_days=20)),
+        ("固定持有 40 日", dict(hold_days=40)),
+    ]
+    rows: list[dict] = []
+    for label, kw in variants:
+        strat = six_pulse.SixPulseStrategy(**kw)
+        per_code = [eval_one(code, daily, strat, capital) for code, daily in pool_data]
+        st = merge_stats(per_code)
+        st["label"] = label
+        rows.append(st)
+    return rows
+
+
+# ======================================================================
+# 报告
+# ======================================================================
+
+def _pct(v: float, nd: int = 2) -> str:
+    if v == float("inf"):
+        return "∞"
+    return f"{v * 100:+.{nd}f}%"
+
+
+def _pf(v: float) -> str:
+    return "∞" if v == float("inf") else f"{v:.2f}"
+
+
+def render_report(rows: list[dict], frames: list[pd.DataFrame], names: dict[str, str],
+                  head: dict, fwd: dict, sweep: list[dict], args) -> str:
+    st = merge_stats(rows)
+    lines: list[str] = []
+    add = lines.append
+
+    add("# 六脉神剑策略评估")
+    add("")
+    add(f"- 标的池：`{Path(args.pool).name}`（{st['codes']} 只）")
+    add(f"- 数据：日线 {args.days} 根、**前复权**、新浪源"
+        f"（{head['start']} ~ {head['end']}）")
+    add(f"- 资金口径：每只**独立 {args.capital:,.0f} 元满仓**（整手），汇总等权平均")
+    add("- 费用：佣金万 2.5（双边、最低 5 元）、印花税千 1（卖出）")
+    add("- 买点：六指标共振首日（T 收盘确认）→ **T+1 开盘买入**")
+    add("- 卖点：收盘跌破 MA10（T 收盘确认）→ **T+1 开盘卖出**")
+    add("")
+
+    add("## 1. 汇总")
+    add("")
+    add("| 指标 | 策略 | 买入持有（基线） |")
+    add("| --- | --- | --- |")
+    add(f"| 平均区间收益（等权） | **{_pct(st['avg_return'])}** | {_pct(st['avg_buy_hold'])} |")
+    add(f"| 收益为正的标的 | {st['win_codes']} / {st['codes']} | — |")
+    add(f"| 平均最大回撤 | {st['avg_dd']:.2%} | — |")
+    add(f"| 最大回撤（单只最差） | {st['max_dd']:.2%} | — |")
+    add(f"| **在场时间占比** | {st['exposure']:.1%} | 100% |")
+    add("")
+    add(f"**笔级口径**（{st['codes_with_trades']} 只标的有交易、共 {st['trades']} 笔）："
+        f"胜率 **{st['win_rate']:.1%}**、平均每笔 **{_pct(st['avg_pct'])}**、"
+        f"盈亏比 {_pf(st['profit_factor'])}、平均持有 {st['avg_hold']:.1f} 个交易日。")
+    add("")
+    add(f"⚠️ 逐只独立满仓、等权平均 ⇒ **不是组合资金曲线**，收益不可相加。"
+        f"平均持有 {st['avg_hold']:.1f} 日意味着单只一年换手约 "
+        f"{252 / st['avg_hold']:.0f} 次，费用按双边 0.15% 量级计每年磨掉不少。")
+    add("")
+
+    # ---- 诊断 A ----
+    ints, actual, independent = collinearity(frames)
+    add("## 2. 诊断 A：六项指标共线性（共振到底稀不稀有）")
+    add("")
+    add("| 指标 | 多头天数占比 |")
+    add("| --- | --- |")
+    for name in six_pulse.PULSE_NAMES:
+        add(f"| {name} | {ints[name].mean():.1%} |")
+    add("")
+    add(f"- **实际六项共振占比：{actual:.1%}**")
+    add(f"- 若六项相互独立，应有占比：{independent:.2%}")
+    add(f"- 倍数：**{actual / independent:.0f}×**"
+        if independent > 0 else "- 独立假设乘积为 0，无法比较")
+    add("")
+    add("两两相关（同向率）：")
+    add("")
+    add("| | " + " | ".join(six_pulse.PULSE_NAMES) + " |")
+    add("| --- |" + " --- |" * len(six_pulse.PULSE_NAMES))
+    corr = ints.corr()
+    for a in six_pulse.PULSE_NAMES:
+        add(f"| {a} | " + " | ".join(f"{corr.loc[a, b]:.2f}" for b in six_pulse.PULSE_NAMES) + " |")
+    add("")
+
+    # ---- 诊断 B ----
+    add("## 3. 诊断 B：买点有没有 alpha（共振买点 vs 同标的任意日）")
+    add("")
+    add("两端同口径：T+1 开盘买入、T+1+h 收盘卖出。**基准 = 同一只标的所有可比较"
+        "起点的同口径收益均值**，超额 = 买点后均值 − 基准均值。")
+    add("")
+    add("| 持有 | 样本 | 买点后均值 | 中位 | 为正占比 | 任意日起基准 | **超额** |")
+    add("| --- | --- | --- | --- | --- | --- | --- |")
+    for h in HORIZONS:
+        d = fwd.get(h) or {}
+        if not d.get("n"):
+            add(f"| {h} 日 | 0 | -- | -- | -- | -- | -- |")
+            continue
+        add(f"| {h} 日 | {d['n']} | {_pct(d['mean'])} | {_pct(d['median'])} "
+            f"| {d['pos']:.1%} | {_pct(d['base_mean'])} | **{_pct(d['excess'])}** |")
+    add("")
+
+    # ---- 诊断 C ----
+    if sweep:
+        add("## 4. 诊断 C：出口对照扫（买点固定，只换卖出口）")
+        add("")
+        add("| 出口规则 | 笔数 | 胜率 | 平均每笔 | 平均区间收益 | 平均持有 |")
+        add("| --- | --- | --- | --- | --- | --- |")
+        for s in sweep:
+            add(f"| {s['label']} | {s['trades']} | {s['win_rate']:.1%} | {_pct(s['avg_pct'])} "
+                f"| {_pct(s['avg_return'])} | {s['avg_hold']:.1f} 日 |")
+        add("")
+        add("读法：**出口越松、持有越久，成绩越靠近「买入持有」** —— 说明收益主要"
+            "来自在场时间（β）而不是择时（α）；反过来，越紧的出口被震荡与"
+            "双边费用磨损得越狠。若某个方向能显著超过买入持有，才说明这套出口"
+            "真的在创造价值。")
+        add("")
+
+    # ---- 逐标的 ----
+    nxt = 5 if sweep else 4
+    add(f"## {nxt}. 逐标的明细（按区间收益排序）")
+    add("")
+    add("| 代码 | 名称 | 笔数 | 胜率 | 平均每笔 | 区间收益 | 最大回撤 | 平均持有 | 买入持有 |")
+    add("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for r in sorted(rows, key=lambda x: x["total_return"], reverse=True):
+        nm = names.get(r["code"], "")
+        add(f"| {r['code']} | {nm} | {r['trades']} | {r['win_rate']:.0%} | {_pct(r['avg_pct'])} "
+            f"| {_pct(r['total_return'])} | {r['max_dd']:.1%} | {r['avg_hold']:.0f} 日 "
+            f"| {_pct(r['buy_hold'])} |")
+    add("")
+
+    add(f"## {nxt + 1}. 口径与限制")
+    add("")
+    add("- **不是组合回测**：逐只独立满仓、等权平均；同一时点多只出信号时，"
+        "真实组合做不到同时满仓。要看资金曲线得用 `core.backtest.engine` "
+        "接组合层（截至本轮未做）。")
+    add("- **区间长度固定**（`--days`），窗口起点不同结果会变；"
+        "1500 根 ≈ 6 年，覆盖 2021 熊市、2022 弱市、2024-09 后反弹，"
+        "但**只有一个市场样本**，不足以谈稳健性。")
+    add("- **前复权数据**：新浪 `stock_zh_a_daily(adjust=\"qfq\")`，"
+        "历史价格会随分红送股变化，跨日复跑数字可能微调。")
+    add("- 未处理涨跌停无法成交、停牌、退市；整手约束下高价股的资金利用率偏低。")
+    add("- 六项指标口径严格照 `lmsj.txt` 原文，**未做任何参数寻优**。")
+    add("")
+    return "\n".join(lines)
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="六脉神剑策略批量评估",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--pool", default=str(DEFAULT_POOL), help="标的池文件")
+    p.add_argument("--days", type=int, default=1500, help="每只取多少根日线（默认 1500）")
+    p.add_argument("--capital", type=float, default=DEFAULT_CAPITAL, help="单只初始资金")
+    p.add_argument("--codes", default="", help="只跑指定代码（逗号分隔）")
+    p.add_argument("--limit", type=int, default=0, help="只跑前 N 只（调试用）")
+    p.add_argument("--cache-dir", default=str(DAILY_CACHE), help="日线缓存目录")
+    p.add_argument("--cache-days", type=int, default=0, help="吃 N 天内的旧缓存（默认 0=只认今天）")
+    p.add_argument("--no-cache", action="store_true", help="忽略缓存，强制重新取数")
+    p.add_argument("--sleep", type=float, default=1.0, help="取数后的间隔秒数")
+    p.add_argument("--attempts", type=int, default=3, help="单只取数重试次数")
+    p.add_argument("--no-sweep", action="store_true", help="跳过出口对照扫")
+    p.add_argument("--out", default="", help="报告输出路径（默认 outputs/six_pulse.md）")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    pool = load_pool(Path(args.pool))
+    if args.codes:
+        want = {chan_viz.normalize_code(c) for c in args.codes.split(",") if c.strip()}
+        pool = [x for x in pool if x[0] in want]
+    if args.limit:
+        pool = pool[: args.limit]
+    if not pool:
+        print("标的池为空")
+        return 1
+
+    names = {code: nm for code, nm in pool}
+    pool_data: list[tuple[str, list[KLineData]]] = []
+    rows: list[dict] = []
+    frames: list[pd.DataFrame] = []
+    failures: list[tuple[str, str]] = []
+    head = {"start": "", "end": ""}
+
+    strat = six_pulse.SixPulseStrategy()
+    print(f"标的池 {len(pool)} 只 | 日线 {args.days} 根 | 资金 {args.capital:,.0f} | 出口 MA10")
+
+    for i, (code, nm) in enumerate(pool, 1):
+        try:
+            daily, cached = load_daily(code, args.days, cache_dir=Path(args.cache_dir),
+                                       use_cache=not args.no_cache,
+                                       cache_days=args.cache_days,
+                                       attempts=args.attempts, polite_sleep=args.sleep)
+        except Exception as exc:                       # noqa: BLE001
+            failures.append((code, str(exc)))
+            print(f"  [{i}/{len(pool)}] {code} {nm} 取数失败：{exc}")
+            continue
+
+        row = eval_one(code, daily, strat, args.capital)
+        rows.append(row)
+        pool_data.append((code, daily))
+        frames.append(six_pulse.compute_indicators(six_pulse.to_frame(daily)))
+        if not head["start"]:
+            head["start"], head["end"] = row["start"], row["end"]
+        flag = "缓存" if cached else "取数"
+        print(f"  [{i}/{len(pool)}] {code} {nm} {flag} {row['bars']}根 "
+              f"笔数={row['trades']} 区间收益={row['total_return']:+.2%}")
+
+    if not rows:
+        print("没有任何标的数据，无法出报告")
+        return 1
+
+    print("诊断：买点前瞻收益 …")
+    fwd = forward_returns(frames)
+
+    sweep: list[dict] = []
+    if not args.no_sweep:
+        print("诊断：出口对照扫（7 种出口规则，只走本地缓存）…")
+        sweep = exit_sweep(pool_data, args.capital)
+
+    report = render_report(rows, frames, names, head, fwd, sweep, args)
+    out = Path(args.out) if args.out else ROOT / "outputs" / "six_pulse.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report, encoding="utf-8")
+
+    st = merge_stats(rows)
+    print()
+    print(f"汇总：{st['codes']} 只（{st['codes_with_trades']} 只有交易）/ {st['trades']} 笔 | "
+          f"胜率 {st['win_rate']:.1%} | 平均每笔 {st['avg_pct']:+.2%} | "
+          f"平均区间收益 {st['avg_return']:+.2%}（买入持有 {st['avg_buy_hold']:+.2%}）")
+    if failures:
+        print(f"⚠️ 取数失败 {len(failures)} 只：" + ", ".join(c for c, _ in failures))
+    print(f"报告：{out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
