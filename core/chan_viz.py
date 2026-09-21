@@ -19,7 +19,7 @@
 | 策略日线条件 | `chan_points` 几何 | 竖线：日线一买 / 日线二买「生效日」（笔终点次日） |
 | 策略买卖点 | `chan_strategy.scan` | 三重共振触发 + 均线卖出（几何源，默认） |
 | 策略命中二买 | `chan_strategy` | 被策略真正用到的那个 30 分钟二买 bar |
-| 六脉买点 / 卖点 | `core/six_pulse.py` | **独立策略**（六指标共振 + MA10 出口），日线级别，菱形标记 |
+| 六脉买点 / 卖点 | `core/six_pulse.py` | **独立策略**（六指标共振 + 分级出口），日线级别，菱形标记，轮级 |
 
 ======================================================================
 三条必须在图上说清楚的口径（否则图会骗人）
@@ -67,8 +67,12 @@
 
    2026-09-20 老三要求「两套策略的买卖点画在一起比较好比较」。要点：
 
-   - 它**不参与**缠论那套结构，买点来自 `six_pulse` 的六指标共振首日，
-     卖点来自跌破 MA10 —— 与缠论的三重共振/均线出口是两套独立的判定。
+   - 它**不参与**缠论那套结构，买点来自 `six_pulse` 的六指标共振首日
+     （默认还要求收盘站上 MA20），卖点来自**破 MA20 清仓** ——
+     与缠论的三重共振/均线出口是两套独立的判定。
+   - 只画**轮级**的建仓 / 清仓两个点，分级出口里「破 MA5 减半」与
+     「站回 MA10 回补」这两条半仓腿**不落点**（见 `build_payload` 5b 段注释；
+     早先按一买一卖配对会把减半当成整笔卖出）。
    - 为了 X 轴严格可比，六脉用的是**同一份合成日线**（30 分钟聚合而来，
      约 247 个交易日），**不是**评估报告里那 1500 根日线。因此图上的六脉
      样本远少于 `outputs/six_pulse.md`，前 `six_pulse.WARMUP`（60）根
@@ -527,7 +531,15 @@ def build_payload(
     # 成交口径与 `six_pulse.SixPulseStrategy` 一致（T 日收盘确认 → T+1
     # **开盘**成交）⇒ 买卖点都标**当日首根** bar。注意这与缠论策略不同：
     # 缠论买点同样在开盘（首根），但卖点按当日**收盘**成交、标末根。
-    # 未平仓的最后一笔不造卖点（同 marks_from_payload 的「空 = 未平仓」约定）。
+    #
+    # ⚠️ 2026-09-21 改口径：默认出口是**分级**（破 MA5 减半 / 站回 MA10 回补 /
+    # 破 MA20 清仓）。这里只画**轮级**的两个点 —— 建仓与清仓，
+    # **减半和回补不落点**：一是这张图是拿来跟缠论买点比**位置**的，
+    # 半仓腿只是同一轮的噪音；二是早先按"一买一卖配对"的写法会把
+    # `weight=0.5` 的减半当成整笔卖出（连收益都算错），
+    # 跨出口的绩效只能看轮级（见 `core/backtest/engine.Trade.episode`）。
+    # `return_pct` 用**现金流口径**：Σ(卖出 w×价) / Σ(买入 w×价) − 1，
+    # 单笔进出时与价格收益率一致，有减半/回补时也不会像"首尾价相除"那样失真。
     six_trades: list[dict] = []
     if len(daily_df) >= six_pulse.WARMUP + 2:
         sigs = six_pulse.SixPulseStrategy().generate_signals(
@@ -537,22 +549,34 @@ def build_payload(
             i = _day_first_idx(sg.date)
             if i < 0:
                 continue
+            w = float(getattr(sg, "weight", 1.0) or 1.0)
+            px = float(sg.price)
             if sg.action == Action.BUY:
-                cur = {"buy_idx": i, "buy_dt": str(sg.date)[:10],
-                       "buy_price": round(float(sg.price), 3),
-                       "sell_idx": None, "sell_dt": "", "sell_price": None,
-                       "return_pct": None}
-                six_trades.append(cur)
+                if cur is None:
+                    cur = {"buy_idx": i, "buy_dt": str(sg.date)[:10],
+                           "buy_price": round(px, 3),
+                           "sell_idx": None, "sell_dt": "", "sell_price": None,
+                           "return_pct": None, "reduces": 0, "reentries": 0,
+                           "cash_in": 0.0, "cash_out": 0.0}
+                    six_trades.append(cur)
+                cur["cash_in"] += w * px
+                if w < 1.0:
+                    cur["reentries"] += 1
             elif sg.action == Action.SELL and cur is not None:
-                cur["sell_idx"] = i
-                cur["sell_dt"] = str(sg.date)[:10]
-                cur["sell_price"] = round(float(sg.price), 3)
-                if cur["buy_price"]:
-                    cur["return_pct"] = round(
-                        (cur["sell_price"] / cur["buy_price"] - 1) * 100, 2)
-                cur = None
-    logger.info(f"{code}: 六脉神剑 买点 {len(six_trades)} 次"
-                f"（图内合成日线 {len(daily_df)} 根，预热 {six_pulse.WARMUP} 根）")
+                cur["cash_out"] += w * px
+                if w >= 1.0:                       # 破 MA20 清仓 ⇒ 这一轮结束
+                    cur["sell_idx"] = i
+                    cur["sell_dt"] = str(sg.date)[:10]
+                    cur["sell_price"] = round(px, 3)
+                    if cur["cash_in"] > 0:
+                        cur["return_pct"] = round(
+                            (cur["cash_out"] / cur["cash_in"] - 1) * 100, 2)
+                    cur = None
+                else:                              # 破 MA5 减半 ⇒ 不落点、只计数
+                    cur["reduces"] += 1
+    logger.info(f"{code}: 六脉神剑 轮级买点 {len(six_trades)} 次"
+                f"（图内合成日线 {len(daily_df)} 根，预热 {six_pulse.WARMUP} 根；"
+                f"减半/回补不落点）")
 
     # ---- 6. 默认视窗 ----
     # 铺满全量：主图层是**日线**级别的中枢与买卖点（一个中枢跨数月、一年
@@ -620,7 +644,8 @@ def build_payload(
             "m30_hits": m30_hits,
             "trades": trades,
         },
-        # 六脉神剑：独立策略（六指标共振 + MA10 出口），日线级别。
+        # 六脉神剑：独立策略（六指标共振 + 分级出口：MA5 半 / MA10 回补 / MA20 清），
+        # 日线级别。`buys`/`sells` 是**轮级**的建仓/清仓点，半仓腿不落点。
         # `warmup_bars` 是它在这份合成日线上的预热根数 —— 图上那段不会有点。
         "six_pulse": {
             "warmup_bars": six_pulse.WARMUP,
@@ -655,7 +680,8 @@ def marks_from_payload(payload: dict) -> dict:
     - ``geometry``：日线级别的几何买卖点（一/二/三 买与卖）—— 与 HTML 图上
       的「日线买卖点」是同一批点
     - ``trades``：策略实际成交（`chan_strategy` 三重共振买入 + 均线卖出）
-    - ``six_pulse``：**独立策略**六脉神剑的成交（六指标共振买入 + 破 MA10 卖出），
+    - ``six_pulse``：**独立策略**六脉神剑**轮级**的建仓 / 清仓（六指标共振站上
+      MA20 买入 + 破 MA20 清仓；破 MA5 减半与站回 MA10 回补是轮内半仓腿，不落点），
       与 ``trades`` 不同源；画在同一张图上只作位置对照，两者的买卖点不要混读
     - 两处的 ``sell_date`` 为空串 = 数据末尾仍未平仓（收益也是 None）
     """
@@ -1056,8 +1082,10 @@ var option = {
           s += '<div style="margin-top:4px;padding-top:4px;' +
                'border-top:1px dashed #ccc">' +
                '<b style="color:' + ST.six_buy + '">六脉买点</b> @' +
-               x.buy_price + '<br/><span style="color:#888">六指标共振首日 → ' +
+               x.buy_price + '<br/><span style="color:#888">六指标共振首日（且站上 MA20）→ ' +
                '次日开盘买入</span>' +
+               (x.reentries ? '<br/><span style="color:#888">轮内回补 ' +
+                              x.reentries + ' 次（不落点）</span>' : '') +
                (x.sell_dt ? '' : '<br/><span style="color:#888">（数据末尾仍未平仓）</span>') +
                '</div>';
         }
@@ -1066,8 +1094,10 @@ var option = {
                'border-top:1px dashed #ccc">' +
                '<b style="color:' + ST.six_sell + '">六脉卖点</b> @' +
                x.sell_price +
-               (x.return_pct == null ? '' : '<br/>本笔 ' +
-                (x.return_pct >= 0 ? '+' : '') + x.return_pct + '%') +
+               '<br/><span style="color:#888">破 MA20 清仓' +
+               (x.reduces ? '（轮内曾减半 ' + x.reduces + ' 次）' : '') + '</span>' +
+               (x.return_pct == null ? '' : '<br/>本轮 ' +
+                (x.return_pct >= 0 ? '+' : '') + x.return_pct + '%（现金流口径）') +
                '</div>';
         }
       });
@@ -1201,7 +1231,9 @@ def render_html(payload: dict, echarts_path: Optional[str] = None) -> str:
         "这是为了先把「信号本身对不对」验清楚，资金约束留到组合回测再接。</li>"
         "<li><b>菱形标记是六脉神剑，另一套独立策略，只借这张图比位置。</b>"
         "买点＝六个指标（MACD / KDJ / RSI / LWR / BBI / MTM，原文见 "
-        "<code>lmsj.txt</code>）同一天全部转多的第一天，卖点＝跌破日线 MA10；"
+        "<code>lmsj.txt</code>）同一天全部转多、<b>且收盘站上 MA20</b> 的第一天；"
+        "卖点＝<b>破 MA20 清仓</b>那一天（分级出口里「破 MA5 减半 / 站回 MA10 回补」"
+        "是轮内的半仓腿，<b>不落点</b> —— 跨出口的绩效只能按轮看）。"
         "同样是 T 日收盘确认、<b>T+1 开盘</b>成交。它<b>不参与</b>缠论结构，"
         "两者买卖点不要混读。图上它用的是<b>同一份合成日线</b>（约 247 个交易日），"
         "前 60 根是指标预热区、不出信号 —— 因此这里看到的六脉样本远少于"
