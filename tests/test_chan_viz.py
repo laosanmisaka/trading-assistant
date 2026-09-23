@@ -203,8 +203,11 @@ def test_payload_indices_in_range(payload):
         assert price > 0
     for level in ("daily", "m30"):
         for arr in payload["points"][level].values():
-            for idx, price in arr:
+            for pt in arr:
+                idx, price = pt[0], pt[1]   # 第三元素是可选的背驰标注
                 assert 0 <= idx < n and price > 0
+                if len(pt) > 2:
+                    assert pt[2] in (0, 1)  # 背驰标注只能是 0 / 1
 
 
 def test_payload_centers_two_levels(payload):

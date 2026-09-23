@@ -212,6 +212,12 @@ SOURCE_GEOMETRY = "geometry"    # chan_points 几何判定（默认）
 # 无意义计算（避免"跑通了但永远 0 笔"这种更难查的症状）。
 GEO_MIN_BARS = 480
 
+# 一买 / 一卖是否要求 MACD 面积背驰确认（`core.chan_points.buy_sell_points`
+# 的 require_divergence）。默认开：几何判定放宽了「≥2 中枢」的要求，
+# 背驰过滤是补偿 —— 把「力度未衰竭的下跌中继」从一买里剔掉。
+# 无法判定（bar 数据缺失）的候选保留，不误杀。
+DEFAULT_REQUIRE_DIVERGENCE = True
+
 _FIRST_BUY_SIGNAL = "cxt_first_buy_V221126"
 _SECOND_BS_SIGNAL = "cxt_second_bs_V230320"
 
@@ -651,6 +657,9 @@ def points_from_structures(
     dt_list,
     *,
     confirm_offset: int = 1,
+    bars_m30=None,
+    bars_daily=None,
+    require_divergence: bool = DEFAULT_REQUIRE_DIVERGENCE,
 ) -> GeoPoints:
     """从**已算好的**缠论结构推三级点事件（纯函数，不碰 czsc）
 
@@ -665,6 +674,9 @@ def points_from_structures(
     days     : 与 30 分钟帧**等长**的交易日（date 对象，允许重复）
     day_list : 去重升序的交易日（date 对象）
     dt_list  : 与 30 分钟帧**等长**的 Timestamp（用于把笔终点映射回 bar 下标）
+    bars_m30 / bars_daily : 两级各自的 bar 行情（DataFrame，含 dt/close），
+               供一买/一卖的 MACD 面积背驰判定；不传则背驰退化为「无法判定」
+    require_divergence : 一买/一卖是否要求背驰确认（不过滤二买/三买）
     """
     from core import chan_points
 
@@ -676,7 +688,9 @@ def points_from_structures(
         pts.counts[key] = pts.counts.get(key, 0) + 1
 
     # 日线级：一买 / 二买，延后到次一交易日生效
-    for p in chan_points.buy_sell_points(bis_daily, centers_daily):
+    for p in chan_points.buy_sell_points(bis_daily, centers_daily,
+                                         bars=bars_daily,
+                                         require_divergence=require_divergence):
         tally("日线", p)
         if p["kind"] not in ("一买", "二买"):
             continue
@@ -689,7 +703,9 @@ def points_from_structures(
             pts.d2_days.append(d)
 
     # 30 分钟级：二买，按 bar 时刻直接生效
-    for p in chan_points.buy_sell_points(bis_m30, centers_m30):
+    for p in chan_points.buy_sell_points(bis_m30, centers_m30,
+                                         bars=bars_m30,
+                                         require_divergence=require_divergence):
         tally("30分", p)
         if p["kind"] != "二买":
             continue
@@ -708,6 +724,7 @@ def points_from_chan(
     code: str = "",
     *,
     confirm_offset: int = 1,
+    require_divergence: bool = DEFAULT_REQUIRE_DIVERGENCE,
 ) -> GeoPoints:
     """用几何判定（`core.chan_points`）产出三级点事件 —— 替代 `cxt_*` 信号
 
@@ -758,7 +775,9 @@ def points_from_chan(
         chan_mod.centers(cr) if cr else [],
         chan_mod.bis(cr_d) if cr_d else [],
         chan_mod.centers(cr_d) if cr_d else [],
-        days, day_list, dt_list, confirm_offset=confirm_offset)
+        days, day_list, dt_list, confirm_offset=confirm_offset,
+        bars_m30=df, bars_daily=daily_df,
+        require_divergence=require_divergence)
     pts.daily_bars = len(daily_df)
     return pts
 
@@ -781,6 +800,7 @@ def scan(
     init_n: int = DEFAULT_INIT_N,
     entry_delay_bars: int = 1,
     exit_delay_days: int = 1,
+    require_divergence: bool = DEFAULT_REQUIRE_DIVERGENCE,
 ) -> ScanResult:
     """对一只股票的 30 分钟 K 线跑完整策略，返回买点/卖点与诊断信息
 
@@ -801,7 +821,8 @@ def scan(
                 f"不足（geometry 源需 ≥ {GEO_MIN_BARS} 根 ≈ "
                 f"{GEO_MIN_BARS // 8} 个交易日，否则日线形不成中枢）")
             return result
-        pts = points_from_chan(klines, df, code)
+        pts = points_from_chan(klines, df, code,
+                               require_divergence=require_divergence)
         logger.info(
             f"缠论多周期策略 {code}：几何源，30 分钟 {len(df)} 根 / "
             f"日线 {pts.daily_bars} 根，点事件 {pts.counts}")

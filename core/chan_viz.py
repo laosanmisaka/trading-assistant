@@ -383,9 +383,12 @@ def build_payload(
         logger.warning(f"{code}: 缠论结构算不出来（K 线不足）")
 
     pts_m30: list[dict] = []
-    for p in chan_points.buy_sell_points(bis_raw, centers_raw):
+    for p in chan_points.buy_sell_points(
+            bis_raw, centers_raw, bars=df,
+            require_divergence=chan_strategy.DEFAULT_REQUIRE_DIVERGENCE):
         i = _nearest_idx(p["dt"], dt_list, dt_keys)
-        pts_m30.append({"kind": p["kind"], "idx": i, "price": p["price"]})
+        pts_m30.append({"kind": p["kind"], "idx": i, "price": p["price"],
+                        "divergence": p.get("divergence")})
 
     # ---- 2. 日线缠论结构 + 几何买卖点（映射回 30 分钟下标） ----
     daily_df = _resample_daily(df)
@@ -394,14 +397,17 @@ def build_payload(
     if len(daily_df) >= 3:
         cr_d = chan_mod.build(_to_klines(daily_df, "daily", code), period="daily")
         if cr_d:
-            for p in chan_points.buy_sell_points(chan_mod.bis(cr_d),
-                                                 chan_mod.centers(cr_d)):
+            for p in chan_points.buy_sell_points(
+                    chan_mod.bis(cr_d), chan_mod.centers(cr_d),
+                    bars=daily_df,
+                    require_divergence=chan_strategy.DEFAULT_REQUIRE_DIVERGENCE):
                 side = "buy" if p["kind"].endswith("买") else "sell"
                 i = _daily_point_to_bar(p["dt"], p["price"], side,
                                         day_range, lo, h)
                 if i >= 0:
                     pts_daily.append({"kind": p["kind"], "idx": i,
-                                      "price": p["price"]})
+                                      "price": p["price"],
+                                      "divergence": p.get("divergence")})
     logger.info(f"{code}: 几何买卖点 日线 {len(pts_daily)} 个 / "
                 f"30 分钟 {len(pts_m30)} 个（笔 {len(bis_raw)}、"
                 f"30 分钟中枢 {len(centers_raw)}）")
@@ -409,7 +415,13 @@ def build_payload(
     def pack(points: list[dict]) -> dict:
         g: dict[str, list] = {k: [] for k in chan_points.KINDS}
         for p in points:
-            g[p["kind"]].append([p["idx"], round(float(p["price"]), 3)])
+            item = [p["idx"], round(float(p["price"]), 3)]
+            # 一买/一卖的背驰标注：1=背驰确认 0=未背驰；未判定/不适用则省略，
+            # 保持 [idx, price] 两元素旧格式（下游按 p[0]/p[1] 取值，兼容）
+            div = p.get("divergence")
+            if div is not None:
+                item.append(1 if div else 0)
+            g[p["kind"]].append(item)
         return {k: v for k, v in g.items() if v}
 
     # ---- 3. 中枢 / 笔 / 分型 ----
@@ -480,7 +492,8 @@ def build_payload(
         bis_raw, centers_raw,
         chan_mod.bis(cr_d) if cr_d else [],
         chan_mod.centers(cr_d) if cr_d else [],
-        days, sorted(set(days)), dt_list)
+        days, sorted(set(days)), dt_list,
+        bars_m30=df, bars_daily=daily_df)
     strat = chan_strategy.scan_from_frame(
         df, code=code, source=chan_strategy.SOURCE_GEOMETRY, points=geo,
         ma_short=ma_short, ma_long=ma_long)
@@ -688,7 +701,8 @@ def marks_from_payload(payload: dict) -> dict:
     dates = payload.get("dates") or []
     geo: list[dict] = []
     for kind, points in (payload.get("points", {}).get("daily") or {}).items():
-        for idx, price in points:
+        for p in points:
+            idx, price = p[0], p[1]      # 第三元素（背驰标注）UI 标注不用
             if 0 <= idx < len(dates):
                 geo.append({"date": str(dates[idx])[:10], "kind": kind,
                             "price": float(price)})
@@ -804,7 +818,10 @@ var markAt = {};
   Object.keys(g).forEach(function (k) {
     g[k].forEach(function (p) {
       var i = p[0];
-      (markAt[i] = markAt[i] || []).push((lv === 'daily' ? '日线' : '30分') + k);
+      var label = (lv === 'daily' ? '日线' : '30分') + k;
+      // 第三元素是一买/一卖的背驰标注（1=背驰确认 0=未背驰）
+      if (p.length > 2) { label += p[2] ? '（背驰）' : '（未背驰）'; }
+      (markAt[i] = markAt[i] || []).push(label);
     });
   });
 });

@@ -326,3 +326,130 @@ def test_bi_idx_points_back_to_source_bi():
     ]
     for p in buy_sell_points(bis, centers):
         assert bis[p["bi_idx"]]["edt"] == p["dt"]
+
+
+# ----------------------------------------------------------------------
+# MACD 面积背驰（一买 / 一卖）
+# ----------------------------------------------------------------------
+
+from core.chan_points import bi_macd_areas, is_divergence
+
+
+def bars_from(closes, start="2024-01-01"):
+    """dict 形态 bar 序列（dt + close），供背驰判定"""
+    return [{"dt": d, "close": c} for d, c in
+            zip(pd.date_range(start, periods=len(closes), freq="D"), closes)]
+
+
+# 两段下跌：第一段急跌到 96（绿柱面积大），第二段缓跌到 94（面积缩小=背驰）
+DIV_BUY_CLOSES = ([108.0] * 4
+                  + [110, 108, 105, 102, 100, 98, 97, 96]       # 1/5-1/12 急跌
+                  + [99, 101, 103, 104, 105]                    # 1/13-1/17 回升
+                  + [103, 101, 99, 97.5, 96, 95, 94])           # 1/18-1/24 缓跌
+# 第二段改为暴跌到 85，绿柱面积反而更大（力度未衰竭 = 未背驰）
+NODIV_BUY_CLOSES = ([108.0] * 4
+                    + [110, 108, 105, 102, 100, 98, 97, 96]
+                    + [99, 101, 103, 104, 105]
+                    + [100, 95, 92, 90, 88, 86, 85])            # 1/18-1/24 暴跌
+
+
+def div_buy_bis(low2: float):
+    return [
+        bi("Down", "2024-01-05", "2024-01-12", 110, 96),
+        bi("Up",   "2024-01-12", "2024-01-17", 105, 96),
+        bi("Down", "2024-01-17", "2024-01-24", 105, low2),
+    ]
+
+
+def test_first_buy_divergence_confirmed():
+    """价格新低但 MACD 绿柱面积缩小 → 背驰确认的一买"""
+    centers = [zs("2024-01-01", "2024-01-04", 100, 105)]
+    pts = buy_sell_points(div_buy_bis(94), centers,
+                          bars=bars_from(DIV_BUY_CLOSES),
+                          require_divergence=True)
+    fb = pick(pts, "一买")
+    assert fb["price"] == 94 and fb["divergence"] is True
+
+
+def test_first_buy_without_divergence_filtered():
+    """价格新低但下跌力度更大 → 未背驰，require_divergence=True 时过滤掉"""
+    centers = [zs("2024-01-01", "2024-01-04", 100, 105)]
+    bis = div_buy_bis(85)
+    bars = bars_from(NODIV_BUY_CLOSES)
+    # 开过滤：85 那根未背驰被滤掉，只剩 96 那根（无前置笔，无法判定 → 保留）
+    pts = buy_sell_points(bis, centers, bars=bars, require_divergence=True)
+    fb = pick(pts, "一买")
+    assert fb["price"] == 96 and fb["divergence"] is None
+    # 关过滤：恢复旧行为，收敛取最低 85，且 divergence 字段如实标注 False
+    pts = buy_sell_points(bis, centers, bars=bars, require_divergence=False)
+    fb = pick(pts, "一买")
+    assert fb["price"] == 85 and fb["divergence"] is False
+
+
+def test_divergence_not_judged_without_bars():
+    """不传 bars 时背驰退化为「无法判定」，require_divergence=True 也不误杀"""
+    centers = [zs("2024-01-01", "2024-01-04", 100, 105)]
+    pts = buy_sell_points(div_buy_bis(94), centers, require_divergence=True)
+    fb = pick(pts, "一买")
+    assert fb["price"] == 94 and fb["divergence"] is None
+
+
+# 卖点侧镜像：第一段急涨到 112（红柱面积大），第二段缓涨到 114（背驰）/
+# 暴涨到 130（未背驰）
+DIV_SELL_CLOSES = ([98.0] * 4
+                   + [100, 103, 106, 108, 110, 111, 112, 112]   # 1/5-1/12 急涨
+                   + [110, 109, 108, 108, 108]                  # 1/13-1/17 回落
+                   + [109, 110, 111, 111.5, 112, 113, 114])     # 1/18-1/24 缓涨
+NODIV_SELL_CLOSES = ([98.0] * 4
+                     + [100, 103, 106, 108, 110, 111, 112, 112]
+                     + [110, 109, 108, 108, 108]
+                     + [114, 118, 121, 124, 126, 128, 130])     # 1/18-1/24 暴涨
+
+
+def div_sell_bis(high2: float):
+    return [
+        bi("Up",   "2024-01-05", "2024-01-12", 112, 98),
+        bi("Down", "2024-01-12", "2024-01-17", 112, 108),
+        bi("Up",   "2024-01-17", "2024-01-24", high2, 108),
+    ]
+
+
+def test_first_sell_divergence_confirmed():
+    centers = [zs("2024-01-01", "2024-01-04", 100, 105)]
+    pts = buy_sell_points(div_sell_bis(114), centers,
+                          bars=bars_from(DIV_SELL_CLOSES),
+                          require_divergence=True)
+    fs = pick(pts, "一卖")
+    assert fs["price"] == 114 and fs["divergence"] is True
+
+
+def test_first_sell_without_divergence_filtered():
+    centers = [zs("2024-01-01", "2024-01-04", 100, 105)]
+    pts = buy_sell_points(div_sell_bis(130), centers,
+                          bars=bars_from(NODIV_SELL_CLOSES),
+                          require_divergence=True)
+    fs = pick(pts, "一卖")
+    assert fs["price"] == 112 and fs["divergence"] is None
+
+
+def test_bi_macd_areas_none_without_bars():
+    assert bi_macd_areas(div_buy_bis(94), None) is None
+    assert is_divergence(None, 0, 1) is None
+
+
+def test_second_third_points_unaffected_by_divergence():
+    """背驰检查只直接作用于一买/一卖 —— 二买/三买不是背驰点，不加过滤
+
+    用背驰成立的数据（两种模式下一买都收敛到同一根笔），其后的向下笔
+    低点 95 > 一买 94 → 二买在两种模式下都应正常判出，且不带背驰标注。
+    """
+    centers = [zs("2024-01-01", "2024-01-04", 100, 105)]
+    bis = div_buy_bis(94) + [bi("Up", "2024-01-24", "2024-01-28", 100, 94),
+                             bi("Down", "2024-01-28", "2024-01-31", 100, 95)]
+    bars = bars_from(DIV_BUY_CLOSES + [95, 97, 99, 100] + [99, 97, 96, 95])
+    pts_on = buy_sell_points(bis, centers, bars=bars, require_divergence=True)
+    pts_off = buy_sell_points(bis, centers, bars=bars, require_divergence=False)
+    assert count(pts_on, "一买") == count(pts_off, "一买") == 1
+    assert count(pts_on, "二买") == count(pts_off, "二买") == 1
+    sb = pick(pts_on, "二买")
+    assert sb["price"] == 95 and sb["divergence"] is None
