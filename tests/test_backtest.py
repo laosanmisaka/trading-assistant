@@ -9,6 +9,8 @@
 """
 import datetime as dt
 
+import pandas as pd
+
 import pytest
 
 from data.models import KLineData
@@ -214,3 +216,156 @@ def test_fake_chan_entry_hooks_are_gone():
     assert hasattr(tech, "detect_top_fractal")
     assert hasattr(tech, "kline_to_arrays")
     assert hasattr(tech, "find_stop_loss_price")
+
+
+# ============================================================
+# 按信号分类胜率 / 权益曲线
+# ============================================================
+
+def test_win_rate_by_kind_groups_trades():
+    """同一策略里不同 kind 的买入信号，胜率要分开统计"""
+    daily = make_daily([10.0] * 10)
+    sigs = [
+        Signal(date=daily[1].date, action=Action.BUY, price=10.0, kind="一买"),
+        Signal(date=daily[3].date, action=Action.SELL, price=11.0, kind="一卖"),
+        Signal(date=daily[5].date, action=Action.BUY, price=10.0, kind="二买"),
+        Signal(date=daily[7].date, action=Action.SELL, price=9.0, kind="二卖"),
+    ]
+    report = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy(sigs), "000001", daily)
+
+    assert [t.signal_kind for t in report.trades] == ["一买", "二买"]
+    by_kind = report.win_rate_by_kind()
+    assert by_kind["一买"]["trades"] == 1 and by_kind["一买"]["wins"] == 1
+    assert by_kind["一买"]["win_rate"] == 1.0
+    assert by_kind["二买"]["trades"] == 1 and by_kind["二买"]["wins"] == 0
+    assert by_kind["二买"]["win_rate"] == 0.0
+    assert "分类胜率" in report.format()
+
+
+def test_untagged_trades_grouped_as_unmarked():
+    daily = make_daily([10.0] * 6)
+    sigs = [
+        Signal(date=daily[1].date, action=Action.BUY, price=10.0),
+        Signal(date=daily[3].date, action=Action.SELL, price=11.0),
+    ]
+    report = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy(sigs), "000001", daily)
+    by_kind = report.win_rate_by_kind()
+    assert set(by_kind) == {"未标注"}
+    # 全是未标注时不打印分类段（没有意义）
+    assert "分类胜率" not in report.format()
+
+
+def test_equity_curve_and_dates_recorded():
+    daily = make_daily([10.0, 10.0, 11.0, 12.0])
+    report = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy([]), "000001", daily)
+    assert len(report.equity_curve) == len(daily)
+    assert report.equity_dates == [k.date for k in daily]
+    # 无持仓时权益恒为初始资金
+    assert all(e == pytest.approx(10000.0) for e in report.equity_curve)
+
+
+# ============================================================
+# 缠论买卖点适配器（注入点序列，不依赖 czsc）
+# ============================================================
+
+from core.backtest.chan_adapter import ChanPointStrategy
+
+
+def _pt(kind, date, price=10.0):
+    return {"kind": kind, "dt": pd.Timestamp(date), "price": price,
+            "bi_idx": 0, "direction": "Down", "divergence": None}
+
+
+def test_chan_adapter_maps_points_to_signals():
+    daily = make_daily([10.0] * 10)
+    points = [_pt("一买", "2020-01-02"), _pt("二买", "2020-01-04"),
+              _pt("一卖", "2020-01-06", 12.0), _pt("三卖", "2020-01-08", 13.0)]
+    sigs = ChanPointStrategy(points).generate_signals(daily)
+
+    assert [s.action for s in sigs] == [Action.BUY, Action.BUY,
+                                        Action.SELL, Action.SELL]
+    # confirm_offset=1：点确认后次一交易日成交，价格为当日收盘价
+    assert [s.date for s in sigs] == ["2020-01-03", "2020-01-05",
+                                      "2020-01-07", "2020-01-09"]
+    assert all(s.price == 10.0 for s in sigs)
+    assert [s.kind for s in sigs] == ["一买", "二买", "一卖", "三卖"]
+    assert sigs[0].reason == "缠论一买"
+
+
+def test_chan_adapter_drops_points_without_fill_day():
+    """数据末尾的点：确认延后期内没有可成交日 → 丢弃"""
+    daily = make_daily([10.0] * 5)          # 最后一日 2020-01-05
+    points = [_pt("一买", "2020-01-05")]    # +1 交易日已越界
+    assert ChanPointStrategy(points).generate_signals(daily) == []
+
+
+def test_chan_adapter_non_trading_day_falls_to_next():
+    """点的日期不在日线里（非交易日）→ 先落到其后第一个交易日，再延后"""
+    daily = make_daily([10.0] * 10)
+    daily = [k for k in daily if k.date != "2020-01-04"]  # 挖掉一天模拟非交易日
+    points = [_pt("一买", "2020-01-04")]
+    sigs = ChanPointStrategy(points).generate_signals(daily)
+    # bisect 落到 2020-01-05，再 +1 → 2020-01-06
+    assert sigs[0].date == "2020-01-06"
+
+
+def test_chan_adapter_end_to_end_with_engine():
+    """买卖点 → 引擎：一笔一买买进、一卖卖出，signal_kind 落到交易上"""
+    closes = [10.0] * 3 + [12.0] * 3 + [10.0] * 4
+    daily = make_daily(closes)
+    points = [_pt("一买", "2020-01-01"), _pt("一卖", "2020-01-04", 12.0)]
+    report = BacktestEngine(initial_capital=10000.0).run_on_data(
+        ChanPointStrategy(points), "000001", daily)
+
+    assert report.total_trades == 1
+    t = report.trades[0]
+    assert t.signal_kind == "一买"
+    # 买入 2020-01-02 @10，卖出 2020-01-05（一卖+1）@12
+    assert t.entry_date == "2020-01-02" and t.exit_date == "2020-01-05"
+    assert t.profit > 0
+    assert report.win_rate_by_kind()["一买"]["win_rate"] == 1.0
+
+
+# ============================================================
+# 报告图表（core/backtest/viz.py）
+# ============================================================
+
+def test_report_figure_has_two_panels_and_marks():
+    from core.backtest.viz import render_report_figure
+
+    daily = make_daily([10.0, 10.5, 11.0, 10.8, 11.5] * 4)
+    sigs = [
+        Signal(date=daily[1].date, action=Action.BUY, price=10.5, kind="一买"),
+        Signal(date=daily[8].date, action=Action.SELL, price=11.5, kind="一卖"),
+    ]
+    report = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy(sigs), "000001", daily)
+    marks = [{"date": daily[1].date, "kind": "一买", "price": 10.5},
+             {"date": daily[8].date, "kind": "一卖", "price": 11.5},
+             {"date": "2099-01-01", "kind": "二买", "price": 1.0}]  # 越界日期丢弃
+    fig = render_report_figure(report, daily, marks=marks)
+    assert len(fig.axes) == 2
+    ax_k = fig.axes[0]
+    assert len(ax_k.patches) == len(daily)          # 每根 K 线一个矩形
+    # 两个有效标注 = 2 个 scatter PathCollection（越界的那个不画）；
+    # vlines 产生的是 LineCollection，不算
+    from matplotlib.collections import PathCollection
+    scatters = [c for c in ax_k.collections if isinstance(c, PathCollection)]
+    assert len(scatters) == 2
+    # 权益曲线画在下面板
+    assert len(fig.axes[1].lines) >= 1
+
+
+def test_save_report_chart_writes_png(tmp_path):
+    from core.backtest.viz import save_report_chart
+
+    daily = make_daily([10.0, 10.5, 11.0, 10.8, 11.5])
+    report = BacktestEngine(initial_capital=10000.0).run_on_data(
+        DummyStrategy([]), "000001", daily)
+    out = save_report_chart(report, daily, tmp_path / "report.png")
+    assert out.exists() and out.stat().st_size > 1000
+    # PNG 魔数
+    assert out.read_bytes()[:4] == b"\x89PNG"

@@ -35,6 +35,7 @@ class Trade:
     profit_pct: float = 0.0
     reason: str = ""
     episode: int = 0
+    signal_kind: str = ""   # 本轮开仓信号的分类（如 "一买"），来自 Signal.kind
 
 
 @dataclass
@@ -53,6 +54,31 @@ class BacktestReport:
     max_drawdown: float = 0.0
     open_position: bool = False
     trades: list = field(default_factory=list)
+    equity_curve: list = field(default_factory=list)   # 逐 bar 权益（资金+持仓市值）
+    equity_dates: list = field(default_factory=list)   # 与 equity_curve 等长的日期
+
+    def win_rate_by_kind(self) -> dict:
+        """按买入信号分类（`Trade.signal_kind`）分组统计胜率
+
+        返回 ``{kind: {"trades", "wins", "win_rate", "avg_profit_pct"}}``，
+        未标注分类的交易归入 ``"未标注"``。用于回答「缠论一买/二买/三买
+        各自的胜率是多少」这类问题。注意是**按笔**统计 —— 分级减仓把一轮
+        持仓拆成多笔时会拆细（缠论买卖点策略全进全出，一轮=一笔，不受影响）。
+        """
+        groups: dict[str, list] = {}
+        for t in self.trades:
+            groups.setdefault(t.signal_kind or "未标注", []).append(t)
+        out = {}
+        for kind, ts in groups.items():
+            wins = sum(1 for t in ts if t.profit > 0)
+            out[kind] = {
+                "trades": len(ts),
+                "wins": wins,
+                "win_rate": wins / len(ts) if ts else 0.0,
+                "avg_profit_pct": (sum(t.profit_pct for t in ts) / len(ts)
+                                   if ts else 0.0),
+            }
+        return out
 
     def format(self) -> str:
         lines = [
@@ -67,6 +93,16 @@ class BacktestReport:
             f"总收益率: {self.total_return:+.2%}",
             f"最大回撤: {self.max_drawdown:.2%}",
         ]
+        by_kind = self.win_rate_by_kind()
+        if len(by_kind) > 1 or "未标注" not in by_kind:
+            lines.append("-" * 46)
+            lines.append("按信号分类胜率:")
+            for kind, g in by_kind.items():
+                lines.append(
+                    f"  {kind}: {g['win_rate']:.2%} "
+                    f"({g['wins']}胜 / {g['trades'] - g['wins']}负)  "
+                    f"平均 {g['avg_profit_pct']:+.2%}"
+                )
         if self.open_position:
             lines.append("⚠ 仍有未平仓持仓（按最后收盘价计入收益）")
         lines.append("-" * 46)
@@ -143,6 +179,7 @@ class BacktestEngine:
         position_cost = 0.0          # 当前持仓成本（含买入费用），按卖出比例结转
         episode_full_qty = 0         # 本轮「满仓股数」，weight 的基准
         episode = 0
+        episode_kind = ""            # 本轮开仓信号的分类（Signal.kind）
         entry_price = 0.0
         entry_date = ""
         trades: list[Trade] = []
@@ -161,6 +198,7 @@ class BacktestEngine:
                         if episode_full_qty <= 0:
                             continue
                         entry_price, entry_date = s.price, s.date
+                        episode_kind = str(getattr(s, "kind", "") or "")
                         episode += 1
                     # 买入 `weight × 满仓股数`，但不越过满仓、也买不起更多
                     room = max(episode_full_qty - position_qty, 0)
@@ -192,6 +230,7 @@ class BacktestEngine:
                         profit=round(profit, 2),
                         profit_pct=(profit / cost_part) if cost_part > 0 else 0.0,
                         reason=s.reason, episode=episode,
+                        signal_kind=episode_kind,
                     ))
                     position_qty -= delta
                     position_cost -= cost_part
@@ -204,9 +243,12 @@ class BacktestEngine:
 
             equity_curve.append(cash + position_qty * k.close)
 
-        return self._build_report(strategy, code, trades, equity_curve, position_qty > 0)
+        return self._build_report(strategy, code, trades, equity_curve,
+                                  position_qty > 0,
+                                  dates=[k.date for k in daily])
 
-    def _build_report(self, strategy, code, trades, equity_curve, has_open) -> BacktestReport:
+    def _build_report(self, strategy, code, trades, equity_curve, has_open,
+                      dates=None) -> BacktestReport:
         total = len(trades)
         wins = [t for t in trades if t.profit > 0]
         losses = [t for t in trades if t.profit <= 0]
@@ -233,4 +275,6 @@ class BacktestEngine:
             profit_factor=profit_factor,
             total_return=total_return, max_drawdown=max_dd,
             open_position=has_open, trades=trades,
+            equity_curve=list(equity_curve),
+            equity_dates=list(dates) if dates else [],
         )

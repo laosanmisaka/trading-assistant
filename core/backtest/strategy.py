@@ -45,6 +45,10 @@ class Signal:
     price: float = 0.0
     reason: str = ""
     weight: float = 1.0
+    kind: str = ""
+    """信号分类标签（如缠论的 "一买"/"三卖"），引擎原样记到
+    `Trade.signal_kind`，供 `BacktestReport.win_rate_by_kind()` 分组统计。
+    与 `reason` 的分工：reason 是给人看的完整描述，kind 是可枚举的分类键。"""
 
 
 class Strategy(ABC):
