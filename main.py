@@ -4,6 +4,13 @@ import sys
 import os
 import traceback
 
+# pythonw.exe 下 sys.stdout/stderr 为 None，
+# 第三方库（AKShare/tqdm 等）内部 print 会抛 'NoneType' object has no attribute 'write'
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 # 确保项目根目录在 sys.path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

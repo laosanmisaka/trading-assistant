@@ -257,8 +257,11 @@ class TestAddByCodeIsAsync:
         assert worker.sync_done.slots == [win._on_name_sync_done]
         assert worker.sync_failed.slots == [win._on_name_sync_failed], (
             "sync_failed 必须接上，否则同步失败又变成静默")
-        assert worker.finished.slots == [worker.deleteLater], (
+        assert worker.deleteLater in worker.finished.slots, (
             "finished 必须接 deleteLater，否则 worker 不回收")
+        assert len(worker.finished.slots) == 2, (
+            "finished 还必须接「清 self._name_sync_worker 引用」的回调，"
+            "否则 deleteLater 后残留引用会让下次 isRunning() 抛 RuntimeError")
 
 
 # ============================================================

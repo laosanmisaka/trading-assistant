@@ -32,6 +32,9 @@ from data.market_data import (
 from data.market_data_manager import get_data_manager
 from data.models import RealtimeQuote, Group, Stock
 from core.alert_engine import AlertEngine
+from core.buy_points import (
+    BUY_GROUP_NAME, DEFAULT_SIGNALS, recent_buy_points, sync_buy_points_group,
+)
 from ui.chan_worker import ChanMarkWorker
 import traceback
 
@@ -73,6 +76,15 @@ class MainWindow(QMainWindow):
         self._alert_triggered_codes: set[str] = set()
         self._daily_stop_loss_done: set[tuple[str, str]] = set()  # 已执行每日止损更新的 (代码, 日期)
         self._quitting: bool = False  # 真正退出应用标志 (区分窗口关闭与退出)
+        self._buy_group_id: int = -1       # 「策略买点」自动分组的 id（-1 = 未建）
+        self._bp_cache: tuple[float, dict] = (0.0, {})  # 买点时间列缓存 (jsonl mtime, map)
+        self._init_fetch_queue: list[str] = []  # 待补拉全量行情的股票（自动分组的票）
+
+        # 「策略买点」分组：启动时按监控落的信号先同步一次，保证分组存在
+        try:
+            sync_buy_points_group()
+        except Exception:
+            logger.warning("策略买点分组同步失败", exc_info=True)
 
         # 构建UI
         self._setup_menu()
@@ -323,6 +335,9 @@ class MainWindow(QMainWindow):
         type_order = {"holding": 0, "cleared": 1, "tracking": 2, "custom": 3}
         type_icons = {"holding": "📊", "cleared": "📋", "tracking": "👁", "custom": "📁"}
 
+        self._buy_group_id = next(
+            (g.id for g in groups if g.name == BUY_GROUP_NAME), -1)
+
         groups.sort(key=lambda g: (type_order.get(g.type, 99), g.sort_order))
 
         for g in groups:
@@ -353,6 +368,12 @@ class MainWindow(QMainWindow):
 
     def _refresh_current_group_data(self):
         """刷新当前分组：始终刷新表格显示，交易时段才拉API增量数据"""
+        if self._current_group_id == self._buy_group_id and self._buy_group_id > 0:
+            # 「策略买点」分组：先把监控新落的信号同步进分组再显示
+            try:
+                sync_buy_points_group()
+            except Exception:
+                logger.warning("策略买点分组同步失败", exc_info=True)
         self._refresh_table_display()  # 切换分组/添加删除/F5 等始终生效
 
         if not is_trading_time():
@@ -425,12 +446,28 @@ class MainWindow(QMainWindow):
             self._check_alerts(all_quotes)
             self._update_profit_status(all_quotes)
 
+    def _buy_times_map(self) -> dict[str, str]:
+        """近两日策略买点 code → conf 时刻（按 jsonl mtime 缓存，3s 轮询不重解析）"""
+        try:
+            mtime = os.path.getmtime(DEFAULT_SIGNALS)
+        except OSError:
+            return {}
+        if mtime != self._bp_cache[0]:
+            pts = recent_buy_points()
+            self._bp_cache = (mtime, {c: p["conf"] for c, p in pts.items()})
+        return self._bp_cache[1]
+
     def _refresh_table_display(self):
         """根据DB+Manager缓存刷新表格 (行情缺失时stub填充)"""
         codes = self._get_current_group_codes()
         stocks_in_group = get_stocks_by_group(self._current_group_id)
         name_map = {s.code: s.name for s in stocks_in_group}
         quotes_cache = self.data_manager.get_all_quotes()
+        buy_times = self._buy_times_map()
+
+        if self._current_group_id == self._buy_group_id and self._buy_group_id > 0:
+            # 「策略买点」分组按买点时间倒序（最新确认的在最上面）
+            codes.sort(key=lambda c: buy_times.get(c, ""), reverse=True)
 
         merged = {}
         for code in codes:
@@ -452,7 +489,8 @@ class MainWindow(QMainWindow):
                     price=0.0, timestamp="--",
                 )
 
-        self.stock_table.update_quotes(merged, self._alert_triggered_codes)
+        self.stock_table.update_quotes(merged, self._alert_triggered_codes,
+                                       buy_times)
 
     def _update_profit_status(self, quotes: dict[str, RealtimeQuote]):
         """更新持仓盈亏状态栏"""
@@ -730,6 +768,47 @@ class MainWindow(QMainWindow):
         # 缠论买卖点：**只标注在 K 线图上**，不弹窗、不提醒（2026-09-18 老三定）
         self._request_chan_marks(code)
 
+        # 自动分组（三买监控/策略买点）同步进来的票没走过手动添加的
+        # 全量取数流程，DB 里没有 K 线 —— 双击时补拉，完成后自动重载图表
+        self._ensure_kline_data(code)
+
+    def _ensure_kline_data(self, code: str):
+        """DB 里没有日线数据的票排队补拉全量行情（一次一只，不阻塞 UI）"""
+        if self.data_manager.is_pending(code) or code in self._init_fetch_queue:
+            return
+        if self.data_manager.get_klines(code, "daily", 250):
+            return
+        self._init_fetch_queue.append(code)
+        self._pump_init_fetch_queue()
+
+    def _pump_init_fetch_queue(self):
+        """驱动补拉队列：上一只没跑完就等它的完成回调再来触发"""
+        prev = getattr(self, '_init_worker', None)
+        if prev is not None and prev.isRunning():
+            return
+        if not self._init_fetch_queue:
+            return
+        code = self._init_fetch_queue.pop(0)
+        self.data_manager.mark_pending(code)
+        self.status_bar.showMessage(f"{code} 首次加载，正在获取全量数据...")
+        logger.info(f"{code} 无本地K线，启动全量数据获取（队列剩 {len(self._init_fetch_queue)}）")
+        self._init_worker = InitialFetchWorker(code)
+        self._init_worker.all_done.connect(self._on_init_fetch_done)
+        self._init_worker.error_occurred.connect(self._on_init_fetch_error)
+        self._init_worker.start()
+
+    def _on_init_fetch_done(self, code: str):
+        """补拉完成 → 刷表格；若还是当前查看的票则重载图表 + 重算标注"""
+        self._on_new_stock_init_done(code)
+        if code == self._current_stock_code:
+            self.chart_widget.load_stock(code)
+            self._request_chan_marks(code)
+        self._pump_init_fetch_queue()
+
+    def _on_init_fetch_error(self, err: str):
+        logger.error(f"全量数据获取失败: {err}")
+        self._pump_init_fetch_queue()
+
     def _on_stock_right_clicked(self, code: str, action: str):
         """股票右键菜单操作"""
         if action == "add_trade":
@@ -856,10 +935,17 @@ class MainWindow(QMainWindow):
         # DB中没有 → 异步全量同步
         # (该同步含 3 次 AKShare 请求 + 递增 sleep，同步执行会冻结 UI 十秒以上)
         prev = getattr(self, '_name_sync_worker', None)
-        if prev is not None and prev.isRunning():
-            self.status_bar.showMessage("股票名称库正在同步中，请稍候...", 3000)
-            logger.debug(f"{code} 添加请求跳过: 上一轮名称库同步尚未完成")
-            return
+        if prev is not None:
+            try:
+                running = prev.isRunning()
+            except RuntimeError:
+                # worker 已被 deleteLater 销毁但引用未清 —— 视为未运行
+                running = False
+                self._name_sync_worker = None
+            if running:
+                self.status_bar.showMessage("股票名称库正在同步中，请稍候...", 3000)
+                logger.debug(f"{code} 添加请求跳过: 上一轮名称库同步尚未完成")
+                return
 
         logger.info(f"本地无 {code}，触发异步全量名称同步...")
         self.status_bar.showMessage(
@@ -869,6 +955,9 @@ class MainWindow(QMainWindow):
         self._name_sync_worker.sync_done.connect(self._on_name_sync_done)
         self._name_sync_worker.sync_failed.connect(self._on_name_sync_failed)
         self._name_sync_worker.finished.connect(self._name_sync_worker.deleteLater)
+        # finished 后清引用，避免下次 isRunning() 撞上已销毁的 C++ 对象
+        self._name_sync_worker.finished.connect(
+            lambda: setattr(self, '_name_sync_worker', None))
         self._name_sync_worker.start()
 
     def _on_name_sync_done(self, code: str, name: str):
@@ -919,6 +1008,7 @@ class MainWindow(QMainWindow):
         self._refresh_table_display()  # 立即显示新股的现价数据
         self.status_bar.showMessage(f"{code} 数据初始化完成", 3000)
         logger.info(f"{code} 全量数据初始化完成")
+        self._pump_init_fetch_queue()  # 手动添加的取数也会占worker，完成后继续补拉队列
 
     def _fallback_to_search(self, keyword: str):
         """回退到搜索模式"""

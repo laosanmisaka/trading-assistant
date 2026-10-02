@@ -1,8 +1,8 @@
 """股票列表表格 — 自定义QTableView + Model，支持高亮、排序、右键菜单
 
-2026-09-18：删除「买点信号」列与买点高亮 —— 买点提醒已取消，改为在
-K 线图上标注（`ui/chart_widget.py` 的 `set_chan_marks`）。表格只保留
-止损止盈提醒这一条提醒链路。
+提醒链路：止损止盈触发高亮（红色闪烁）。「买点时间」列显示近两日的
+三买策略买点确认时刻（`core.buy_points`，数据源是盘中监控落的
+`outputs/monitor_signals.jsonl`），没有买点的行显示 "--"。
 """
 
 from PyQt5.QtWidgets import (
@@ -34,7 +34,8 @@ class StockTableModel(QAbstractTableModel):
     COL_VOLUME = 5
     COL_STOP_LOSS = 6
     COL_TAKE_PROFIT = 7
-    COL_ALERT = 8
+    COL_BUY_TIME = 8
+    COL_ALERT = 9
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,17 +44,20 @@ class StockTableModel(QAbstractTableModel):
         self._alert_codes: set[str] = set()      # 止损止盈触发代码
         self._highlight_rows: set[str] = set()    # 当前高亮行
         self._highlight_colors: dict[str, QColor] = {}
+        self._buy_times: dict[str, str] = {}      # code → 策略买点确认时刻
 
     def update_data(
         self,
         quotes: dict[str, RealtimeQuote],
         alert_codes: set[str],
+        buy_times: dict[str, str] | None = None,
     ):
-        """更新数据"""
+        """更新数据（buy_times：code → 买点确认时刻，无则该列显示 "--"）"""
         self.beginResetModel()
         self._quotes = quotes
         self._codes = list(quotes.keys())
         self._alert_codes = alert_codes
+        self._buy_times = dict(buy_times or {})
         # 保持高亮与触发状态同步
         self._highlight_rows = set(alert_codes)
         self.endResetModel()
@@ -109,7 +113,8 @@ class StockTableModel(QAbstractTableModel):
 
         # 文字对齐
         if role == Qt.TextAlignmentRole:
-            if col in (self.COL_CODE, self.COL_NAME, self.COL_ALERT):
+            if col in (self.COL_CODE, self.COL_NAME, self.COL_BUY_TIME,
+                       self.COL_ALERT):
                 return Qt.AlignCenter
             return Qt.AlignRight | Qt.AlignVCenter
 
@@ -141,6 +146,9 @@ class StockTableModel(QAbstractTableModel):
             return "--"
         elif col == self.COL_TAKE_PROFIT:
             return "--"
+        elif col == self.COL_BUY_TIME:
+            conf = self._buy_times.get(code, "")
+            return conf[5:16] if conf else "--"   # "2026-09-30 14:40:00" → "09-30 14:40"
         elif col == self.COL_ALERT:
             if is_alert:
                 return "⚠ 触发"
@@ -194,9 +202,10 @@ class StockTableWidget(QTableView):
         self,
         quotes: dict[str, RealtimeQuote],
         alert_codes: set[str],
+        buy_times: dict[str, str] | None = None,
     ):
-        """更新行情数据"""
-        self._model.update_data(quotes, alert_codes)
+        """更新行情数据（buy_times：code → 策略买点确认时刻）"""
+        self._model.update_data(quotes, alert_codes, buy_times)
 
     def highlight_rows(self, codes: list[str]):
         """高亮指定股票行（止损止盈触发）"""

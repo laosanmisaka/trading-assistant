@@ -48,7 +48,28 @@ class ChanMarkWorker(QThread):
         klines = self._klines
         if klines is None:
             klines = chan_viz.fetch_klines(self.code, self.period)
-        return chan_viz.marks_from_klines(klines, code=self.code)
+        marks = chan_viz.marks_from_klines(klines, code=self.code)
+        marks["triple"] = self._triple_marks()
+        return marks
+
+    def _triple_marks(self) -> list[dict]:
+        """日线三买 + 5min 一买策略（老三的定稿策略）的逐笔标注
+
+        数据来自 baostock 缓存 `outputs/cache_min` —— 该票没取过 5min
+        缓存时返回空（不静默伪造点）。判定链与 `eval_daily_5min.py`
+        同源（`core/triple_buy.py`）：闸门 40% + 只要一买 + 持 20 日。
+        """
+        from pathlib import Path
+        from core.triple_buy import triple_buy_trades
+
+        cache = Path(__file__).resolve().parent.parent / "outputs" / "cache_min"
+        code = chan_viz.normalize_code(self.code)
+        try:
+            r = triple_buy_trades(code, cache)
+        except Exception as exc:                       # 标注是增量信息，不拖垮主标注
+            logger.warning(f"三买策略标注计算失败 {code}: {exc}")
+            return []
+        return r["trades"] if r else []
 
     def run(self):  # pragma: no cover - 线程体，逻辑都在 _compute
         try:

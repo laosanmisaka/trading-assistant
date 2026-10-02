@@ -33,13 +33,13 @@ CHAN_DAILY_COLORS = {
     "一买": "#7b1fa2", "二买": "#e65100", "三买": "#f9a825",
     "一卖": "#004d40", "二卖": "#1b5e20", "三卖": "#2e7d32",
 }
-# 六脉神剑（独立策略，叠在同图上做位置对照）—— 菱形标记 + 外圈一档，
-# 与缠论策略的三角/圆点形状区分开。色值与 core/chan_viz.STYLE 同源。
-SIX_PULSE_BUY_COLOR = "#0277bd"
-SIX_PULSE_SELL_COLOR = "#ad1457"
+# 三买策略（日线三买<40% + 5min 一买 + 持 20 日，老三定稿）—— 圆点标记，
+# 与缠论策略的三角区分开。`core/triple_buy.py` 同源产出。
+TRIPLE_BUY_COLOR = "#c2185b"
+TRIPLE_SELL_COLOR = "#00796b"
 
-# 标注离当根 K 线极值的距离（买点向下取、卖点向上取）。六脉比缠论**外圈
-# 一档**，这样同一根 bar 上两类点都出现时不会叠在一起。
+# 标注离当根 K 线极值的距离（买点向下取、卖点向上取）。三买策略比缠论
+# **外圈一档**，同一根 bar 上两类点都出现时不叠住。
 _BUY_NEAR, _SELL_NEAR = 0.985, 1.015
 _BUY_FAR, _SELL_FAR = 0.968, 1.032
 
@@ -480,18 +480,15 @@ class ChartTabWidget(QWidget):
         """在有 K 线的主轴上标注买卖点 → 返回额外的图例代理项
 
         数据（``self.chan_marks``）来自 `core.chan_viz.marks_from_klines`，
-        形态是**按日期**给出的点，三组：
+        形态是**按日期**给出的点，两组：
 
         - ``geometry``：日线几何买卖点（一/二/三 买与卖）
         - ``trades``：缠论多周期共振策略的实际成交
-        - ``six_pulse``：**独立策略**六脉神剑的成交（六指标共振 + MA10 出口）
-
-        前两组同源（都出自缠论几何判定），第三组不同源。叠在同一张日线图上
-        是为了让老三**比较两套策略买点的位置**，不是把两者混成一套信号
-        （见 `core/chan_viz` docstring 第 4 条）。
+        - ``triple``：三买策略（日线三买<40% + 5min 一买 + 持 20 日）的逐笔，
+          来自 `core/triple_buy`（baostock 缓存；无缓存的票为空）
 
         这里只做「日期 → 横轴下标」映射：买点画在当根 K 线低点下方、卖点画在
-        高点上方；六脉比缠论**外圈一档**，避免两类点落在同一位置叠住。
+        高点上方；三买策略比缠论**外圈一档**，避免两类点落在同一位置叠住。
 
         为什么不用 `ax.scatter` 逐个画、而是一次画一批：与蜡烛批量化同因 ——
         250 根上逐点建 artist 会让缩放/重绘变慢。每个 (marker, 买卖) 组合
@@ -499,8 +496,8 @@ class ChartTabWidget(QWidget):
         """
         geometry = self.chan_marks.get("geometry") or []
         trades = self.chan_marks.get("trades") or []
-        six = self.chan_marks.get("six_pulse") or []
-        if not geometry and not trades and not six:
+        triple = self.chan_marks.get("triple") or []
+        if not geometry and not trades and not triple:
             return []
 
         date_to_x = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(df.index)}
@@ -537,22 +534,25 @@ class ChartTabWidget(QWidget):
                     label += f" ({pct:+.2f}%)"
                 items.append((j, CHAN_SELL_COLOR, 130, label, "v", False, _SELL_NEAR))
 
-        for t in six:
+        for t in triple:
             i = date_to_x.get(str(t.get("buy_date")))
             if i is not None and 0 <= i < n:
                 price = t.get("buy_price")
-                items.append((i, SIX_PULSE_BUY_COLOR, 105,
-                              "六脉 " + (f"{price:.2f}" if price else ""),
-                              "D", True, _BUY_FAR))
+                amp = t.get("amp")
+                label = "三买 " + (f"{price:.2f}" if price else "")
+                if amp is not None:
+                    label += f" (幅{amp:.0f}%)"
+                items.append((i, TRIPLE_BUY_COLOR, 130, label,
+                              "o", True, _BUY_FAR))
             j = date_to_x.get(str(t.get("sell_date"))) if t.get("sell_date") else None
             if j is not None and 0 <= j < n:
                 price = t.get("sell_price")
                 pct = t.get("return_pct")
-                label = "六脉 " + (f"{price:.2f}" if price else "")
+                label = "三买卖 " + (f"{price:.2f}" if price else "")
                 if pct is not None:
                     label += f" ({pct:+.2f}%)"
-                items.append((j, SIX_PULSE_SELL_COLOR, 105, label,
-                              "D", False, _SELL_FAR))
+                items.append((j, TRIPLE_SELL_COLOR, 130, label,
+                              "o", False, _SELL_FAR))
 
         if not items:
             return []
@@ -598,14 +598,14 @@ class ChartTabWidget(QWidget):
                 (Line2D([], [], marker="v", color="none", markerfacecolor="#1b5e20",
                         markersize=6, label="日线卖点"), "日线卖点"),
             ]
-        if six:
+        if triple:
             legend += [
-                (Line2D([], [], marker="D", color="none",
-                        markerfacecolor=SIX_PULSE_BUY_COLOR, markersize=7,
-                        label="六脉买点"), "六脉买点"),
-                (Line2D([], [], marker="D", color="none",
-                        markerfacecolor=SIX_PULSE_SELL_COLOR, markersize=7,
-                        label="六脉卖点"), "六脉卖点"),
+                (Line2D([], [], marker="o", color="none",
+                        markerfacecolor=TRIPLE_BUY_COLOR, markersize=8,
+                        label="三买策略入场"), "三买策略入场"),
+                (Line2D([], [], marker="o", color="none",
+                        markerfacecolor=TRIPLE_SELL_COLOR, markersize=8,
+                        label="三买策略出场"), "三买策略出场"),
             ]
         return legend
 
