@@ -46,7 +46,6 @@ def chart(qapp, monkeypatch):
 MARKS = {
     "geometry": [{"date": "2026-01-05", "kind": "二买", "price": 10.0}],
     "trades": [{"buy_date": "2026-01-05", "buy_price": 10.0}],
-    "six_pulse": [{"buy_date": "2026-01-05", "buy_price": 10.0}],
     "meta": {"source": "geometry"},
 }
 

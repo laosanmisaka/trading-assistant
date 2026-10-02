@@ -318,38 +318,16 @@ trading_assistant.db
 标注结构：
 `{"geometry": [{"date","kind","price"}...],
 "trades": [{"buy_date","buy_price","sell_date","sell_price","return_pct"}...],
-"six_pulse": [同 trades 结构], "meta": {...}}`
+"meta": {...}}`
 
 - `geometry` —— 日线几何买卖点，`core/chan_points` 判定
 - `trades` —— **缠论**多周期共振策略的成交，`core/chan_strategy` 产出
-- `six_pulse` —— **六脉神剑**（另一套独立策略，`core/six_pulse`）的成交，
-  日线级别、含 60 根预热。与 `trades` 不同源，画在同图上只为对照，
-  不要混读（见 `docs/STRATEGY_SIX_PULSE.md`）
-- 两组交易的 `sell_date` 为空串 = 数据末尾仍未平仓
+- `sell_date` 为空串 = 数据末尾仍未平仓
 
 UI 与 HTML 图共用同一套函数，不各算一套。
 
-### `core/six_pulse.py`（六脉神剑，**独立于缠论**）
-
-日线六指标共振策略，买点移植自通达信公式（仓库根 `lmsj.txt`）。实现
-`core.backtest.strategy.Strategy`，可直接交给 `BacktestEngine`。
-口径与实测结论见 `docs/STRATEGY_SIX_PULSE.md`。
-
-| 函数/类 | 输入 | 返回 | 说明 |
-| --- | --- | --- | --- |
-| `ema(s, n)` / `sma_tdx(s, n, m)` | Series、周期 | Series | 通达信 `EMA` / `SMA`（**加权**平均，不是简单均线） |
-| `to_frame(daily)` | `list[KLineData]` | DataFrame | 转日线表 |
-| `compute_indicators(df, ma_exit=10, entry_ma=None)` | 日线表、均线周期 | DataFrame | OHLC + `B1`~`B6` / `all6` / `buy_signal` / `sell_signal` + 分级出口三条均线（`entry_ma` 非空时另有 `ma_entry`） |
-| `SixPulseStrategy(..., entry_ma=20, trade_from=None)` | — | 策略 | 共振首日**且收盘站上 MA20** 买入；分级出口（破 MA5 卖半 / 站回 MA10 补 / 破 MA20 全清） |
-| `SixPulseStrategy.generate_signals(daily)` | 日线 | `list[Signal]` | T 日收盘确认、**T+1 开盘**成交；`weight` 表委托占本轮满仓的比例 |
-
-实测（2026-09-20，**当前口径**：520 只池 / `--start 2025-01-01` / 带 MA20 过滤）：
-7997 轮 15908 笔、轮胜率 35.4%、平均区间收益 **+50.13%** vs 同池买入持有 **+195.09%**。
-换**无偏随机池**（499 只）是 **+11.23% vs +54.10%**。**三个池全部跑输同池基线**，
-买点超额 ≈ 0、横截面回归 α 为负、β 仅 0.15~0.28 ⇒ **无 alpha，不建议实盘**。
-评估脚本 `scripts/eval_six_pulse.py`（`--pool` / `--start` / `--entry-ma`），
-池构建 `scripts/build_pool.py`，测试 `tests/test_six_pulse.py`（35 条，全离线）。
-口径与完整证据见 `docs/STRATEGY_SIX_PULSE.md`（§2.0 是主口径）。
+（2026-09-30：六脉神剑 `core/six_pulse.py` 及其评估/可视化链路已整体删除——
+三池全跑输买入持有、买点无 alpha，老三拍板移除。）
 
 ## 9. 做 T 模块
 
@@ -499,7 +477,7 @@ UI 与 HTML 图共用同一套函数，不各算一套。
 | `_draw_intraday()` | 无 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。固定只显示最近 5 个交易日，按天分隔标注日期，上栏隐藏 X 轴刻度。绘图后存储价格/成交量数组到 axes 供滚轮 Y 轴自适应。 |
 | `_draw_kline()` | 无 | `None` | 将 K 线数据转为 DataFrame，设置标题后委托 `_draw_kline_manual`。 |
 | `_draw_kline_manual(df, title)` | DataFrame、标题 | `None` | 使用 `GridSpec(height_ratios=[3,1])` 创建上下合体子图（`sharex` 同步缩放）。上栏手工绘制蜡烛图（自适应宽度）、MA 均线、止损/止盈线和**缠论买卖点标注**（`_draw_chan_marks`）；下栏绘制成交量。上栏隐藏 X 轴刻度，x 轴日期格式根据周期自适应。绘图后将 OHLC/成交量数组存储到 axes 供滚轮 Y 轴自适应。 |
-| `_draw_chan_marks(ax, df)` | 子图、DataFrame | `None` | 画 `chan_marks` 里的三组点：**缠论策略点**（买=当日最低价下方红上三角、卖=最高价上方绿下三角）＋**日线几何点**（小三角）＋**六脉神剑点**（菱形，紫蓝买 / 洋红卖，画在更外圈一档以免与缠论点叠住）。按 `(marker, 买卖, 距离档)` 分组批量 `collection`，不逐点建 artist。图例只列实际画了的类别。只在 `period == "daily"` 时调用。 |
+| `_draw_chan_marks(ax, df)` | 子图、DataFrame | `None` | 画 `chan_marks` 里的两组点：**缠论策略点**（买=当日最低价下方红上三角、卖=最高价上方绿下三角）＋**日线几何点**（小三角）。按 `(marker, 买卖, 距离档)` 分组批量 `collection`，不逐点建 artist。图例只列实际画了的类别。只在 `period == "daily"` 时调用。 |
 | `set_alert_lines(stop_loss, take_profit)` | 止损价、止盈价 | `None` | 设置该图表页止损/止盈线。 |
 | `set_chan_marks(marks)` | 标注 dict | `None` | 设置本页的缠论标注（结构见 `core/chan_viz.marks_from_klines`）并重绘。 |
 | `ChartWidget` | QWidget | widget | 包含分时/日/周/月四个标签页。 |

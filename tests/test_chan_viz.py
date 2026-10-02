@@ -286,102 +286,6 @@ def test_payload_strategy_hit_lands_on_signal_bar(payload):
         assert t["buy"]["idx"] == t["buy"]["signal_idx"] + 1
 
 
-def test_payload_six_pulse_block_is_self_consistent(payload):
-    """六脉块（独立策略）结构与图内下标自洽 —— UI 直接消费它
-
-    ⚠️ 与缠论策略的关键区别：六脉用的是**同一份合成日线**（保证两根策略
-    共用一条 X 轴），不是评估报告里那 1500 根日线。交易日数必须与 meta 对上。
-    """
-    from core import six_pulse
-
-    sp = payload["six_pulse"]
-    n = payload["meta"]["bars"]
-    assert sp["warmup_bars"] == six_pulse.WARMUP
-    assert sp["daily_bars"] == payload["meta"]["trading_days"], \
-        "六脉必须用同一份合成日线，否则两根策略的 X 轴不可比"
-    assert len(sp["buys"]) == len(sp["trades"])
-    assert len(sp["sells"]) <= len(sp["buys"]), "未平仓那笔没有卖点"
-    for t in sp["trades"]:
-        assert 0 <= t["buy_idx"] < n
-        assert t["buy_price"] > 0
-        if t["sell_idx"] is not None:
-            assert 0 <= t["sell_idx"] < n
-            assert t["sell_price"] is not None
-            assert t["return_pct"] is not None
-
-
-def test_payload_six_pulse_is_round_level(payload):
-    """六脉块画的是**轮级**：一笔一轮、轮与轮不重叠，清仓必在建仓之后
-
-    分级出口（破 MA5 减半 / 站回 MA10 回补 / 破 MA20 清仓）下只有建仓与清仓
-    落点。2026-09-21 之前按"一买一卖配对"，会把 `weight=0.5` 的减半当成整笔
-    卖出、把回补当成新开一笔 ⇒ 图上的卖点位置与轮数都是错的。
-    """
-    sp = payload["six_pulse"]
-    prev_sell = -1
-    for t in sp["trades"]:
-        assert t["buy_idx"] > prev_sell, "两轮不能重叠（清仓后才认新买点）"
-        assert t["cash_in"] > 0, "本轮买入金额必须为正"
-        if t["sell_idx"] is not None:
-            assert t["sell_idx"] > t["buy_idx"]
-            assert t["cash_out"] > 0
-            want = round((t["cash_out"] / t["cash_in"] - 1) * 100, 2)
-            assert t["return_pct"] == pytest.approx(want), \
-                "轮级收益要用现金流口径（含减半/回补两腿），不能只拿首尾价相除"
-            prev_sell = t["sell_idx"]
-        else:
-            assert t["sell_dt"] == "" and t["sell_price"] is None
-            assert t["return_pct"] is None, "未平仓的轮没有收益"
-        # 半仓腿的计数是附属信息（有没有减半取决于行情，不做断言）
-        assert isinstance(t["reduces"], int) and t["reduces"] >= 0
-        assert isinstance(t["reentries"], int) and t["reentries"] >= 0
-
-
-def test_payload_six_pulse_drops_half_position_legs(monkeypatch):
-    """半仓腿（`weight=0.5` 的减半 / 回补）**不能**落成买卖点
-
-    直接替换 `generate_signals`，把「建仓 → 破 MA5 减半 → 站回 MA10 回补 →
-    破 MA20 清仓」四条腿按真实口径喂进去（`Signal.date` 就是成交日），
-    断言六脉块只有 **1 轮**、卖点落在**清仓**那天、收益走**现金流口径**。
-
-    回归对象：早先按"一买一卖配对"，减半被当成整笔卖出、回补被当成新开一笔，
-    于是图上的卖点位置与轮数都错；收益还会变成拿首尾价相除（本用例里是
-    −15.0%，与正确的现金流口径 −11.86% 不同，能把它抓出来）。
-    """
-    from core import six_pulse
-    from core.backtest.strategy import Action, Signal
-    from core.chan_viz import build_payload
-
-    kl = make_klines(1100)                       # 1100/8 ≈ 137 个交易日 > 预热 60
-    days = sorted({k.date[:10] for k in kl})
-    assert len(days) > 100
-
-    legs = [(Action.BUY, 1.0, 20.0, days[70]),    # 建仓
-            (Action.SELL, 0.5, 18.0, days[75]),   # 破 MA5 减半
-            (Action.BUY, 0.5, 19.0, days[80]),    # 站回 MA10 回补
-            (Action.SELL, 1.0, 17.0, days[95])]   # 破 MA20 清仓
-    monkeypatch.setattr(
-        six_pulse.SixPulseStrategy, "generate_signals",
-        lambda self, daily: [Signal(date=dt, action=a, price=p,
-                                    reason="测试腿", weight=w)
-                             for a, w, p, dt in legs])
-
-    sp = build_payload(kl, code="TEST", name="分级出口",
-                       period="30min")["six_pulse"]
-    assert len(sp["trades"]) == 1, "一轮行情只该落 1 个轮级买点与卖点"
-    assert len(sp["buys"]) == 1 and len(sp["sells"]) == 1
-
-    t = sp["trades"][0]
-    assert t["reduces"] == 1 and t["reentries"] == 1
-    assert t["buy_dt"] == days[70] and t["sell_dt"] == days[95], \
-        "卖点必须是清仓日，不能是减半日"
-    assert t["cash_in"] == pytest.approx(1.0 * 20.0 + 0.5 * 19.0)
-    assert t["cash_out"] == pytest.approx(0.5 * 18.0 + 1.0 * 17.0)
-    assert t["return_pct"] == pytest.approx(round((26.0 / 29.5 - 1) * 100, 2))
-    assert t["return_pct"] != pytest.approx(-15.0), \
-        "拿首尾价相除（17/20−1）是旧口径，说明半仓腿又被当成整笔了"
-
-
 def test_payload_zoom_within_range(payload):
     z = payload["zoom"]
     n = payload["meta"]["bars"]
@@ -529,15 +433,6 @@ def _fake_payload_for_marks():
              "sell": {"dt": "2026-01-07", "price": 12.0, "return_pct": 9.09}},
             {"buy": {"dt": "2026-01-07 14:00", "price": 12.5}, "sell": None},
         ]},
-        # 六脉神剑：独立策略的另一套买卖点（第二笔未平仓）
-        "six_pulse": {"trades": [
-            {"buy_idx": 0, "buy_dt": "2026-01-05", "buy_price": 10.2,
-             "sell_idx": 1, "sell_dt": "2026-01-06", "sell_price": 11.4,
-             "return_pct": 11.76},
-            {"buy_idx": 2, "buy_dt": "2026-01-07", "buy_price": 12.6,
-             "sell_idx": None, "sell_dt": "", "sell_price": None,
-             "return_pct": None},
-        ]},
     }
 
 
@@ -559,32 +454,11 @@ def test_marks_from_payload_maps_index_to_date():
     ], "未平仓那笔的 sell_date 必须是空串（不是 None 也不是乱码日期）"
 
 
-def test_marks_from_payload_six_pulse_is_separate():
-    """六脉神剑导出成**独立一组** —— 不能并进 geometry/trades 混成一锅
-
-    UI 靠这个分组把菱形画在更外圈、并与缠论点分开上图例；一旦被并进
-    trades，图上就分不出哪笔是缠论、哪笔是六脉了。
-    """
-    from core.chan_viz import marks_from_payload
-
-    marks = marks_from_payload(_fake_payload_for_marks())
-
-    assert marks["six_pulse"] == [
-        {"buy_date": "2026-01-05", "buy_price": 10.2,
-         "sell_date": "2026-01-06", "sell_price": 11.4, "return_pct": 11.76},
-        {"buy_date": "2026-01-07", "buy_price": 12.6,
-         "sell_date": "", "sell_price": None, "return_pct": None},
-    ], "未平仓那笔同样用空串表示卖点（与缠论组口径一致）"
-    # 原两组不受影响 —— 六脉是第三组，不是替换
-    assert len(marks["geometry"]) == 2 and len(marks["trades"]) == 2
-
-
 def test_marks_from_payload_tolerates_empty_payload():
     """空 payload 不抛异常 —— UI 拿到空标注只是不画点"""
     from core.chan_viz import marks_from_payload
 
-    assert marks_from_payload({}) == {"geometry": [], "trades": [],
-                                      "six_pulse": []}
+    assert marks_from_payload({}) == {"geometry": [], "trades": []}
 
 
 def test_marks_from_klines_matches_payload(payload):
@@ -606,4 +480,4 @@ def test_marks_from_klines_carries_meta():
 
     marks = marks_from_klines(make_klines(420), code="600000", name="测试股")
     assert marks["meta"]["code"] == "sh600000"
-    assert set(marks) == {"geometry", "trades", "six_pulse", "meta"}
+    assert set(marks) == {"geometry", "trades", "meta"}
