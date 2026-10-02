@@ -4,6 +4,16 @@
     python scripts/build_pool.py                    # 默认 500 只
     python scripts/build_pool.py --n 300
     python scripts/build_pool.py --out scripts/pool_liquid300.txt
+    python scripts/build_pool.py --mode random --n 2000 --out scripts/pool_random2000.txt
+    python scripts/build_pool.py --mode mainboard   # 沪深主板全部（监控扫描口径）
+
+三种模式（**用途不同，别混用**）
+--------------------------------
+- `liquid`（默认）—— 按当日成交额取前 N，**剔 ST/停牌**；**回测样本**。
+- `random` —— 全市场随机抽样（固定种子），避免前视选择偏差；**回测样本**。
+- `mainboard` —— 沪深主板**全部** 3197 只，不排序、**保留 ST/停牌**；
+  供 `scan_candidates.py` / `daily_routine.py` 做**盘中监控的扫描范围**。
+  ⚠️ 含 ST 股，**不要拿去回测**。
 
 做什么
 ------
@@ -58,6 +68,79 @@ def build_random(n: int, seed: int = 20260920) -> list[tuple[str, str]]:
             for c, nm in zip(sub["code"], sub["name"])]
 
 
+#: 沪深主板代码前缀（baostock 的 9 位带点格式）
+MAINBOARD_PREFIX = ("sh.600", "sh.601", "sh.603", "sh.605",
+                    "sz.000", "sz.001", "sz.002", "sz.003")
+
+
+def _latest_trade_day() -> str:
+    """最近一个交易日（``YYYY-MM-DD``）—— 交易日历来自 baostock
+
+    ``query_all_stock(day="")`` 实测返回 **0 行**，必须给显式交易日，
+    所以得先自己定这一天。往前找 40 个自然日足够覆盖任何长假。
+    """
+    import baostock as bs
+
+    end = pd.Timestamp.today()
+    start = end - pd.Timedelta(days=40)
+    rs = bs.query_trade_dates(start_date=start.strftime("%Y-%m-%d"),
+                              end_date=end.strftime("%Y-%m-%d"))
+    if rs.error_code != "0":
+        raise RuntimeError(f"query_trade_dates 失败：{rs.error_msg}")
+    days = []
+    while rs.next():
+        d, is_td = rs.get_row_data()[:2]
+        if is_td == "1":
+            days.append(d)
+    if not days:
+        raise RuntimeError("近 40 天内没找到交易日")
+    return max(days)
+
+
+def build_mainboard() -> list[tuple[str, str]]:
+    """**沪深主板全部**（不排序、不筛 ST/停牌）—— 监控覆盖口径
+
+    与 `build()` 的区别是**目的不同**：
+
+    | | `build()`（liquid） | `build_mainboard()` |
+    |---|---|---|
+    | 用途 | 回测样本 | 盘中监控的扫描范围 |
+    | 口径 | 按当日成交额取前 N | 主板全部，一只不漏 |
+    | ST/退市 | **剔除** | **保留** |
+    | 停牌 | **剔除**（成交额=0） | **保留** |
+
+    ⚠️ 所以**不要拿本池回测**：它含 ST/退市股，会污染策略胜率统计。
+    回测请继续用 `pool_random*.txt` / `pool_liquid*.txt`。
+
+    为什么用 baostock 而不是 `build()` 用的新浪快照：新浪 `stock_zh_a_spot`
+    只列**当日有成交**的票，当日停牌股会缺席；baostock `query_all_stock`
+    是交易所当日证券列表，停牌股也在。
+    """
+    import baostock as bs
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise RuntimeError(f"baostock 登录失败：{lg.error_msg}")
+    try:
+        day = _latest_trade_day()
+        rs = bs.query_all_stock(day=day)
+        if rs.error_code != "0":
+            raise RuntimeError(f"query_all_stock 失败：{rs.error_code} {rs.error_msg}")
+        out: list[tuple[str, str]] = []
+        while rs.next():
+            r = rs.get_row_data()               # [code, tradeStatus, code_name]
+            code = r[0]
+            if code.startswith(MAINBOARD_PREFIX):
+                # sh.600526 → sh600526（项目内部统一用新浪格式）
+                out.append((code[:2] + code[3:], r[2] if len(r) > 2 else ""))
+        return sorted(set(out))
+    finally:
+        try:
+            bs.logout()
+        except Exception:                        # noqa: BLE001
+            pass
+
+
 def _read_pool(path: str) -> list[tuple[str, str]]:
     """读现有的池文件（一行一只 `代码 名称`，`#` 开头为注释）"""
     out: list[tuple[str, str]] = []
@@ -101,8 +184,10 @@ def build(n: int, snapshot: str = "") -> list[tuple[str, str]]:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="按流动性构造标的池文件")
     p.add_argument("--n", type=int, default=500, help="取前 N 只（默认 500）")
-    p.add_argument("--mode", choices=("liquid", "random"), default="liquid",
-                   help="liquid=按成交额（默认）；random=全市场随机抽样（无前视偏差）")
+    p.add_argument("--mode", choices=("liquid", "random", "mainboard"),
+                   default="liquid",
+                   help="liquid=按成交额（默认）；random=全市场随机抽样（无前视偏差）；"
+                        "mainboard=沪深主板全部（监控扫描口径，不排序不筛 ST/停牌）")
     p.add_argument("--seed", type=int, default=20260920, help="random 模式的抽样种子")
     p.add_argument("--snapshot", default="", help="本地快照 CSV（列同 stock_zh_a_spot）")
     p.add_argument("--include", default="",
@@ -110,7 +195,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default="", help="输出文件（默认 scripts/pool_liquid<N>.txt）")
     args = p.parse_args(argv)
 
-    if args.mode == "random":
+    if args.mode == "mainboard":
+        pool = build_mainboard()
+    elif args.mode == "random":
         pool = build_random(args.n, args.seed)
     else:
         pool = build(args.n, args.snapshot)
@@ -125,40 +212,62 @@ def main(argv: list[str] | None = None) -> int:
     merged += added
     pool = merged
 
-    out = Path(args.out) if args.out else Path(__file__).with_name(
-        f"pool_{'random' if args.mode == 'random' else 'liquid'}{args.n}.txt")
+    if args.out:
+        out = Path(args.out)
+    elif args.mode == "mainboard":
+        out = Path(__file__).with_name("pool_mainboard_all.txt")
+    else:
+        out = Path(__file__).with_name(
+            f"pool_{'random' if args.mode == 'random' else 'liquid'}{args.n}.txt")
 
-    if args.mode == "random":
+    if args.mode == "mainboard":
+        how = "baostock 当日全量证券列表中的**沪深主板**全部（不排序、不筛）"
+        cmd = "python scripts/build_pool.py --mode mainboard"
+        note = ("本池是**监控覆盖**口径：目标是「不漏任何一只主板票」，故**保留**\n"
+                "# ST/*ST/退市整理股与当日停牌股。")
+        head = "# 沪深主板监控标的池（全量覆盖）"
+        filt = "# 保留 ST/退市、停牌股（与回测池口径相反）；仅剔北交所/创业板/科创板。"
+        warn = "# ⚠️ 这是**盘中监控的扫描范围**，不是股票池推荐，**也不适合回测**。"
+    elif args.mode == "random":
         how = (f"全市场（沪深主板/创业板/科创板，剔 ST）**随机抽样** {len(pool)} 只，"
                f"种子 {args.seed}")
         cmd = f"python scripts/build_pool.py --n {args.n} --mode random --seed {args.seed}"
         note = ("池子构成与后续涨跌**无关**，是评价择时策略的公正样本；\n"
                 "# 对比 `pool_liquid500.txt`（按成交额选，含前视选择偏差）。")
+        head = "# 缠论策略回测标的池"
+        filt = "# 剔除 ST/退市、北交所（新浪日线接口不支持）。"
+        warn = "# ⚠️ 这不是「股票池推荐」，只是为策略评估凑样本量的**回测样本**。"
     else:
         how = f"新浪全市场快照按**当日成交额**降序取前 {args.n} 只"
         cmd = f"python scripts/build_pool.py --n {args.n}"
         note = ("⚠️ 按**当前**成交额选池会引入**前视选择偏差**：用它回测更早的区间\n"
                 "# 等于挑出了那段时间的赢家，同池「买入持有」基线会被显著抬高。\n"
                 "# 评价策略时请与 `pool_random500.txt`（随机抽样）一起看。")
+        head = "# 缠论策略回测标的池"
+        filt = "# 剔除 ST/退市、北交所（新浪日线接口不支持）。"
+        warn = "# ⚠️ 这不是「股票池推荐」，只是为策略评估凑样本量的**回测样本**。"
     lines = [
-        f"# 六脉神剑 / 缠论策略回测标的池 —— {len(pool)} 只",
+        f"{head} —— {len(pool)} 只",
         "#",
         f"# 选取口径：{how}；",
-        "# 剔除 ST/退市、北交所（新浪日线接口不支持）。",
+        filt,
         f"# 生成命令：`{cmd}`",
         "#",
         "# 一行一只：`代码 名称`（代码用新浪格式 sh/sz + 6 位，名称仅作注释）。",
         "#",
-        "# ⚠️ 这不是「股票池推荐」，只是为策略评估凑样本量的**回测样本**。",
+        warn,
         f"# {note}",
         "",
     ]
     if added:
-        lines.append(f"# ---- 以下 {len(added)} 只由 --include 并入（原 50 只池中成交额不足的） ----")
+        lines.append(f"# ---- 以下 {len(added)} 只由 --include 并入 ----")
         lines.append("")
     lines += [f"{code} {name}" for code, name in pool]
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"写出 {len(pool)} 只（快照前 {args.n} + 并入 {len(added)}）→ {out}")
+    if args.mode == "mainboard":
+        print(f"写出 {len(pool)} 只主板票（并入 {len(added)}）→ {out}")
+    else:
+        print(f"写出 {len(pool)} 只（快照前 {args.n} + 并入 {len(added)}）→ {out}")
     print(f"前 8：{pool[:8]}")
     return 0
 
