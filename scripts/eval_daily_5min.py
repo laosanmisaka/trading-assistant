@@ -62,6 +62,22 @@ czsc 判笔所需的 bar 数与级别**无关**（实测：日线 12.4~14.0 根/
 - ``one``：只一买
 - ``one_div``：一买 **且带背驰**（``require_divergence=True``，需传 bars）
 
+动态止损（``--trail``，报告 §8）
+--------------------------------
+2026-09-23 定稿的出场规则，与固定持有期并列独立统计（两者互不影响）：
+- 第 1~10 个交易日：``stop = max(成本×(1−5%), 中枢上沿)`` —— **取较高者**（更紧）；
+- 第 11 个交易日起：``stop = max(成本, 前一交易日收盘的 MA20)`` —— **保本优先**；
+- 收益触及 **+15%** 减半仓（只触发一次）；止损盘中触及即出、跳空低开按开盘价；
+- **同根 bar 内两者都触 ⇒ 先止损**（bar 内部无法分辨先后，取悲观）；
+- 兜底 ``--max-hold``（默认 60）交易日，窗口不满的点剔除（与 ``hold_ret`` 越界同口径）。
+
+⚠️ **MA20 必须滞后一天**：日内只能看到**前一交易日收盘**算出的均线，所以序列要
+``rolling(20).mean().shift(1)``。用当日 MA20 等于偷看当天收盘价。``zg``（中枢上沿）
+没这个问题 —— 它在突破那一刻就已固定。
+
+⚠️ 随机基准跑**同一套**规则（时间轴均匀抽样）。唯一的口径差异：随机入场没有
+「参照中枢」⇒ 第一阶段少了 ``zg`` 这层保护、基准偏松 ⇒ 信号超额被**低估**。
+
 回撤拆解与统计功效（报告 §5~§7）
 --------------------------------
 - **MAE / MFE**：入场后持有窗内的最大不利/有利偏移（各自级别的 low/high）。
@@ -246,6 +262,138 @@ def baseline_ret(entry_px: list[float], exit_px: list[float],
     return {"n": len(vals), "mean": float(s.mean()), "median": float(s.median())}
 
 
+# ======================================================================
+# 动态止损（10 日换线 + 15% 减半）
+# ======================================================================
+
+TRAIL_HALF_WEIGHT = 0.5          # 收益触及 half_profit 时减掉的仓位
+TRAIL_MA = 20                    # 第二阶段跟随的日线均线周期
+
+
+def trail_exit(hi: list[float], lo: list[float], op: list[float],
+               cl: list[float], dts: list[pd.Timestamp],
+               entry_idx: int | None, cost: float | None, *,
+               zg: float | None = None,
+               ma_prev: list[float | None] | None = None,
+               dtd: list[pd.Timestamp] | None = None,
+               trail_days: int = 10, trail_stop: float = 5.0,
+               half_profit: float = 15.0, max_hold: int = 60,
+               mode: str = "stage") -> dict | None:
+    """动态止损 + 止盈减半：逐 5min bar 推进的持仓模拟
+
+    入场价 = ``entry_idx`` 那根 bar 的**收盘价**（``cost``），暴露自**下一根**起
+    （成交那根已经走完，与 ``excursion`` 的 ``incl_entry_bar=False`` 同源）。
+
+    ``mode="stage"``（完整规则）：
+    - 第 1~``trail_days`` 个交易日（每 48 根 bar 记 1 日）：``stop = max(cost×(1−trail_stop%), zg)``；
+    - 第 ``trail_days+1`` 个交易日起：``stop = max(cost, 前一交易日收盘的 MA20)``；
+    - 全程：``high ≥ cost×(1+half_profit%)`` → 按该价卖 ``TRAIL_HALF_WEIGHT``（只触发一次）；
+    - ``low ≤ stop`` → 剩余全清，**跳空低开按该 bar 开盘价**成交（与 ``stop_ret`` 同口径）；
+    - 同根 bar 内两者都触 → **按先止损处理**（bar 内部无法分辨先后，取悲观）。
+
+    ``mode="halfonly"``：只做止盈减半、不设止损 ⇒ 用来拆出止损线单独贡献了多少。
+
+    ⚠️ ``ma_prev`` 必须是**前一交易日收盘后**才已知的 MA20（调用方已 ``shift(1)``）。
+    日内用当日 MA20 是未来函数 —— 盘中并不知道当天收盘价。
+
+    ⚠️ 持仓窗不足 ``max_hold`` 个交易日的点返回 ``None``（与 ``hold_ret`` 越界
+    同口径：不拿截断窗口冒充到期收益）。
+
+    收益按**现金流口径** ``Σ(卖价×权重)/cost − 1`` —— 减半后剩半仓，两段成交价
+    不能简单平均。
+    """
+    if entry_idx is None or cost is None or cost <= 0:
+        return None
+    n_bars = max_hold * MIN5_BARS_PER_DAY
+    end = entry_idx + n_bars
+    if end >= len(cl):
+        return None
+
+    stop1 = cost * (1.0 - trail_stop / 100.0)
+    if zg is not None and not pd.isna(zg) and float(zg) > 0:
+        stop1 = max(stop1, float(zg))        # 阶段 1 取较高者（更紧）
+    half_px = cost * (1.0 + half_profit / 100.0)
+
+    remain, half_done = 1.0, False
+    legs: list[tuple[float, float, str]] = []
+    cur_day, stop2 = None, cost
+    k = entry_idx
+    for k in range(entry_idx + 1, end + 1):
+        if mode == "stage":
+            day_no = (k - entry_idx - 1) // MIN5_BARS_PER_DAY + 1
+            if day_no <= trail_days:
+                stop: float | None = stop1
+            else:
+                d = dts[k].date()
+                if d != cur_day:             # 每个交易日只需查一次 MA20
+                    cur_day = d
+                    stop2 = cost
+                    if ma_prev is not None and dtd is not None:
+                        j = bisect.bisect_right(dtd, ts(d)) - 1
+                        if 1 <= j <= len(ma_prev):
+                            m = ma_prev[j - 1]       # 前一交易日收盘才已知
+                            if m is not None and not pd.isna(m) and m > 0:
+                                stop2 = max(cost, float(m))
+                stop = stop2
+        else:
+            stop = None
+        if stop is not None and lo[k] <= stop:
+            legs.append((remain, min(op[k], stop), "止损"))
+            remain = 0.0
+            break
+        if not half_done and hi[k] >= half_px:
+            legs.append((TRAIL_HALF_WEIGHT, half_px, "止盈减半"))
+            remain -= TRAIL_HALF_WEIGHT
+            half_done = True
+    if remain > 1e-9:
+        legs.append((remain, cl[end], "到期"))
+        k = end
+
+    gross = sum(w * px for w, px, _ in legs)
+    bars = k - entry_idx
+    return {"ret": (gross / cost - 1.0) * 100.0,
+            "reason": legs[-1][2],
+            "half": half_done,
+            "bars": bars,
+            "days": bars / MIN5_BARS_PER_DAY,
+            "legs": legs}
+
+
+def trail_baseline(hi: list[float], lo: list[float], op: list[float],
+                   cl: list[float], dts: list[pd.Timestamp], *,
+                   ma_prev: list[float | None] | None = None,
+                   dtd: list[pd.Timestamp] | None = None,
+                   trail_days: int = 10, trail_stop: float = 5.0,
+                   half_profit: float = 15.0, max_hold: int = 60,
+                   n_samples: int = 80, mode: str = "stage") -> dict | None:
+    """同池随机入场 + **同一套动态止损** → 同构基准（时间轴上均匀抽样）
+
+    动态止损要逐 bar 模拟，全 bar 穷举的代价是每点 ``max_hold×48`` 步 × 几万根
+    bar，承受不起；改为在有效入场区间上**均匀**取 ``n_samples`` 个点。均匀覆盖
+    时间轴 ⇒ 均值无偏，只是不再逐 bar 精确。
+
+    ⚠️ 与信号口径的**唯一**差异：随机入场没有「参照中枢」⇒ 第一阶段止损线只有
+    ``cost×(1−trail_stop%)``（比 ``max(cost×0.95, zg)`` 更松）。基准因此更容易
+    扛过回调、数值偏高 ⇒ 信号超额被**低估**，方向上不会高估这套规则。
+    """
+    n_bars = max_hold * MIN5_BARS_PER_DAY
+    last = len(cl) - n_bars - 1
+    if last <= 0 or n_samples <= 0:
+        return None
+    step = max(1, last // n_samples)
+    vals: list[float] = []
+    for i in range(0, last, step):
+        r = trail_exit(hi, lo, op, cl, dts, i, cl[i], zg=None, ma_prev=ma_prev,
+                       dtd=dtd, trail_days=trail_days, trail_stop=trail_stop,
+                       half_profit=half_profit, max_hold=max_hold, mode=mode)
+        if r is not None and r["ret"] is not None:
+            vals.append(float(r["ret"]))
+    if not vals:
+        return None
+    s = pd.Series(vals, dtype=float)
+    return {"n": len(vals), "mean": float(s.mean()), "median": float(s.median())}
+
+
 def breakout_amp(bis: list[dict], p: dict) -> float | None:
     """三买点的**突破幅度%** = 突破笔高点 ÷ 参照中枢 zg − 1
 
@@ -271,11 +419,16 @@ def breakout_amp(bis: list[dict], p: dict) -> float | None:
 def analyze_one(code: str, cache_dir: Path, *, holds: list[int],
                 min_mode: str = "any", verbose: bool = False,
                 diag: dict | None = None,
-                min_breakout: float = 0.0) -> dict | None:
+                min_breakout: float = 0.0,
+                trail: dict | None = None) -> dict | None:
     """日线出三买 → 5min 在回调窗口内找买点 → 逐点明细 + 汇总
 
     ``diag`` 若传入（dict），返回 None 时写入 ``reason`` 说明原因 —— 报告必须
     如实列出「池子里哪几只没进统计、为什么」，不能静默少几只。
+
+    ``trail`` 非空则额外算动态止损（见 ``trail_exit``），参数包键：
+    ``days``（阶段 1 天数）/ ``stop``（成本下方百分点）/ ``half``（减半收益率）/
+    ``max_hold``（兜底交易日）/ ``samples``（随机基准抽样数）。
     """
     def note(msg: str) -> None:
         if diag is not None:
@@ -326,6 +479,12 @@ def analyze_one(code: str, cache_dir: Path, *, holds: list[int],
     hid = [float(k.high) for k in kd]
     lod = [float(k.low) for k in kd]
     cld = [float(k.close) for k in kd]
+    # 动态止损阶段 2 用的日线 MA20：``shift(1)`` ⇒ 第 i 日盘中只能看到第 i−1 日
+    # 收盘算出的均线，**无未来函数**（用当日 MA20 等于偷看当天收盘价）。
+    ma20 = None
+    if trail:
+        ma20 = (pd.Series(cld, dtype=float).rolling(TRAIL_MA).mean()
+                .shift(1).tolist())
     idx5 = {id(b): i for i, b in enumerate(bis_5)}
     cov_lo = dt5[0]
 
@@ -427,6 +586,19 @@ def analyze_one(code: str, cache_dir: Path, *, holds: list[int],
                 rec[f"SL{h}_{int(s)}"] = stop_ret(op5, lo5, cl5, e5, px5,
                                                   h * MIN5_BARS_PER_DAY, -abs(s),
                                                   incl_entry_bar=False)
+
+        # 动态止损（--trail）：同一入场点、**不按持有期**、走到出场条件为止
+        if trail:
+            tkw = {"ma_prev": ma20, "dtd": dtd,
+                   "trail_days": trail["days"], "trail_stop": trail["stop"],
+                   "half_profit": trail["half"], "max_hold": trail["max_hold"]}
+            for key, md in (("TR", "stage"), ("TRh", "halfonly")):
+                r = trail_exit(hi5, lo5, op5, cl5, dt5, e5, px5,
+                               zg=p.get("zg"), mode=md, **tkw)
+                rec[key] = r["ret"] if r else None
+                rec[f"{key}原因"] = r["reason"] if r else None
+                rec[f"{key}减半"] = r["half"] if r else None
+                rec[f"{key}天数"] = round(r["days"], 1) if r else None
         details.append(rec)
         if verbose:
             print(f"  窗口 {str(t_lo)[:10]} → 三买 {str(t_pt)[:10]} | 日线确认 "
@@ -457,6 +629,16 @@ def analyze_one(code: str, cache_dir: Path, *, holds: list[int],
         if b5 is not None:
             base["5min"][h] = b5
 
+    # ---- 动态止损的同构基准：随机入场 + 同一套规则（均匀抽样） ----
+    base_tr: dict[str, dict | None] = {}
+    if trail:
+        for md in ("stage", "halfonly"):
+            base_tr[md] = trail_baseline(
+                hi5, lo5, op5, cl5, dt5, ma_prev=ma20, dtd=dtd,
+                trail_days=trail["days"], trail_stop=trail["stop"],
+                half_profit=trail["half"], max_hold=trail["max_hold"],
+                n_samples=trail.get("samples", 80), mode=md)
+
     # ---- 汇总 ----
     summ = {}
     for h in holds:
@@ -475,7 +657,7 @@ def analyze_one(code: str, cache_dir: Path, *, holds: list[int],
         "提前中位": round(pd.Series(leads).median(), 2) if leads else None,
         "价优中位": round(pd.Series(advs).median(), 2) if advs else None,
         "幅度中位": round(pd.Series(amps_kept).median(), 2) if amps_kept else None,
-        "汇总": summ, "基准": base, "明细": details,
+        "汇总": summ, "基准": base, "基准TR": base_tr, "明细": details,
     }
 
 
@@ -511,6 +693,38 @@ def collect_points(rows: list[dict], side: str, h: int) -> list[dict]:
 def base_of(rows: list[dict], side: str, h: int) -> dict[str, float]:
     return {r["代码"]: float(r["基准"][side][h]["mean"]) for r in rows
             if r.get("基准", {}).get(side, {}).get(h, {}).get("mean") is not None}
+
+
+def trail_points(rows: list[dict], key: str = "TR") -> list[dict]:
+    """动态止损的逐点收益 → ``[{code, ret, idx, dt}]``
+
+    与 ``collect_points`` 返回同结构，可直接喂给 ``metrics`` / 两个 bootstrap。
+    动态止损没有固定持有期，``deoverlap`` 用不上（用 ``max_hold`` 的 bar 数）。
+    """
+    out = []
+    for r in rows:
+        for d in r["明细"]:
+            v, i = d.get(key), d.get("_entry5")
+            if v is None or i is None:
+                continue
+            try:
+                if pd.isna(v):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            out.append({"code": d["代码"], "ret": float(v), "idx": int(i),
+                        "dt": d.get("最早买点")})
+    return out
+
+
+def trail_base_of(rows: list[dict], mode: str = "stage") -> dict[str, float]:
+    """每只标的的动态止损随机基准（样本均值）"""
+    out: dict[str, float] = {}
+    for r in rows:
+        b = (r.get("基准TR") or {}).get(mode)
+        if b and b.get("mean") is not None:
+            out[r["代码"]] = float(b["mean"])
+    return out
 
 
 def deoverlap(points: list[dict], hold_bars: int) -> list[dict]:
@@ -748,7 +962,8 @@ def _ex(m: dict | None) -> str:
 def build_report(rows: list[dict], *, min_mode: str, holds: list[int],
                  pool_size: int = 0,
                  skipped: list[tuple[str, str]] | None = None,
-                 min_breakout: float = 0.0) -> str:
+                 min_breakout: float = 0.0,
+                 trail: dict | None = None) -> str:
     L: list[str] = []
     add = L.append
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -983,6 +1198,105 @@ def build_report(rows: list[dict], *, min_mode: str, holds: list[int],
         "（当根收盘）后持有 5 交易日收益；MAE5 = 5min 入场后 5 交易日内的最大不利偏移"
         "（自入场 bar 下一根起算）。")
     add("")
+
+    # ---- 8. 动态止损 ----
+    if trail:
+        ds, hl, hd = trail["days"], trail["half"], trail["max_hold"]
+        add("## 8. 动态止损：10 日换线 + 15% 减半")
+        add("")
+        add(f"- 止损线：第 1~{ds} 个交易日 = `max(成本 × {1 - trail['stop'] / 100:.2f}, "
+            f"中枢上沿)`；第 {ds + 1} 个交易日起 = `max(成本, 前一交易日收盘的 MA{TRAIL_MA})`")
+        add(f"- 止盈：收益触及 **+{hl:g}%** 时减半仓；最长持有 **{hd} 交易日**兜底")
+        add("- 成交：止损盘中触及即出（跳空低开按开盘价）、减半按 `成本 × "
+            f"{1 + hl / 100:.2f}` 成交；**同根 bar 内两者都触及时先止损**（悲观）")
+        add(f"- 随机基准：同池随机入场（时间轴均匀 {trail.get('samples', 80)} 点/只）跑"
+            "**同一套**规则；唯一差异是随机入场没有参照中枢、第一阶段少了 `zg` 这层"
+            "保护 ⇒ 基准偏松、超额偏保守")
+        add(f"- ⚠️ 只有持仓窗满 {hd} 个交易日的点才计入 ⇒ 样本比 §3 少末端一批")
+        add("")
+        add("| 口径 | 样本 | 胜率 | 平均% | 中位% | 平均持有(交易日) | 随机基准% | 超额% | "
+            "标的cluster 95% | P(≤0) | 季度block 95% | P(≤0) |")
+        add("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+
+        h_ref = max(holds)
+        tr_ids = {(p["code"], p["idx"]) for p in trail_points(rows, "TR")}
+        ref_vals: list[float] = []
+        ref_codes: set[str] = set()
+        for r in rows:
+            for d in r["明细"]:
+                if (d["代码"], d.get("_entry5")) not in tr_ids:
+                    continue
+                ref_codes.add(d["代码"])
+                v = d.get(f"M{h_ref}")
+                if v is None:
+                    continue
+                try:
+                    if pd.isna(v):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                ref_vals.append(float(v))
+        bv = [r["基准"]["5min"][h_ref]["mean"] for r in rows
+              if r["代码"] in ref_codes
+              and r.get("基准", {}).get("5min", {}).get(h_ref, {}).get("mean") is not None]
+        ref_base = sum(bv) / len(bv) if bv else None
+
+        for label, key, md in (("动态止损（完整规则）", "TR", "stage"),
+                               ("只减半 · 不设止损", "TRh", "halfonly"),
+                               (f"固定持有 {h_ref} 日（同一批点）", None, None)):
+            if key is None:
+                sp = summarize(ref_vals)
+                bmk, boot, boot_t = ref_base, None, None
+                dsum: float | None = float(h_ref)
+            else:
+                base = trail_base_of(rows, md)
+                pts = trail_points(rows, key)
+                m = metrics(pts, base)
+                if not m:
+                    continue
+                sp = summarize([p["ret"] for p in pts if p["code"] in base])
+                bmk = m["base"]
+                boot = cluster_bootstrap(pts, base)
+                boot_t = block_bootstrap(pts, base)
+                dv = [d.get(f"{key}天数") for r in rows for d in r["明细"]]
+                dv = [float(x) for x in dv if x is not None]
+                dsum = float(np.mean(dv)) if dv else None
+            if not sp["n"]:
+                continue
+            ex = (sp["平均"] - bmk) if (sp["平均"] is not None and bmk is not None) else None
+            rng = f"[{boot['lo']:+.2f}, {boot['hi']:+.2f}]" if boot else "--"
+            p0 = _pct(boot["p_le0"]) if boot else "--"
+            rng2 = f"[{boot_t['lo']:+.2f}, {boot_t['hi']:+.2f}]" if boot_t else "--"
+            p02 = _pct(boot_t["p_le0"]) if boot_t else "--"
+            add(f"| {label} | {sp['n']} | {_pct(sp['胜率'])} | {_fmt(sp['平均'])} | "
+                f"{_fmt(sp['中位'])} | {_fmt(dsum, 1)} | {_fmt(bmk)} | "
+                f"{('%+.2f' % ex) if ex is not None else '--'} | {rng} | {p0} | "
+                f"{rng2} | {p02} |")
+        add("")
+
+        rc: dict[str, int] = {}
+        n_half = n_tr = 0
+        for r in rows:
+            for d in r["明细"]:
+                k = d.get("TR原因")
+                if k is None:
+                    continue
+                n_tr += 1
+                if d.get("TR减半"):
+                    n_half += 1
+                k = ("减半后止损" if d.get("TR减半") else "止损") if k == "止损" else k
+                rc[k] = rc.get(k, 0) + 1
+        if n_tr:
+            add(f"- **出场原因**（完整规则，n={n_tr}）："
+                + "；".join(f"{k} {v} 个（{v / n_tr:.0%}）"
+                            for k, v in sorted(rc.items(), key=lambda x: -x[1]))
+                + f"；**减半触发率 {n_half / n_tr:.1%}**")
+            add("")
+        add("读法：**「动态止损」行要跟「固定持有」行比**才有意义 —— 同一批点、同一"
+            "基准口径，差别只在于出场规则。若动态止损超额低于固定持有，说明止损线在"
+            "这批样本上砍掉了后来涨回来的点（§6 的止损列给过同类证据）。")
+        add("")
+
     add("---")
     add(f"生成命令：`python scripts/eval_daily_5min.py {' '.join(sys.argv[1:])}`")
     return "\n".join(L) + "\n"
@@ -1025,6 +1339,18 @@ def main(argv=None) -> int:
                    help="5min 侧口径：any=一/二买，one=只一买，one_div=一买且背驰")
     p.add_argument("--min-breakout", type=float, default=0.0,
                    help="日线突破幅度闸门（%）：突破笔高点÷参照中枢zg−1 低于此值的点剔除；0=不过滤")
+    p.add_argument("--trail", action="store_true",
+                   help="额外评估动态止损（10 日换线 + 15%% 减半，见报告 §8）")
+    p.add_argument("--trail-days", type=int, default=10,
+                   help="动态止损第一阶段天数（交易日）")
+    p.add_argument("--trail-stop", type=float, default=5.0,
+                   help="第一阶段止损线：成本下方几个百分点")
+    p.add_argument("--half-profit", type=float, default=15.0,
+                   help="止盈减半的收益率（%%）")
+    p.add_argument("--max-hold", type=int, default=60,
+                   help="动态止损的最长持有交易日（兜底，到期按收盘清仓）")
+    p.add_argument("--trail-samples", type=int, default=80,
+                   help="动态止损随机基准的抽样点数（每只标的）")
     p.add_argument("--dump-points", default="", help="逐点结果写 CSV（路径）")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--out", default="", help="报告输出路径")
@@ -1045,9 +1371,14 @@ def main(argv=None) -> int:
 
     out = Path(a.out) if a.out else (
         ROOT / "outputs" / f"daily5min_{a.min_mode}.md")
+    trail = ({"days": a.trail_days, "stop": a.trail_stop, "half": a.half_profit,
+              "max_hold": a.max_hold, "samples": a.trail_samples}
+             if a.trail else None)
     print(f"日线+5min 联立：{len(pool)} 只 | 持有 {holds} | 口径 {a.min_mode} | "
           f"幅度闸门 {'关' if a.min_breakout <= 0 else f'>={a.min_breakout:g}%'} | "
-          f"缓存 {a.cache_dir}")
+          + (f"动态止损 {a.trail_days}日换线/-{a.trail_stop:g}%/+{a.half_profit:g}%减半/"
+             f"兜底{a.max_hold}日 | " if trail else "")
+          + f"缓存 {a.cache_dir}")
 
     rows: list[dict] = []
     skipped: list[tuple[str, str]] = []
@@ -1056,7 +1387,7 @@ def main(argv=None) -> int:
         try:
             r = analyze_one(code, a.cache_dir, holds=holds, min_mode=a.min_mode,
                             verbose=a.verbose, diag=diag,
-                            min_breakout=a.min_breakout)
+                            min_breakout=a.min_breakout, trail=trail)
         except Exception as exc:
             why = f"{type(exc).__name__}: {exc}"
             skipped.append((code, why))
@@ -1080,7 +1411,7 @@ def main(argv=None) -> int:
 
     text = build_report(rows, min_mode=a.min_mode, holds=holds,
                         pool_size=len(pool), skipped=skipped,
-                        min_breakout=a.min_breakout)
+                        min_breakout=a.min_breakout, trail=trail)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
     print(f"\n报告 → {out}")

@@ -66,7 +66,7 @@ def to_klines(df: pd.DataFrame, code: str) -> list[KLineData]:
 
 
 def load_daily(cache_dir: Path, sym: str, days: int) -> tuple[list[KLineData], bool]:
-    """优先吃 `eval_six_pulse.py` 落的日线缓存（同格式），没有再联网取"""
+    """优先吃 outputs/cache_daily 的日线缓存（同格式），没有再联网取"""
     f = Path(cache_dir) / f"{sym}_{days}.csv"
     if f.exists() and f.stat().st_size > 0:
         return to_klines(pd.read_csv(f, dtype={"date": str}), sym), True
@@ -201,7 +201,7 @@ def render(kind_stats: list[dict], slices: list[dict], rows: list[dict],
     add("")
     add(f"- 标的：`{Path(args.pool).name}`，实扫 {head['codes']} 只"
         f"（成功 {head['ok']} 只）")
-    add(f"- 数据：日线 {DEFAULT_DAYS} 根（`eval_six_pulse.py` 的缓存），"
+    add(f"- 数据：日线 {DEFAULT_DAYS} 根（`outputs/cache_daily` 缓存），"
         f"{head['start']} ~ {head['end']}")
     add("- 口径 A：`confirm_dt` = **下一笔的终点** ⇒ 保守上界（分型比整笔快）")
     add("- 口径 B：切片重算 —— 只喂到 t，看点最早在哪天出现 ⇒ 实测值")
