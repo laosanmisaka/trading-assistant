@@ -369,7 +369,10 @@ def fetch_today_1min_bars(code: str) -> list[dict]:
             # 拉最近 300 条 1min (覆盖当天的全部分钟 + 前一天的尾盘)
             df = client.bars(symbol=code, frequency=8, start=0, offset=300)
             if df is None or df.empty:
-                return []
+                # 服务器连得上但数据查询返空（本机 mootdx 的真实形态：TCP 通、
+                # 数据帧被 DPI 掐掉）—— 不能当"今天没数据"返回空，必须走新浪回退
+                logger.warning(f"TDX 今日1min返回空 ({code})，回退新浪")
+                break
 
             today_str = datetime.now().strftime("%Y-%m-%d")
             result = []
@@ -406,8 +409,14 @@ def fetch_today_1min_bars(code: str) -> list[dict]:
 
 
 def _fetch_today_1min_sina_fallback(code: str) -> list[dict]:
-    """Sina 分时数据回退 (只有 price+volume，无完整 OHLC)"""
-    bars = fetch_intraday_data(code)
+    """Sina 分时数据回退 (只有 price+volume，无完整 OHLC)
+
+    注意：sina 1min 接口返回的是最近 ~1970 根（跨多个交易日），
+    必须按当天日期过滤，否则多日 bar 会被错误聚合进「今日 OHLCV」。
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    bars = [b for b in fetch_intraday_data(code)
+            if str(b.get("time", "")).startswith(today_str)]
     return [{
         "code": code,
         "timestamp": b["time"],
