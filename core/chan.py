@@ -265,6 +265,28 @@ def build(klines: Iterable[KLineData], period: str = "30min") -> Optional[ChanRe
     return ChanResult(obj=obj, period=period, bars=ordered, index_of=index_of)
 
 
+def iter_structures(klines: Iterable[KLineData], period: str):
+    """逐收口 bar 推进同一个 CZSC，只暴露当时可见的笔/中枢。
+
+    返回 (当前 KLineData, 笔, 中枢)。流接口仅按时间定位，笔的数组下标不
+    是事件身份；start_idx/end_idx 保持 -1，不能用来索引输入行情。
+    """
+    df = klines_to_df(klines)
+    if df.empty:
+        return
+    czsc = _load_czsc()
+    raw = czsc.format_standard_kline(df, freq=_freq_of(period))
+    obj = czsc.CZSC([raw[0]], max_bi_num=max(500, len(raw)))
+    view = ChanResult(obj=obj, period=period, bars=[], index_of={})
+    for index, bar in enumerate(raw):
+        if index:
+            obj.update(bar)
+        current = KLineData(code=str(bar.symbol), date=str(bar.dt), open=float(bar.open),
+                            high=float(bar.high), low=float(bar.low), close=float(bar.close),
+                            volume=int(bar.vol), period=period)
+        yield current, bis(view), centers(view)
+
+
 def fractals(result: ChanResult, kind: Optional[str] = None) -> list[dict]:
     """分型列表
 

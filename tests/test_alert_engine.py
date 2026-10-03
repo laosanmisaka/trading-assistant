@@ -55,15 +55,18 @@ class TestManualOverride:
         state = engine.get_state("000001")
         assert state.sl_manual is False
 
-    def test_manual_persisted_across_engines(self, temp_db):
+    @pytest.mark.parametrize("order", [("sl", "tp"), ("tp", "sl")])
+    def test_manual_persisted_across_engines(self, temp_db, order):
         """手动设置在数据库持久化，新引擎自动加载"""
         engine1 = AlertEngine()
-        engine1.set_manual_sl("000001", 7.77)
+        for field in order:
+            getattr(engine1, f"set_manual_{field}")("000001", 7.77 if field == "sl" else 12.0)
 
         engine2 = AlertEngine()
         state = engine2.get_state("000001")
         assert state.sl_manual is True
         assert state.stop_loss_price == 7.77
+        assert state.tp_manual and state.take_profit_price == 12.0
 
         engine2.clear_manual("000001", "all")
 
@@ -136,7 +139,7 @@ class TestAlertCheck:
 class TestCalcTakeProfitThrottle:
     """calc_take_profit 的30min分型检测限流 (避免高频重复调用API)"""
 
-    def test_first_call_checks_fractal(self, engine, temp_db):
+    def test_first_call_checks_fractal(self, engine, temp_db, monkeypatch):
         """首次调用应该触发检测 (返回的新tp可能不同于初始值)"""
         from data.database import add_trade, get_all_groups
         from data.models import Trade, TradeType
@@ -149,9 +152,19 @@ class TestCalcTakeProfitThrottle:
         state = engine.get_state("000001")
         state._last_fractal_check = 0  # 强制允许检查
 
+        from types import SimpleNamespace
+        rows = [{"timestamp": f"2026-05-20 {hour}:00:00", "open": 10, "high": high,
+                 "low": low, "close": 10, "volume": 100} for hour, high, low in
+                (("10", 12, 8), ("11", 15, 9), ("14", 12, 8))]
+        manager = SimpleNamespace(get_minute_klines_from_db=lambda *a: rows)
+        monkeypatch.setattr("core.alert_engine.get_data_manager", lambda: manager)
         tp, conflict = engine.calc_take_profit("000001", 10.50)
-        # 至少应设置了涨停价止盈
-        assert tp > 0
+        assert tp > 0 and not state.top_fractal_detected
+        for row in rows:
+            row["timestamp"] = row["timestamp"].replace("05-20", "05-21")
+        state._last_fractal_check = 0
+        tp, conflict = engine.calc_take_profit("000001", 10.50)
+        assert tp == 15 and state.top_fractal_detected
 
     def test_second_call_within_60s_skips(self, engine, temp_db):
         """60秒内第二次调用不触发API (返回原值)"""

@@ -73,7 +73,7 @@ DEFAULT_CACHE = ROOT / "outputs" / "cache_min"
 BAOSTOCK_FREQ = {"daily": "d", "5min": "5", "15min": "15", "30min": "30", "60min": "60"}
 
 #: 级别 → 分段天数（保证单段 ≤ 约 3,200 行，绕开 baostock 单次查询上限）；0 = 不分段
-CHUNK_DAYS = {"daily": 0, "5min": 90, "15min": 180, "30min": 365, "60min": 730, "1min": 0}
+CHUNK_DAYS = {"daily": 3650, "5min": 90, "15min": 180, "30min": 365, "60min": 730, "1min": 0}
 
 #: 级别 → 默认起始日期（5min 的物理下限是 2020-01-02，取更早只是白跑）
 DEFAULT_START = {
@@ -219,6 +219,8 @@ def _fetch_baostock_segment(session: BaostockSession, code: str, period: str,
         rows = []
         while rs.next():
             rows.append(rs.get_row_data())
+        if rs.error_code != "0":
+            raise RuntimeError(f"baostock 在读取中失败: {rs.error_code}: {rs.error_msg}")
         if not rows:
             return pd.DataFrame(columns=["dt", "open", "high", "low", "close", "volume"])
         df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
@@ -232,6 +234,8 @@ def _fetch_baostock_segment(session: BaostockSession, code: str, period: str,
         rows = []
         while rs.next():
             rows.append(rs.get_row_data())
+        if rs.error_code != "0":
+            raise RuntimeError(f"baostock 在读取中失败: {rs.error_code}: {rs.error_msg}")
         if not rows:
             return pd.DataFrame(columns=["dt", "open", "high", "low", "close", "volume"])
         df = pd.DataFrame(rows, columns=["date", "time", "open", "high", "low",
@@ -254,7 +258,7 @@ def fetch_baostock(session: BaostockSession, sym: str, period: str,
                    start: str, end: str, *, chunk_days: int | None = None,
                    seg_attempts: int = 3, seg_sleep: float = 1.0,
                    ) -> tuple[pd.DataFrame, dict]:
-    """分段取一只 → ``(df, 统计)``；全部段失败才抛异常
+    """分段取一只 → ``(df, 统计)``；任一段失败即抛异常
 
     ``统计`` 含 ``段数 / 成功段 / 失败段 / 覆盖``，用于暴露静默截断。
     """
@@ -287,6 +291,8 @@ def fetch_baostock(session: BaostockSession, sym: str, period: str,
         if seg_sleep > 0 and len(segs) > 1:
             time.sleep(seg_sleep)
 
+    if failed:
+        raise RuntimeError(f"{sym} {period} 分段不完整，拒绝缓存：{failed}")
     if not frames:
         raise RuntimeError(f"{sym} 未取到 {period} 行情（{start}~{end}，"
                            f"{len(segs)} 段全失败）")
@@ -321,44 +327,24 @@ def cache_path(cache_dir: Path, sym: str, period: str) -> Path:
 
 def cache_valid(path: Path, cache_days: int, *,
                 start: str = "", end: str = "", slack_days: int = 15) -> bool:
-    """缓存判据：存在、非空、mtime 不超过 ``cache_days`` 天，且**覆盖请求区间**
-
-    ⚠️ 只看 mtime 会出大错：先取「近 1 个月」再取「近 5 年」，第二次会命中
-    第一份短缓存，样本被静默截短。所以必须再校验区间覆盖 —— 用 ``slack_days``
-    容忍起止落点不是交易日（以及停牌）造成的自然偏差。
-    """
-    if not path.exists() or path.stat().st_size == 0:
+    """Require hash-bound complete request coverage, including the interior segments."""
+    from data.cache_files import metadata
+    meta = metadata(path)
+    if not meta:
         return False
     age = (date.today() - datetime.fromtimestamp(path.stat().st_mtime).date()).days
-    if age > cache_days:
-        return False
-    if not (start or end):
-        return True
-    try:
-        df = pd.read_csv(path, usecols=["dt"])
-    except Exception:
-        return False
-    if df.empty:
-        return False
-    lo = str(df["dt"].iloc[0])[:10]
-    hi = str(df["dt"].iloc[-1])[:10]
-    slack = pd.Timedelta(days=slack_days)
-    if start and pd.Timestamp(lo) > pd.Timestamp(start) + slack:
-        return False
-    if end and pd.Timestamp(hi) < pd.Timestamp(end) - slack:
-        return False
-    return True
+    return (age <= cache_days and (not start or meta["requested_start"] <= start)
+            and (not end or meta["requested_end"] >= end))
 
 
 # ======================================================================
 # 主流程
 # ======================================================================
 
-def fetch_one(sym: str, period: str, *, cache_dir: Path, start: str, end: str,
-              use_cache: bool, cache_days: int, attempts: int, sleep: float,
-              chunk_days: int | None,
-              session: BaostockSession | None) -> tuple[pd.DataFrame, bool, dict]:
+def fetch_one(sym, period, *, cache_dir, start, end, config, session):
     """取一只（或读缓存）→ ``(df, 是否走缓存, 统计)``"""
+    use_cache, cache_days = config["use_cache"], config["cache_days"]
+    attempts, sleep, chunk_days = config["attempts"], config["sleep"], config["chunk_days"]
     f = cache_path(cache_dir, sym, period)
     if use_cache and cache_valid(f, cache_days, start=start, end=end):
         df = pd.read_csv(f)
@@ -386,8 +372,53 @@ def fetch_one(sym: str, period: str, *, cache_dir: Path, start: str, end: str,
     if not stat.get("覆盖") and len(df):
         stat["覆盖"] = f"{str(df['dt'].iloc[0])[:10]} ~ {str(df['dt'].iloc[-1])[:10]}"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(f, index=False)
+    from data.cache_files import publish
+    publish(f, df, source="sina" if period == "1min" else "baostock",
+            adjustment="unadjusted" if period == "1min" else "qfq",
+            start=str(df["dt"].iloc[0])[:10] if period == "1min" else start,
+            end=str(df["dt"].iloc[-1])[:10] if period == "1min" else end)
     return df, False, stat
+
+
+def _fetch_pool(pool, a, start, end, chunk_days):
+    period = a.period
+    n_cache = n_net = n_fail = 0
+    rows: list[dict] = []
+
+    ctx = BaostockSession()
+    with ctx:
+        for i, (sym, name) in enumerate(pool, 1):
+            t0 = time.time()
+            try:
+                df, cached, stat = fetch_one(sym, period, cache_dir=a.cache_dir,
+                                             start=start, end=end,
+                                             config={"use_cache": not a.no_cache, "cache_days": a.cache_days,
+                                                     "attempts": a.attempts, "sleep": a.sleep,
+                                                     "chunk_days": chunk_days},
+                                             session=ctx)
+                n_cache += cached
+                n_net += not cached
+                segtxt = "" if cached else f" 段{stat['成功段']}/{stat['段数']}"
+                if not cached and stat.get("重登"):
+                    segtxt += f" 重登{stat['重登']}次"
+                rows.append({"代码": sym, "名称": name, "行数": len(df),
+                             "覆盖": stat.get("覆盖", ""),
+                             "来源": "缓存" if cached else "网络"})
+                print(f"[{i}/{len(pool)}] {sym} {name}: {len(df)} 行 "
+                      f"({stat.get('覆盖', '')}){segtxt} "
+                      f"{'缓存' if cached else '网络'} {time.time() - t0:.1f}s",
+                      flush=True)
+            except Exception as exc:
+                n_fail += 1
+                rows.append({"代码": sym, "名称": name, "行数": 0,
+                             "错误": str(exc)[:120]})
+                print(f"[{i}/{len(pool)}] {sym} {name}: ✗ {exc}", flush=True)
+                continue
+
+            if not cached and a.sleep > 0:
+                time.sleep(a.sleep)
+
+    return rows, n_cache, n_net, n_fail
 
 
 def main(argv=None) -> int:
@@ -438,43 +469,8 @@ def main(argv=None) -> int:
     print(f"取数：{len(pool)} 只 | {period} | {start} ~ {end} | "
           f"{ck if ck else '不分'}段×{len(segs)} | 缓存 → {a.cache_dir}")
 
-    n_cache = n_net = n_fail = 0
-    rows: list[dict] = []
     started = time.time()
-
-    ctx = BaostockSession()
-    with ctx:
-        for i, (sym, name) in enumerate(pool, 1):
-            t0 = time.time()
-            try:
-                df, cached, stat = fetch_one(sym, period, cache_dir=a.cache_dir,
-                                             start=start, end=end,
-                                             use_cache=not a.no_cache,
-                                             cache_days=a.cache_days,
-                                             attempts=a.attempts, sleep=a.sleep,
-                                             chunk_days=chunk_days,
-                                             session=ctx)
-                n_cache += cached
-                n_net += not cached
-                segtxt = "" if cached else f" 段{stat['成功段']}/{stat['段数']}"
-                if not cached and stat.get("重登"):
-                    segtxt += f" 重登{stat['重登']}次"
-                rows.append({"代码": sym, "名称": name, "行数": len(df),
-                             "覆盖": stat.get("覆盖", ""),
-                             "来源": "缓存" if cached else "网络"})
-                print(f"[{i}/{len(pool)}] {sym} {name}: {len(df)} 行 "
-                      f"({stat.get('覆盖', '')}){segtxt} "
-                      f"{'缓存' if cached else '网络'} {time.time() - t0:.1f}s",
-                      flush=True)
-            except Exception as exc:
-                n_fail += 1
-                rows.append({"代码": sym, "名称": name, "行数": 0,
-                             "错误": str(exc)[:120]})
-                print(f"[{i}/{len(pool)}] {sym} {name}: ✗ {exc}", flush=True)
-                continue
-
-            if not cached and a.sleep > 0:
-                time.sleep(a.sleep)
+    rows, n_cache, n_net, n_fail = _fetch_pool(pool, a, start, end, chunk_days)
 
     ok = [r for r in rows if not r.get("错误")]
     total = sum(r["行数"] for r in ok)

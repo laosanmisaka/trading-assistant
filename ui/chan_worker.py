@@ -45,11 +45,19 @@ class ChanMarkWorker(QThread):
 
     def _compute(self) -> dict:
         """取数 + 计算（纯同步逻辑，便于离线测试直接调用）"""
-        klines = self._klines
-        if klines is None:
-            klines = chan_viz.fetch_klines(self.code, self.period)
-        marks = chan_viz.marks_from_klines(klines, code=self.code)
-        marks["triple"] = self._triple_marks()
+        triple = self._triple_marks()
+        try:
+            klines = self._klines
+            if klines is None:
+                klines = chan_viz.fetch_klines(self.code, self.period)
+            marks = chan_viz.marks_from_klines(klines, code=self.code)
+        except Exception as error:
+            if not triple:
+                raise
+            logger.warning("几何图层失败但保留三买标注 %s: %s", self.code, error)
+            marks = {"geometry": [], "meta": {"geometry_error": str(error)}}
+        marks["trades"] = []
+        marks["triple"] = triple
         return marks
 
     def _triple_marks(self) -> list[dict]:
@@ -73,6 +81,8 @@ class ChanMarkWorker(QThread):
 
     def run(self):  # pragma: no cover - 线程体，逻辑都在 _compute
         try:
+            if self.isInterruptionRequested():
+                return
             marks = self._compute()
         except Exception as exc:
             logger.error(f"缠论买卖点计算失败 {self.code}: {exc}")

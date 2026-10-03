@@ -28,6 +28,35 @@ def qapp():
     yield app
 
 
+def test_position_cycle_pnl_and_alert_reset(qapp, temp_db, monkeypatch):
+    """一轮持仓完整闭环：平价、无行情、清仓、同日重开与自动提醒重置。"""
+    from core.alert_engine import AlertEngine
+    from data.database import add_trade
+    from data.models import Trade
+    from ui.trade_dialog import TradeDialog
+    quote = types.SimpleNamespace(price=10)
+    window = types.SimpleNamespace(data_manager=types.SimpleNamespace(get_quote=lambda c: quote))
+    monkeypatch.setattr(TradeDialog, "_get_main_window", lambda self: window)
+    add_trade(Trade(stock_code="TEST", price=10, quantity=100, trade_date="2026-01-05"))
+    dialog = TradeDialog("TEST")
+    assert "+0.00" in dialog.lbl_pnl.text()
+    engine = AlertEngine()
+    state = engine.get_state("TEST")
+    state.take_profit_price, state.top_fractal_detected = 11, True
+    quote.price = 0
+    dialog._update_summary()
+    assert "待有效行情" in dialog.lbl_pnl.text()
+    add_trade(Trade(stock_code="TEST", trade_type="sell", price=11, quantity=100,
+                    trade_date="2026-01-06"))
+    add_trade(Trade(stock_code="TEST", price=20, quantity=100, trade_date="2026-01-06"))
+    quote.price = 20
+    dialog._update_summary()
+    assert "+100.00" in dialog.lbl_pnl.text()
+    assert not engine.get_state("TEST").top_fractal_detected
+    assert engine.get_state("TEST").take_profit_price == 0
+    dialog.close()
+
+
 # ============================================================
 # 1. 分型索引精确还原
 # ============================================================

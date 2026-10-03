@@ -1,43 +1,12 @@
 # -*- coding: utf-8 -*-
-"""三买点基线统计 —— 有多少个点、成功率多少、止损放哪儿
+"""历史单级别几何诊断；不是当前可观察事件策略。
 
-    python scripts/eval_triple_buy.py                                  # 30min，50 只池
-    python scripts/eval_triple_buy.py --period 5min --pool scripts/pool_random500.txt
-    python scripts/eval_triple_buy.py --entry confirm --stop-zg        # 可交易口径 + 结构止损
-    python scripts/eval_triple_buy.py --holds 1,3,5,10,20 --limit 5 --dump-trades
+必须显式传 --retrospective。ideal 使用事后低点；confirm 仍以完整历史的
+下一笔终点代理确认，可能早于结构真正可知时刻，二者都有未来信息。
+固定持有与止损、基准也保留旧研究定义，不能据其证明可交易超额。
+当前主线请运行 eval_daily_5min.py；历史输出只供重现旧口径和定位偏差。
 
-为什么先做这个
---------------
-三买从来没有进过策略层（`core/chan_strategy` 只取日线一买/二买 + 30 分钟二买，
-三买只进 `counts` 计数）。所以「三买值不值得做」在产品里**一个数都没有**。
-本脚本用现成的几何判定直接测量，不改任何现有代码。
-
-两种入场口径（差一个「等确认」的距离）
---------------------------------------
-- ``--entry ideal``（默认，**不可交易的上界**）：以三买点本身的价格成交，
-  即回抽笔的 ``low``。这是「如果我能精确抓到那个低点」的理论天花板，
-  用来判断**判定逻辑本身有没有区分度**。
-- ``--entry confirm``（**可交易口径**）：三买点 = 回抽笔（bis[m]）的终点，
-  它要等**下一根笔**（bis[m+1]）走完才锁定 ⇒ 在 ``bis[m+1].edt`` 之后的
-  第一根 bar 开盘成交（A 股 T+1）。
-
-  ⚠️ 这仍是**乐观**估计：`diag_m30_lag.py` 量到 30 分钟级确认滞后中位
-  9 根 bar（口径 A = 下一笔终点作确认时刻），与这里同口径；真实可交易时点
-  不会早于它，只会更晚。
-
-出场与止损
-----------
-- 出场：``--holds`` 给出若干个**交易日**的固定持有期，各自独立统计
-  （不是累加，也不是资金曲线）。
-- 止损：``--stop-zg`` 时，持有期内只要有 bar 的 ``low`` 跌破该三买所依据的
-  中枢上沿 ``zg``，即视为结构失效、以 ``zg`` 成交（保守，忽略跳空）。
-
-⚠️ 统计口径
-------------
-- 按**点**统计，**不是资金曲线**。同一只标的的三买点可以密集出现、持有期
-  互相重叠，收益不可相加。这与 `scan_pool.py` 的既有口径一致。
-- 基准列为**同池随机入场**：每只标的所有 bar 上「持有 N 日」的收益中位数。
-  没有它，胜率 50% 这种数字没法解释（牛市里随便买都赚）。
+示例：python scripts/eval_triple_buy.py --retrospective --period 5min --limit 5
 """
 from __future__ import annotations
 
@@ -278,17 +247,19 @@ def _fmt(v, nd=2) -> str:
 def render_report(rows: list[dict], details: list[dict], *, period: str,
                   pool_path: Path, entry: str, stop_zg: bool,
                   holds_days: list[int], started: datetime,
-                  n_bars_total: int, n_days_total: int) -> str:
+                  totals: tuple[int, int]) -> str:
+    n_bars_total, n_days_total = totals
     L: list[str] = []
     add = L.append
-    add(f"# 三买点基线统计（{period}）")
+    add(f"# 历史三买几何诊断（{period}，非可交易结果）")
+    add("\n> 全历史几何含未来信息，confirm 也不是首次可观察确认。旧基准与止损假设仅供历史诊断；当前事件策略见 eval_daily_5min.py。\n")
     add("")
     add(f"- 生成时间：{started:%Y-%m-%d %H:%M}")
     add(f"- 标的池：`{pool_path.name}`（{len(rows)} 只）")
     add(f"- 入场口径：**{entry}**" + (
         "（以三买点本身的价格成交 —— 不可交易的理论上界，用于判断判定逻辑有无区分度）"
         if entry == "ideal" else
-        "（等回抽笔之后的下一笔终点确认，再下一根 bar 开盘成交 —— 乐观的可交易口径）"))
+        "（事后下一笔终点之后一根 bar 开盘；可能早于实际可观察确认，含未来信息）"))
     add(f"- 止损：{'跌破所依据中枢的 zg 即出场（以 zg 成交）' if stop_zg else '不设（只看固定持有期）'}")
     add(f"- 数据：{n_bars_total:,} 根 bar / 约 {n_days_total:,} 个交易日（来自 `outputs/cache_min/`）")
     add("")
@@ -296,6 +267,14 @@ def render_report(rows: list[dict], details: list[dict], *, period: str,
         "收益不可相加；这与其他诊断脚本口径一致。")
     add("")
 
+    _report_returns(L, rows, details, holds_days)
+    _report_baseline(L, rows, holds_days)
+    _report_excursion(L, rows, details, holds_days)
+    return "\n".join(L)
+
+
+def _report_returns(L, rows, details, holds_days):
+    add = L.append
     add("## 1. 逐持有期汇总（**全池聚合**）")
     add("")
     add("| 持有(交易日) | 三买点数 | 已平仓 | 未到期 | 止损数 | 止损率 | 胜率 | 平均% | 中位% | "
@@ -318,6 +297,11 @@ def render_report(rows: list[dict], details: list[dict], *, period: str,
         "「未到期」= 该持有期超出数据末尾、不计入统计。")
     add("")
 
+
+
+
+def _report_baseline(L, rows, holds_days):
+    add = L.append
     add("## 2. 对照：同池随机入场（不看信号）")
     add("")
     add("| 持有(交易日) | 随机入场 平均% | 随机入场 中位% | 三买 平均% | 超额% |")
@@ -335,11 +319,16 @@ def render_report(rows: list[dict], details: list[dict], *, period: str,
         sm = sum(sig) / len(sig)
         add(f"| {d} | {bm:.2f} | {bmed:.2f} | {sm:.2f} | {sm - bm:+.2f} |")
     add("")
-    add("读法：**超额≤0 就说明三买点没有择时价值** —— 随机哪天买都一样甚至更好。"
+    add("读法：超额仅是此历史诊断定义下的差值，不能证明真实可交易的择时能力。"
         "基准是该池每只标的所有 bar 上「持有 N 日」收益的中位数／均值（全体 bar，非抽样），"
         "再按标的**等权**平均（不按样本量加权，免得大样本标的吃掉小样本标的）。")
     add("")
 
+
+
+
+def _report_excursion(L, rows, details, holds_days):
+    add = L.append
     add("## 3. 逐标的")
     add("")
     cols = ["代码", "名称", "bar数", "交易日", "笔", "中枢", "三买点"]
@@ -365,12 +354,36 @@ def render_report(rows: list[dict], details: list[dict], *, period: str,
     add("MAE = 入场后的最大浮亏（负数），决定止损容差；MFE = 最大浮盈，"
         "决定止盈空间。**MAE 中位比平均收益更能说明「能不能拿得住」。**")
     add("")
-    return "\n".join(L)
 
 
 # ======================================================================
 # 入口
 # ======================================================================
+
+def _print_summary(rows, holds_days, out):
+    total_pts = sum(r.get("三买点", 0) for r in rows)
+    print("\n" + "=" * 56)
+    print(f"三买点合计 {total_pts} 个 | 报告：{out}")
+    for d in holds_days:
+        agg = [r["汇总"][d] for r in rows if r["汇总"].get(d, {}).get("n")]
+        if not agg:
+            continue
+        n = sum(x["n"] for x in agg)
+        wr = sum(x["胜率"] * x["n"] for x in agg) / n
+        mean = sum(x["平均"] * x["n"] for x in agg) / n
+        print(f"  持有 {d} 日：{n} 笔 | 胜率 {wr:.1%} | 平均 {mean:+.2f}%")
+
+
+def _selected_pool(a):
+    if a.codes:
+        pool = [(normalize_code(c), "") for c in (x.strip() for x in a.codes.split(",")) if c]
+    else:
+        pool = load_pool(a.pool)
+    if a.limit:
+        pool = pool[: a.limit]
+
+    return pool
+
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
@@ -383,22 +396,20 @@ def main(argv=None) -> int:
     p.add_argument("--codes", default="", help="只统计指定代码（逗号分隔）")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--entry", choices=["ideal", "confirm"], default="ideal",
-                   help="ideal=以三买点价格成交（上界）；confirm=等下一笔确认后开盘成交")
+                   help="ideal=以三买点价格成交（上界）；confirm=事后下一笔终点后开盘（仍含未来信息）")
     p.add_argument("--stop-zg", action="store_true",
                    help="跌破所依据中枢的 zg 即止损（以 zg 成交）")
     p.add_argument("--holds", default="1,3,5,10,20", help="持有期（交易日，逗号分隔）")
     p.add_argument("--lookback", type=int, default=chan_points.DEFAULT_LOOKBACK)
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--dump-trades", type=Path, default=None, help="逐点明细 CSV")
+    p.add_argument("--retrospective", action="store_true", help="明确使用含未来信息的历史诊断")
     a = p.parse_args(argv)
+    if not a.retrospective:
+        p.error("本脚本仅供历史诊断；当前主线请用 eval_daily_5min.py，重现旧口径须加 --retrospective")
 
     holds_days = [int(x) for x in a.holds.split(",") if x.strip()]
-    if a.codes:
-        pool = [(normalize_code(c), "") for c in (x.strip() for x in a.codes.split(",")) if c]
-    else:
-        pool = load_pool(a.pool)
-    if a.limit:
-        pool = pool[: a.limit]
+    pool = _selected_pool(a)
 
     started = datetime.now()
     print(f"标的池 {len(pool)} 只 | {a.period} | 入场 {a.entry} | "
@@ -465,7 +476,7 @@ def main(argv=None) -> int:
     out.write_text(render_report(rows, details, period=a.period, pool_path=a.pool,
                                  entry=a.entry, stop_zg=a.stop_zg,
                                  holds_days=holds_days, started=started,
-                                 n_bars_total=n_bars_total, n_days_total=n_days_total),
+                                 totals=(n_bars_total, n_days_total)),
                    encoding="utf-8")
 
     if a.dump_trades:
@@ -475,17 +486,7 @@ def main(argv=None) -> int:
         d.to_csv(dd, index=False, encoding="utf-8-sig")
         print(f"逐点明细：{dd}（{len(d)} 行）")
 
-    total_pts = sum(r.get("三买点", 0) for r in rows)
-    print("\n" + "=" * 56)
-    print(f"三买点合计 {total_pts} 个 | 报告：{out}")
-    for d in holds_days:
-        agg = [r["汇总"][d] for r in rows if r["汇总"].get(d, {}).get("n")]
-        if not agg:
-            continue
-        n = sum(x["n"] for x in agg)
-        wr = sum(x["胜率"] * x["n"] for x in agg) / n
-        mean = sum(x["平均"] * x["n"] for x in agg) / n
-        print(f"  持有 {d} 日：{n} 笔 | 胜率 {wr:.1%} | 平均 {mean:+.2f}%")
+    _print_summary(rows, holds_days, out)
     return 0
 
 

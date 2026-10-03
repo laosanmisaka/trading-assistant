@@ -108,3 +108,49 @@ class TestRefreshMinuteBars:
         count = manager.flush_today_bars()
         assert count == 1
         assert get_kline_count("000001", "daily") == 1
+
+
+def test_history_backfill_uses_latest_session_and_refreshes_all_periods(temp_db, monkeypatch):
+    import data.market_data_manager as module
+    from data.models import KLineData
+    from data.database import save_klines_batch
+    from core.trading_calendar import local_now
+    daily = [KLineData(code="000001", date=day, open=10, high=12, low=9, close=price,
+                       volume=100, period="daily") for day, price in
+             [("2026-06-12", 9.5), ("2026-06-15", 10.4)]]
+    minute = _fake_minute_bars("000001", "2026-06-12") + _fake_minute_bars("000001")
+    hourly = [{**minute[-1], "period": "60min"}]
+    monkeypatch.setattr(module, "fetch_kline", lambda *a: daily)
+    monkeypatch.setattr(module, "fetch_1min_kline_history", lambda *a: list(reversed(minute)))
+    monkeypatch.setattr(module, "fetch_60min_kline_history", lambda *a: hourly)
+    save_klines_batch([{"code": "000001", "date": "2026-06-12", "open": 1, "high": 1,
+                       "low": 1, "close": 1, "volume": 1, "period": "daily"}])
+    manager = MarketDataManager()
+    assert manager.needs_history_refresh("000001")
+    manager.fetch_and_store_initial("000001")
+    quote = manager.get_quote("000001")
+    assert (quote.open, quote.high, quote.low, quote.price, quote.volume) == (10, 10.5, 9.9, 10.4, 180000)
+    assert quote.pre_close == 9.5
+    assert [b["close"] for b in get_klines("000001", "daily")] == [9.5, 10.4]
+    assert get_klines("000001", "weekly")[-1]["date"] == "2026-06-15"
+    assert get_klines("000001", "monthly")[-1]["close"] == 10.4
+    assert get_klines_minute("000001", "60min")[-1]["close"] == 10.4
+    assert not manager.needs_history_refresh("000001")
+    manager._history_checked["000001"] = None
+    calls = []
+    real_fetch = manager.fetch_and_store_initial
+    monkeypatch.setattr(manager, "fetch_and_store_initial", lambda code: (calls.append(code), real_fetch(code))[1])
+    manager.refresh_history_if_needed("000001")
+    assert calls == ["000001"]
+
+
+def test_sina_fallback_keeps_real_ohlc(monkeypatch):
+    import data.market_data as module
+    from datetime import datetime
+    day = datetime.now().strftime("%Y-%m-%d")
+    monkeypatch.setattr(module, "fetch_intraday_data", lambda code: [
+        {"time": day + " 09:31:00", "open": 10, "high": 12, "low": 9, "price": 11, "volume": 5},
+        {"time": "2000-01-01 09:31:00", "open": 1, "high": 2, "low": 1, "price": 1, "volume": 50}])
+    bars = module._fetch_today_1min_sina_fallback("000001")
+    assert len(bars) == 1
+    assert [bars[0][key] for key in ("open", "high", "low", "close", "volume")] == [10, 12, 9, 11, 5]

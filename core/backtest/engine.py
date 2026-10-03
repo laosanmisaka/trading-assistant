@@ -1,5 +1,6 @@
 """回测引擎 — 执行策略信号，模拟资金/持仓/手续费，计算绩效指标"""
 from dataclasses import dataclass, field
+from math import isfinite
 
 from data.models import KLineData
 from core.backtest.strategy import Strategy, Action
@@ -122,6 +123,19 @@ class BacktestReport:
         return f"{self.profit_factor:.2f}"
 
 
+@dataclass
+class _Account:
+    cash: float
+    quantity: int = 0
+    cost: float = 0.0
+    full_quantity: int = 0
+    episode: int = 0
+    kind: str = ""
+    entry_price: float = 0.0
+    entry_date: str = ""
+    trades: list[Trade] = field(default_factory=list)
+
+
 class BacktestEngine:
     """回测引擎 — 哑执行器：接收策略信号，模拟交易并算指标。"""
 
@@ -132,6 +146,11 @@ class BacktestEngine:
         stamp_tax_rate: float = 0.001,        # 印花税千 1（仅卖出）
         min_commission: float = 5.0,          # 最低佣金 5 元
     ):
+        values = (initial_capital, commission_rate, stamp_tax_rate, min_commission)
+        if not all(isfinite(value) for value in values) or initial_capital <= 0:
+            raise ValueError("Initial capital must be positive and parameters finite")
+        if min(commission_rate, stamp_tax_rate, min_commission) < 0:
+            raise ValueError("Fees cannot be negative")
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
         self.stamp_tax_rate = stamp_tax_rate
@@ -153,9 +172,63 @@ class BacktestEngine:
 
     def _affordable_lots(self, cash: float, price: float) -> int:
         """这笔现金按当前价最多能买几手（预留佣金）"""
-        if price <= 0:
+        if price <= 0 or cash <= self.min_commission:
             return 0
-        return int(cash / (price * 100 * (1 + self.commission_rate))) * 100
+        budget = min(cash / (1 + self.commission_rate), cash - self.min_commission)
+        return max(int(budget / (price * 100)), 0) * 100
+
+    def _buy(self, account: _Account, signal, weight: float) -> None:
+        """按含手续费预算成交，首笔真正成交后才开始一轮持仓。"""
+        affordable = self._affordable_lots(account.cash, signal.price)
+        full = account.full_quantity if account.quantity else affordable
+        delta = min(lots(full * weight), max(full - account.quantity, 0), affordable)
+        if delta <= 0:
+            return
+        if account.quantity == 0:
+            account.full_quantity = full
+            account.entry_price, account.entry_date = signal.price, signal.date
+            account.kind = str(getattr(signal, "kind", "") or "")
+            account.episode += 1
+        cost = delta * signal.price
+        cost += max(cost * self.commission_rate, self.min_commission)
+        account.cash -= cost
+        account.quantity += delta
+        account.cost += cost
+
+    def _sell(self, account: _Account, signal, weight: float) -> None:
+        delta = (account.quantity if weight >= 1 else
+                 min(lots(account.full_quantity * weight), account.quantity))
+        if delta <= 0:
+            return
+        proceeds = delta * signal.price
+        fee = max(proceeds * self.commission_rate, self.min_commission)
+        fee += proceeds * self.stamp_tax_rate
+        cost_part = account.cost * delta / account.quantity
+        profit = proceeds - cost_part - fee
+        account.trades.append(Trade(
+            entry_date=account.entry_date, entry_price=account.entry_price,
+            exit_date=signal.date, exit_price=signal.price, quantity=delta,
+            profit=round(profit, 2), profit_pct=profit / cost_part if cost_part > 0 else 0.0,
+            reason=signal.reason, episode=account.episode, signal_kind=account.kind))
+        account.cash += proceeds - fee
+        account.quantity -= delta
+        account.cost -= cost_part
+        if account.quantity == 0:
+            account.cost = 0.0
+            account.full_quantity = 0
+            account.entry_price, account.entry_date = 0.0, ""
+
+    def _execute(self, account: _Account, signal) -> None:
+        weight = getattr(signal, "weight", 1.0)
+        weight = 1.0 if weight is None else float(weight)
+        if not isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError("Signal.weight 必须为 [0, 1] 内有限数")
+        if weight == 0 or not isfinite(signal.price) or signal.price <= 0:
+            return
+        if signal.action == Action.BUY:
+            self._buy(account, signal, weight)
+        elif signal.action == Action.SELL:
+            self._sell(account, signal, weight)
 
     def run_on_data(self, strategy: Strategy, code: str, daily: list[KLineData]) -> BacktestReport:
         """对给定日线数据回测（不触网，便于测试）
@@ -174,77 +247,16 @@ class BacktestEngine:
         for s in signals:
             sig_by_date.setdefault(s.date, []).append(s)
 
-        cash = self.initial_capital
-        position_qty = 0
-        position_cost = 0.0          # 当前持仓成本（含买入费用），按卖出比例结转
-        episode_full_qty = 0         # 本轮「满仓股数」，weight 的基准
-        episode = 0
-        episode_kind = ""            # 本轮开仓信号的分类（Signal.kind）
-        entry_price = 0.0
-        entry_date = ""
-        trades: list[Trade] = []
+        account = _Account(self.initial_capital)
         equity_curve: list[float] = []
 
         for k in daily:
             for s in sig_by_date.get(k.date, []):
-                if s.price <= 0:
-                    continue
-                w = float(getattr(s, "weight", 1.0) or 1.0)
+                self._execute(account, s)
+            equity_curve.append(account.cash + account.quantity * k.close)
 
-                if s.action == Action.BUY:
-                    if position_qty == 0:
-                        # 新一轮开仓：先按可用资金定出「满仓股数」
-                        episode_full_qty = self._affordable_lots(cash, s.price)
-                        if episode_full_qty <= 0:
-                            continue
-                        entry_price, entry_date = s.price, s.date
-                        episode_kind = str(getattr(s, "kind", "") or "")
-                        episode += 1
-                    # 买入 `weight × 满仓股数`，但不越过满仓、也买不起更多
-                    room = max(episode_full_qty - position_qty, 0)
-                    delta = min(lots(episode_full_qty * w),
-                                room, self._affordable_lots(cash, s.price))
-                    if delta > 0:
-                        cost = delta * s.price
-                        fee = max(cost * self.commission_rate, self.min_commission)
-                        cash -= cost + fee
-                        position_qty += delta
-                        position_cost += cost + fee
-
-                elif s.action == Action.SELL and position_qty > 0:
-                    if w >= 1.0:
-                        delta = position_qty          # 清仓：不留碎股
-                    else:
-                        delta = min(lots(episode_full_qty * w), position_qty)
-                    if delta <= 0:
-                        continue
-                    proceeds = delta * s.price
-                    fee = (max(proceeds * self.commission_rate, self.min_commission)
-                           + proceeds * self.stamp_tax_rate)
-                    cash += proceeds - fee
-                    cost_part = position_cost * (delta / position_qty)
-                    profit = proceeds - cost_part - fee
-                    trades.append(Trade(
-                        entry_date=entry_date, entry_price=entry_price,
-                        exit_date=s.date, exit_price=s.price, quantity=delta,
-                        profit=round(profit, 2),
-                        profit_pct=(profit / cost_part) if cost_part > 0 else 0.0,
-                        reason=s.reason, episode=episode,
-                        signal_kind=episode_kind,
-                    ))
-                    position_qty -= delta
-                    position_cost -= cost_part
-                    if position_qty <= 0:
-                        position_qty = 0
-                        position_cost = 0.0
-                        entry_price = 0.0
-                        entry_date = ""
-                        episode_full_qty = 0
-
-            equity_curve.append(cash + position_qty * k.close)
-
-        return self._build_report(strategy, code, trades, equity_curve,
-                                  position_qty > 0,
+        return self._build_report(strategy, code, account.trades, equity_curve,
+                                  account.quantity > 0,
                                   dates=[k.date for k in daily])
 
     def _build_report(self, strategy, code, trades, equity_curve, has_open,
@@ -258,7 +270,7 @@ class BacktestEngine:
         final_equity = equity_curve[-1] if equity_curve else self.initial_capital
         total_return = (final_equity - self.initial_capital) / self.initial_capital
 
-        peak = -float("inf")
+        peak = self.initial_capital
         max_dd = 0.0
         for e in equity_curve:
             peak = max(peak, e)

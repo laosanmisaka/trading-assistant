@@ -312,6 +312,15 @@ def test_render_html_embeds_payload_and_echarts(payload, tmp_path):
     data = json.loads(m.group(1))
     assert data["meta"]["bars"] == payload["meta"]["bars"]
     assert len(data["bars"]) == len(payload["bars"])
+    import copy
+    hostile = copy.deepcopy(payload)
+    marker = "</script><script>/* review */</script>&__TITLE__POINT_KEYS"
+    hostile["meta"]["name"] = marker
+    safe = render_html(hostile, echarts_path=fake_echarts(tmp_path))
+    assert "</script><script>" not in safe
+    assert "&lt;/script&gt;" in safe
+    data = json.loads(re.search(r"var CFG = (\{.*?\});\nvar ST", safe, re.S).group(1))
+    assert data["meta"]["name"] == marker
 
 
 def test_render_html_no_custom_series(payload, tmp_path):
@@ -361,20 +370,11 @@ def test_render_html_has_two_center_layers(payload, tmp_path):
 
 def test_render_html_states_and_notes(payload, tmp_path):
     html = render_html(payload, echarts_path=fake_echarts(tmp_path))
-    # 关键口径必须在图上（否则图会骗人）
-    assert "几何定义" in html
-    assert "30 分钟级别默认关闭" in html
-    # 策略窗口口径（2026-09-18 改为 40 / ±10）必须写在图上
-    assert "40 个交易日内" in html
-    assert "前后各 10 个交易日" in html
-    # 日线点延后一个交易日生效（未来函数防线）
-    assert "次一交易日" in html
-    assert "日线MA5" in html and "日线MA10" in html
-    # 策略命中的二买 bar 要单独高亮
-    assert "策略命中二买" in html
-    # 不再有信号预热区间（图层与配色都已删除）
-    assert "CFG.warmup" not in html
-    assert "warmupArea" not in html
+    assert "几何点位于笔端点" in html
+    assert "不能消除结构确认滞后" in html
+    assert "不是当前三买策略" in html
+    assert "策略命中二买" in html  # retained historical overlay is explicitly scoped
+    assert "CFG.warmup" not in html and "warmupArea" not in html
 
 
 def test_render_html_discloses_position_overlap(payload, tmp_path):
@@ -386,7 +386,7 @@ def test_render_html_discloses_position_overlap(payload, tmp_path):
     html = render_html(payload, echarts_path=fake_echarts(tmp_path))
     assert "最大同时持仓" in html
     assert "重叠笔数" in html
-    assert "按笔统计" in html and "不是资金曲线" in html
+    assert "按点统计" in html and "不是资金曲线" in html
 
 
 def test_render_html_defaults_hide_minor_layers(payload, tmp_path):

@@ -1,8 +1,10 @@
 """主窗口 — 布局、菜单、系统托盘、实时数据轮询、止损止盈检查、缠论买卖点标注"""
 
+from pathlib import Path
 import os
 from datetime import datetime
 
+from PyQt5.QtCore import QThread
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QTableView, QTabWidget,
@@ -77,7 +79,7 @@ class MainWindow(QMainWindow):
         self._daily_stop_loss_done: set[tuple[str, str]] = set()  # 已执行每日止损更新的 (代码, 日期)
         self._quitting: bool = False  # 真正退出应用标志 (区分窗口关闭与退出)
         self._buy_group_id: int = -1       # 「策略买点」自动分组的 id（-1 = 未建）
-        self._bp_cache: tuple[float, dict] = (0.0, {})  # 买点时间列缓存 (jsonl mtime, map)
+        self._bp_cache = (None, {})  # (日志签名 + 上海日期, 买点时间)
         self._init_fetch_queue: list[str] = []  # 待补拉全量行情的股票（自动分组的票）
 
         # 「策略买点」分组：启动时按监控落的信号先同步一次，保证分组存在
@@ -289,6 +291,8 @@ class MainWindow(QMainWindow):
             )
 
         self._refresh_table_display()
+        for code in codes:
+            self._ensure_kline_data(code)
 
         if is_trading_time():
             self._refresh_current_group_data()
@@ -391,14 +395,15 @@ class MainWindow(QMainWindow):
 
         # 防止重复启动: 如果上一轮 worker 还在跑则跳过
         prev = getattr(self, '_inc_worker', None)
-        if prev is not None and prev.isRunning():
+        if prev is not None:
             logger.debug("上一轮增量刷新尚未完成，跳过")
             return
 
-        self._inc_worker = IncrementalRefreshWorker(refresh_codes)
+        self._inc_worker = IncrementalRefreshWorker(refresh_codes, self)
         self._inc_worker.data_ready.connect(self._on_incremental_complete)
         # 安全网: 无论 data_ready 是否触发，finished 一定触发
         self._inc_worker.finished.connect(self._on_incremental_complete_safe)
+        self._inc_worker.finished.connect(self._inc_worker.deleteLater)
         self._inc_worker.start()
 
     def _refresh_kline_if_active(self):
@@ -428,6 +433,7 @@ class MainWindow(QMainWindow):
 
     def _on_incremental_complete_safe(self):
         """安全网: worker 异常退出时确保表格至少刷新一次（从缓存读取）"""
+        self._inc_worker = None
         self._on_incremental_finished({})
 
     def _on_incremental_finished(self, quotes: dict[str, RealtimeQuote]):
@@ -447,14 +453,21 @@ class MainWindow(QMainWindow):
             self._update_profit_status(all_quotes)
 
     def _buy_times_map(self) -> dict[str, str]:
-        """近两日策略买点 code → conf 时刻（按 jsonl mtime 缓存，3s 轮询不重解析）"""
+        """事件修订或上海日期改变时刷新，并同步自动分组的滚动窗口。"""
+        from core.trading_calendar import local_now
         try:
-            mtime = os.path.getmtime(DEFAULT_SIGNALS)
+            stat = Path(DEFAULT_SIGNALS).stat()
+            signature = (stat.st_mtime_ns, stat.st_size, local_now().date())
         except OSError:
-            return {}
-        if mtime != self._bp_cache[0]:
-            pts = recent_buy_points()
-            self._bp_cache = (mtime, {c: p["conf"] for c, p in pts.items()})
+            signature = (None, local_now().date())
+        if signature != self._bp_cache[0]:
+            try:
+                points = recent_buy_points(today=local_now().date())
+                sync_buy_points_group(today=local_now().date())
+            except Exception:
+                logger.exception("策略买点更新失败")
+                return {}
+            self._bp_cache = (signature, {code: point["conf"] for code, point in points.items()})
         return self._bp_cache[1]
 
     def _refresh_table_display(self):
@@ -507,11 +520,14 @@ class MainWindow(QMainWindow):
         total_cost = 0.0
         for s in stocks:
             summary = get_position_summary(s.code)
-            if summary["hold_qty"] > 0 and s.code in quotes:
+            if summary.get("valid", True) and summary["hold_qty"] > 0 and s.code in quotes:
                 q = quotes[s.code]
-                profit = (q.price - summary["avg_cost"]) * summary["hold_qty"]
+                if q.price <= 0:
+                    continue
+                cost = summary.get("position_cost", summary["avg_cost"] * summary["hold_qty"])
+                profit = q.price * summary["hold_qty"] - cost
                 total_profit += profit
-                total_cost += summary["avg_cost"] * summary["hold_qty"]
+                total_cost += cost
 
         if total_cost > 0:
             pct = total_profit / total_cost * 100
@@ -574,6 +590,11 @@ class MainWindow(QMainWindow):
             if code not in quotes:
                 continue
             if is_alert_disabled(code):
+                self._alert_triggered_codes.discard(code)
+                continue
+
+            summary = get_position_summary(code)
+            if not summary.get("valid", True) or summary["hold_qty"] <= 0:
                 self._alert_triggered_codes.discard(code)
                 continue
 
@@ -676,6 +697,8 @@ class MainWindow(QMainWindow):
         这是原 `_scan_buy_points` 的线程契约，一字未改，`tests/test_ui_threading.py`
         继续把它钉住（单轮单 worker + `finished` 接 `deleteLater`）。
         """
+        if self.__dict__.get("_quitting", False):
+            return
         if force:
             self._chan_marks.pop(code, None)
 
@@ -701,7 +724,7 @@ class MainWindow(QMainWindow):
 
         logger.info(f"开始异步计算 {code} 的缠论买卖点")
         self.status_bar.showMessage(f"正在计算 {code} 的缠论买卖点...")
-        self._chan_mark_worker = ChanMarkWorker(code)
+        self._chan_mark_worker = ChanMarkWorker(code, parent=self)
         self._chan_mark_worker.marks_ready.connect(self._on_chan_marks_ready)
         self._chan_mark_worker.failed.connect(self._on_chan_marks_failed)
         self._chan_mark_worker.finished.connect(self._on_chan_worker_finished)
@@ -711,7 +734,7 @@ class MainWindow(QMainWindow):
     def _on_chan_marks_ready(self, code: str, marks: dict):
         """标注算好了（主线程）—— 缓存；只在它还是当前股票时才上屏"""
         self._chan_marks[code] = marks
-        trades = len(marks.get("trades") or [])
+        trades = len(marks.get("triple") or marks.get("trades") or [])
         geo = len(marks.get("geometry") or [])
         logger.info(f"{code} 缠论标注完成：日线几何点 {geo} 个、策略买卖点 {trades} 笔")
         if code == self._current_stock_code:
@@ -776,37 +799,43 @@ class MainWindow(QMainWindow):
         """DB 里没有日线数据的票排队补拉全量行情（一次一只，不阻塞 UI）"""
         if self.data_manager.is_pending(code) or code in self._init_fetch_queue:
             return
-        if self.data_manager.get_klines(code, "daily", 250):
+        if not self.data_manager.needs_history_refresh(code):
             return
+        self.data_manager.mark_pending(code)
         self._init_fetch_queue.append(code)
         self._pump_init_fetch_queue()
 
     def _pump_init_fetch_queue(self):
-        """驱动补拉队列：上一只没跑完就等它的完成回调再来触发"""
-        prev = getattr(self, '_init_worker', None)
-        if prev is not None and prev.isRunning():
+        """Only QThread.finished releases the queue slot, never all_done."""
+        if self._quitting or getattr(self, '_init_worker', None) is not None:
             return
         if not self._init_fetch_queue:
             return
         code = self._init_fetch_queue.pop(0)
         self.data_manager.mark_pending(code)
-        self.status_bar.showMessage(f"{code} 首次加载，正在获取全量数据...")
-        logger.info(f"{code} 无本地K线，启动全量数据获取（队列剩 {len(self._init_fetch_queue)}）")
-        self._init_worker = InitialFetchWorker(code)
-        self._init_worker.all_done.connect(self._on_init_fetch_done)
-        self._init_worker.error_occurred.connect(self._on_init_fetch_error)
-        self._init_worker.start()
+        self.status_bar.showMessage(f"{code} 正在获取行情...")
+        worker = InitialFetchWorker(code, self)
+        self._init_worker = worker
+        worker.all_done.connect(self._on_init_fetch_done)
+        worker.error_occurred.connect(self._on_init_fetch_error)
+        worker.finished.connect(self._on_init_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _on_init_fetch_done(self, code: str):
-        """补拉完成 → 刷表格；若还是当前查看的票则重载图表 + 重算标注"""
         self._on_new_stock_init_done(code)
-        if code == self._current_stock_code:
+        if not self._quitting and code == self._current_stock_code:
             self.chart_widget.load_stock(code)
-            self._request_chan_marks(code)
-        self._pump_init_fetch_queue()
+            self._request_chan_marks(code, force=True)
 
     def _on_init_fetch_error(self, err: str):
         logger.error(f"全量数据获取失败: {err}")
+
+    def _on_init_worker_finished(self):
+        worker = self._init_worker
+        if worker is not None:
+            self.data_manager.unmark_pending(worker.code)
+        self._init_worker = None
         self._pump_init_fetch_queue()
 
     def _on_stock_right_clicked(self, code: str, action: str):
@@ -908,14 +937,19 @@ class MainWindow(QMainWindow):
         else:
             # 关键字搜索 — 异步
             self.status_bar.showMessage(f"正在搜索 '{keyword}' ...")
-            self._search_worker = StockSearchWorker(keyword)
+            self._search_worker = StockSearchWorker(keyword, self)
             self._search_worker.data_ready.connect(
                 lambda results: self._on_search_result(results, keyword))
             self._search_worker.error_occurred.connect(self._on_search_error)
-            self._search_worker.start()
+            worker = self._search_worker
+            worker.finished.connect(lambda: self._release_worker("_search_worker", worker))
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
 
     def _try_add_by_code(self, code: str):
         """纯代码添加: DB有→弹窗确认→添加; DB没有→异步同步名称库→回查后再添加"""
+        if self.__dict__.get("_quitting", False):
+            return
         from data.database import get_stock_name
 
         name = get_stock_name(code)
@@ -951,7 +985,7 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"本地无 {code}，正在同步股票名称库（可能需要数十秒）...")
 
-        self._name_sync_worker = StockNameSyncWorker(code)
+        self._name_sync_worker = StockNameSyncWorker(code, self)
         self._name_sync_worker.sync_done.connect(self._on_name_sync_done)
         self._name_sync_worker.sync_failed.connect(self._on_name_sync_failed)
         self._name_sync_worker.finished.connect(self._name_sync_worker.deleteLater)
@@ -989,18 +1023,11 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"已添加: {code} {name}，正在获取全量数据...")
         logger.info(f"添加股票: {code} {name}")
 
-        # 标记为等待初始全量数据 (增量刷新暂时跳过)
-        self.data_manager.mark_pending(code)
-
-        # 先刷新表格显示 (stub数据)
         self._refresh_table_display()
-
-        # 启动独立的全量数据 Worker (与增量刷新互不阻塞)
-        self._init_worker = InitialFetchWorker(code)
-        self._init_worker.all_done.connect(self._on_new_stock_init_done)
-        self._init_worker.error_occurred.connect(
-            lambda e: logger.error(f"新股 {code} 全量数据获取失败: {e}"))
-        self._init_worker.start()
+        if code not in self._init_fetch_queue and not self.data_manager.is_pending(code):
+            self.data_manager.mark_pending(code)
+            self._init_fetch_queue.append(code)
+            self._pump_init_fetch_queue()
 
     def _on_new_stock_init_done(self, code: str):
         """新股全量数据获取完成 → 刷新表格显示（现价已由Manager写入）"""
@@ -1008,15 +1035,24 @@ class MainWindow(QMainWindow):
         self._refresh_table_display()  # 立即显示新股的现价数据
         self.status_bar.showMessage(f"{code} 数据初始化完成", 3000)
         logger.info(f"{code} 全量数据初始化完成")
-        self._pump_init_fetch_queue()  # 手动添加的取数也会占worker，完成后继续补拉队列
+
+
+    def _release_worker(self, name, worker):
+        if self.__dict__.get(name) is worker:
+            setattr(self, name, None)
 
     def _fallback_to_search(self, keyword: str):
         """回退到搜索模式"""
-        self._search_worker = StockSearchWorker(keyword)
+        if self.__dict__.get("_quitting", False):
+            return
+        self._search_worker = StockSearchWorker(keyword, self)
         self._search_worker.data_ready.connect(
             lambda results: self._on_search_result(results, keyword))
         self._search_worker.error_occurred.connect(self._on_search_error)
-        self._search_worker.start()
+        worker = self._search_worker
+        worker.finished.connect(lambda: self._release_worker("_search_worker", worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _on_search_result(self, results: list[dict], keyword: str):
         """搜索结果回调"""
@@ -1163,4 +1199,16 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'tray_icon'):
             self.tray_icon.hide()
 
+        self._init_fetch_queue.clear()
+        self._pending_chan_code = ""
+        for worker in self.findChildren(QThread):
+            worker.requestInterruption()
+        self._finish_quit()
+
+    def _finish_quit(self):
+        """Keep the event loop and worker owners alive until every worker exits."""
+        if any(worker.isRunning() for worker in self.findChildren(QThread)):
+            self.status_bar.showMessage("正在等待行情任务结束后退出…")
+            QTimer.singleShot(100, self._finish_quit)
+            return
         QApplication.instance().quit()

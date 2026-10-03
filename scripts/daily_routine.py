@@ -1,39 +1,10 @@
 # -*- coding: utf-8 -*-
-"""盘后一键例程：增量更新行情缓存 → 刷新 watchlist → 更新监控标的 5min 缓存
+"""盘后完整更新 → 候选扫描 → 5min 更新 → GUI 分组同步。
 
-    python scripts/daily_routine.py                    # 盘后全流程
-    python scripts/daily_routine.py --skip-5min        # 只更日线 + 扫描
-    python scripts/daily_routine.py --limit 20         # 调试：只跑前 20 只
-    python scripts/daily_routine.py --register-tasks   # 注册 Windows 计划任务（一次性）
-
-做什么
-------
-1. 日线缓存**增量更新**（默认池 = 层①扫描用的 pool_mainboard.txt）；
-2. 调 `scan_candidates.py` 刷新 `outputs/watchlist.json`；
-3. watchlist 同步成 GUI 分组「三买监控」（全量接管该分组：新窗口补齐、
-   关闭窗口移除；其他分组不碰，移出分组不影响交易记录）；顺带把近两日
-   策略买点（monitor 落的 monitor_signals.jsonl）同步成分组「策略买点」；
-4. 对 watchlist 里的标的做 5min 缓存增量更新 —— 这份缓存供 GUI 三买标注
-   和回测/复盘链使用；盘中监控（层② `monitor_buy.py`）吃的是新浪实时
-   5min，**不依赖**这份缓存，所以 5min 只更监控名单内的票，不全池更。
-
-为什么增量而不是全量重取
-------------------------
-全量重取 5min 要从 2020 年起分约 27 段/只，全池跑一遍以小时计；日线全量
-单段近 5000 行，超出 baostock 单次查询的实测安全上限（约 3,200 行）。
-增量只取「缓存末尾 − N 天」到今天（单段/只），再用**重叠区间收盘价校验**
-识别前复权平移（分红除权后 baostock 历史价整体漂移，见 `fetch_min.py`
-docstring 的缓存过期警告）：不一致则对该只自动全量重取。校验窗口内停牌
-无新 bar 时视为「无新数据」，不误判漂移。
-
-计划任务（`--register-tasks` 注册）
------------------------------------
-- ``TradingAssistant-DailyUpdate``：周一至周五 18:05 跑本脚本（baostock
-  日线晚间才就绪；若当天数据未出，次日开盘前手动补跑一次即可，幂等）；
-- ``TradingAssistant-Monitor``：周一至周五 09:25 跑 `start_monitor.bat`
-  （清掉昨天的残留进程，以最新 watchlist 重启盘中监控）。
-
-日志追加到 `outputs/daily_routine.log`。
+无重叠/复权漂移完整重取；部分失败不覆盖旧缓存，不消费过期 watchlist。
+--cache-dir/--limit/--watchlist 传递给扫描。--skip-scan 只更新日线。
+调度显式 --register-tasks 才注册，名称带仓库标识；不终止其他实例。
+详细合同见 docs/OPERATIONS.md。
 """
 from __future__ import annotations
 
@@ -86,7 +57,11 @@ def merge_incremental(old: pd.DataFrame, new: pd.DataFrame, *,
     """
     if new.empty:
         return old, "no_new"
+    if old.empty:
+        return new.sort_values("dt").drop_duplicates("dt", keep="last"), "appended"
     ov = old.merge(new, on="dt", suffixes=("_o", "_n"))
+    if ov.empty:
+        return old, "unverified"
     if len(ov):
         diff = (ov["close_o"] - ov["close_n"]).abs() > ov["close_n"].abs() * rtol
         if diff.any():
@@ -127,41 +102,43 @@ def _fetch_recent(session: fetch_min.BaostockSession, sym: str, period: str,
     raise RuntimeError(f"{sym} {period} 增量取数失败（重试 3 次）：{last}")
 
 
-def update_one(session: fetch_min.BaostockSession, sym: str, period: str,
-               cache_dir: Path, *, overlap_days: int = OVERLAP_DAYS) -> str:
-    """增量更新一只的缓存 → 状态串
+def _full_cache(session, sym, period, cache_dir, today):
+    from data.cache_files import publish
+    start = fetch_min.DEFAULT_START[period]
+    frame, stats = fetch_min.fetch_baostock(session, sym, period, start, today)
+    if stats.get("失败段", 0):
+        raise RuntimeError(f"取数不完整，保留原缓存：{stats}")
+    publish(fetch_min.cache_path(cache_dir, sym, period), frame, source="baostock",
+            adjustment="qfq", start=start, end=today)
 
-    ``fresh`` 已是最新｜``full`` 无缓存全量建｜``appended`` 增量追加｜
-    ``no_new`` 无新数据｜``shifted_refetch`` 检出前复权平移、已全量重取。
-    取数异常向上抛，由调用方按只捕获。
-    """
-    f = fetch_min.cache_path(cache_dir, sym, period)
-    today = date.today().strftime("%Y-%m-%d")
-    if not f.exists() or f.stat().st_size == 0:
-        df, _ = fetch_min.fetch_baostock(session, sym, period,
-                                         fetch_min.DEFAULT_START[period], today)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        df.to_csv(f, index=False)
+
+def update_one(session, sym, period, cache_dir, *, overlap_days=OVERLAP_DAYS):
+    """Only hash-verified complete caches can be extended; no overlap means refetch."""
+    from data.cache_files import metadata, publish, validate_frame
+    from core.trading_calendar import local_now
+    path = fetch_min.cache_path(cache_dir, sym, period)
+    today = str(local_now().date())
+    meta = metadata(path)
+    if not meta or (meta.get("source"), meta.get("adjustment")) != ("baostock", "qfq"):
+        _full_cache(session, sym, period, cache_dir, today)
         return "full"
-    old = pd.read_csv(f)
-    if old.empty:
-        f.unlink()
-        return update_one(session, sym, period, cache_dir,
-                          overlap_days=overlap_days)
+    old = validate_frame(pd.read_csv(path, float_precision="round_trip"))
+    if old.empty or meta["requested_start"] > fetch_min.DEFAULT_START[period]:
+        _full_cache(session, sym, period, cache_dir, today)
+        return "full"
     last_day = str(old["dt"].iloc[-1])[:10]
-    if last_day >= today:
+    # A current tail alone never certifies an old partial download.
+    if last_day >= today and meta["requested_end"] >= today:
         return "fresh"
-    start = (pd.Timestamp(last_day)
-             - pd.Timedelta(days=overlap_days)).strftime("%Y-%m-%d")
-    new = _fetch_recent(session, sym, period, start, today)
+    start = (pd.Timestamp(last_day) - pd.Timedelta(days=overlap_days)).strftime("%Y-%m-%d")
+    new = validate_frame(_fetch_recent(session, sym, period, start, today))
     merged, status = merge_incremental(old, new)
-    if status == "shifted":
-        df, _ = fetch_min.fetch_baostock(session, sym, period,
-                                         fetch_min.DEFAULT_START[period], today)
-        df.to_csv(f, index=False)
-        return "shifted_refetch"
+    if status in ("shifted", "unverified"):
+        _full_cache(session, sym, period, cache_dir, today)
+        return f"{status}_refetch"
     if status == "appended":
-        merged.to_csv(f, index=False)
+        publish(path, merged, source="baostock", adjustment="qfq",
+                start=meta["requested_start"], end=today)
     return status
 
 
@@ -238,16 +215,20 @@ def sync_watchlist_group(watch: dict, *,
 
 def register_tasks(log=print) -> None:
     """注册两个工作日计划任务（/F 覆盖同名，/IT 当前用户交互式运行）"""
-    pyw = Path(sys.executable).with_name("pythonw.exe")
-    py = pyw if pyw.exists() else Path(sys.executable)
+    import os
+    import hashlib
+    if os.name != "nt":
+        raise RuntimeError("计划任务注册只支持 Windows；其他平台使用系统调度器")
+    suffix = hashlib.sha256(str(ROOT).encode()).hexdigest()[:8]
+    py = Path(sys.executable)
     jobs = [
         ("TradingAssistant-DailyUpdate", "18:05",
          f'"{py}" "{ROOT / "scripts" / "daily_routine.py"}"'),
         ("TradingAssistant-Monitor", "09:25",
-         f'"{ROOT / "scripts" / "start_monitor.bat"}"'),
+         f'"{py}" "{ROOT / "scripts" / "monitor_buy.py"}"'),
     ]
     for name, st, tr in jobs:
-        cmd = ["schtasks", "/Create", "/TN", name, "/TR", tr,
+        cmd = ["schtasks", "/Create", "/TN", f"{name}-{suffix}", "/TR", tr,
                "/SC", "WEEKLY", "/D", "MON,TUE,WED,THU,FRI",
                "/ST", st, "/F", "/IT"]
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -262,105 +243,79 @@ def register_tasks(log=print) -> None:
 # 主流程
 # ======================================================================
 
-def main() -> int:
-    p = argparse.ArgumentParser(
-        description="盘后例程：增量更缓存 → 刷 watchlist → 更监控标的 5min",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pool", type=Path, default=DEFAULT_POOL,
-                   help="日线更新池（默认与层①扫描同池）")
-    p.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE)
-    p.add_argument("--skip-5min", action="store_true",
-                   help="跳过 watchlist 标的的 5min 增量更新")
-    p.add_argument("--skip-scan", action="store_true",
-                   help="跳过 scan_candidates（只更数据）")
-    p.add_argument("--skip-sync", action="store_true",
-                   help="跳过 watchlist → GUI 分组同步")
-    p.add_argument("--limit", type=int, default=0, help="只跑池内前 N 只（调试）")
-    p.add_argument("--sleep", type=float, default=0.3, help="每只间隔秒数")
-    p.add_argument("--no-toast", action="store_true")
-    p.add_argument("--register-tasks", action="store_true",
-                   help="注册 Windows 计划任务后退出")
-    a = p.parse_args()
+def _scan_watch(args, log):
+    command = [sys.executable, str(ROOT / "scripts/scan_candidates.py"),
+               "--pool", str(args.pool), "--cache-dir", str(args.cache_dir),
+               "--out", str(args.watchlist), "--limit", str(args.limit)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    log(result.stdout or "")
+    if result.returncode:
+        raise RuntimeError(f"扫描失败({result.returncode})：{result.stderr[:500]}")
+    return json.loads(args.watchlist.read_text(encoding="utf-8"))
 
-    # 子进程与父进程同为本地默认编码（GBK），不能按 UTF-8 解码 —
-    # GBK 字节对会被误当成合法 UTF-8（如「扫」→ ɨ），再打印即崩
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
-        sys.stderr.reconfigure(errors="replace")
 
-    lines: list[str] = []
+def _run_daily(args, log):
+    pool = fetch_min.load_pool(args.pool)
+    if args.limit:
+        pool = pool[:args.limit]
+    if not pool:
+        raise ValueError("标的池为空")
+    with fetch_min.BaostockSession() as session:
+        counts = update_pool(session, pool, "daily", args.cache_dir, sleep=args.sleep, log=log)
+        log(f"日线结果：{counts}")
+        if counts.get("failed"):
+            raise RuntimeError("日线更新不完整，本次不扫描、不改自动分组")
+        if args.skip_scan:
+            log("跳过扫描：本次只更新日线，不消费旧 watchlist")
+            return
+        watch = _scan_watch(args, log)
+        if not args.skip_5min:
+            codes = sorted({item["code"] for item in watch["items"]})
+            counts = update_pool(session, [(code, "") for code in codes], "5min",
+                                 args.cache_dir, sleep=args.sleep, log=log)
+            log(f"5min 结果：{counts}")
+            if counts.get("failed"):
+                raise RuntimeError("5min 更新不完整，本次不改自动分组")
+        if not args.skip_sync and not args.limit:
+            from core.buy_points import sync_buy_points_group
+            log(f"三买监控同步：{sync_watchlist_group(watch)}")
+            log(f"策略买点同步：{sync_buy_points_group()}")
+        elif args.limit:
+            log("局部调试池不全量接管 GUI 自动分组")
 
-    def log(msg: str) -> None:
-        print(msg, flush=True)
-        lines.append(msg)
 
-    if a.register_tasks:
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="盘后完整更新 → 扫描 → 同步")
+    parser.add_argument("--pool", type=Path, default=DEFAULT_POOL)
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE)
+    parser.add_argument("--watchlist", type=Path, default=None)
+    for flag in ("skip-5min", "skip-scan", "skip-sync", "no-toast", "register-tasks"):
+        parser.add_argument(f"--{flag}", action="store_true")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--sleep", type=float, default=0.3)
+    args = parser.parse_args(argv)
+    args.watchlist = args.watchlist or args.cache_dir.parent / "watchlist.json"
+    lines = []
+    def log(message):
+        print(message, flush=True)
+        lines.append(message)
+    if args.register_tasks:
         register_tasks(log)
         return 0
-
-    t0 = time.time()
-    log(f"=== 盘后例程 {datetime.now():%Y-%m-%d %H:%M:%S} ===")
-
-    pool = fetch_min.load_pool(a.pool)
-    if a.limit:
-        pool = pool[: a.limit]
-    log(f"池 {len(pool)} 只（{a.pool.name}）")
-
-    session = fetch_min.BaostockSession()
-    with session:
-        log("[1/3] 日线增量更新 …")
-        c_d = update_pool(session, pool, "daily", a.cache_dir,
-                          sleep=a.sleep, log=log)
-        log(f"  日线完成：{c_d}")
-
-        if not a.skip_scan:
-            log("[2/4] 扫描活跃窗口（scan_candidates）…")
-            r = subprocess.run(
-                [sys.executable, str(ROOT / "scripts" / "scan_candidates.py"),
-                 "--pool", str(a.pool)],
-                capture_output=True, text=True)   # 子进程同机同编码（GBK），用默认 locale 解码
-            for ln in (r.stdout or "").splitlines():
-                log(f"  {ln}")
-            if r.returncode != 0:
-                log(f"  ⚠️ scan_candidates 退出码 {r.returncode}："
-                    f"{(r.stderr or '').strip()[:500]}")
-
-        watch = (json.loads(WATCHLIST.read_text(encoding="utf-8"))
-                 if WATCHLIST.exists() else None)
-        if watch is not None and not a.skip_sync:
-            st = sync_watchlist_group(watch)
-            log(f"[3/4] watchlist → GUI 分组「{WATCH_GROUP_NAME}」："
-                f"新增 {st['added']}、移除 {st['removed']}、现存 {st['total']} 只")
-            from core.buy_points import (BUY_GROUP_NAME,
-                                         sync_buy_points_group)
-            st = sync_buy_points_group()
-            log(f"      近两日策略买点 → GUI 分组「{BUY_GROUP_NAME}」："
-                f"新增 {st['added']}、移除 {st['removed']}、现存 {st['total']} 只")
-
-        if not a.skip_5min:
-            if watch is not None:
-                codes = sorted({it["code"] for it in watch["items"]})
-                log(f"[4/4] watchlist {len(codes)} 只的 5min 增量更新 …")
-                c5 = update_pool(session, [(c, "") for c in codes], "5min",
-                                 a.cache_dir, sleep=a.sleep,
-                                 progress_every=20, log=log)
-                log(f"  5min 完成：{c5}")
-            else:
-                log("[4/4] 无 watchlist.json，跳过 5min 更新")
-
-    summary = f"例程完成（{time.time()-t0:.0f}s）：日线 {c_d}"
-    log(summary)
+    status = 0
+    try:
+        _run_daily(args, log)
+        log("盘后例程成功")
+    except Exception as error:
+        status = 1
+        log(f"盘后例程失败：{type(error).__name__}: {error}")
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-    if not a.no_toast:
-        try:
-            from monitor_buy import toast
-            toast("盘后例程完成", summary)
-        except Exception:
-            pass
-    return 0
+    with LOG_FILE.open("a", encoding="utf-8") as stream:
+        stream.write(f"{datetime.now().isoformat()}\n" + "\n".join(lines) + "\n")
+    if not args.no_toast:
+        from monitor_buy import toast
+        toast("盘后例程失败" if status else "盘后例程完成", lines[-1])
+    return status
 
 
 if __name__ == "__main__":

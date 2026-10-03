@@ -48,7 +48,24 @@ def load_pool(path: Path) -> list[tuple[str, str]]:
     return out
 
 
-def main() -> None:
+def _scan_one(code, name, cache, args):
+    from data.cache_files import metadata
+    from core.trading_calendar import latest_closed_session, local_now
+    meta = metadata(cache / f"daily_{code}.csv")
+    if not meta or meta["requested_end"] < latest_closed_session():
+        raise ValueError("日线来源/新鲜度未验证，请先完成 daily_routine 或 fetch_min 更新")
+    wins = candidate_windows(code, cache, max_amp=args.max_amp, recent_days=args.recent_days)
+    items = []
+    for window in wins:
+        if (local_now().date() - datetime.fromisoformat(window["window_start"]).date()).days > args.recent_days:
+            continue
+        days_open = (local_now() - datetime.fromisoformat(window["available_at"])).days
+        items.append({"code": code, "name": name, **window,
+                      "days_open": max(days_open, 0), "hot": days_open <= args.hot_days})
+    return items
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description="日线三买活跃窗口扫描 → watchlist")
     ap.add_argument("--pool", default=str(ROOT / "scripts" / "pool_mainboard_all.txt"))
     ap.add_argument("--cache-dir", default=str(ROOT / "outputs" / "cache_min"))
@@ -60,7 +77,7 @@ def main() -> None:
     ap.add_argument("--hot-days", type=int, default=3,
                     help="窗口起点 N 自然日内 = 热窗口（层②每轮都扫）")
     ap.add_argument("--limit", type=int, default=0, help="只扫前 N 只（调试）")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     pool = load_pool(Path(a.pool))
     if a.limit:
@@ -69,36 +86,28 @@ def main() -> None:
 
     items, missing = [], []
     t0 = time.time()
-    for n, (code, name) in enumerate(pool, 1):
-        wins = candidate_windows(code, cache, max_amp=a.max_amp,
-                                 recent_days=a.recent_days)
-        if not wins:
+    failures = []
+    for code, name in pool:
+        try:
             if not (cache / f"daily_{code}.csv").exists():
                 missing.append(code)
-            continue
-        dfp = cache / f"daily_{code}.csv"
-        last_day = None
-        if dfp.exists() and dfp.stat().st_size > 0:
-            with dfp.open(encoding="utf-8") as f:
-                for line in f:
-                    pass
-                last_day = line.split(",")[0].strip()
-        if not last_day:
-            continue          # 缓存缺失/空 → 算不出 days_open，跳过（正常不该发生）
-        for w in wins:
-            days_open = (datetime.fromisoformat(last_day)
-                         - datetime.fromisoformat(w["window_start"])).days
-            items.append({"code": code, "name": name, **w,
-                          "days_open": max(days_open, 0),
-                          "hot": days_open <= a.hot_days})
-
+                continue
+            items.extend(_scan_one(code, name, cache, a))
+        except Exception as error:
+            failures.append(f"{code}: {error}")
+    if missing or failures:
+        print(f"扫描不完整，保留旧 watchlist；缺缓存 {missing}；失败 {failures}", file=sys.stderr)
+        return 1
     items.sort(key=lambda x: (-x["hot"], -x["days_open"]))
     out = {"generated": datetime.now().isoformat(timespec="seconds"),
            "pool": str(a.pool), "max_amp": a.max_amp,
            "recent_days": a.recent_days, "hot_days": a.hot_days,
            "items": items, "missing": missing}
-    Path(a.out).write_text(json.dumps(out, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
+    from utils.atomic import atomic_json
+    from core.trading_calendar import latest_closed_session
+    out["schema"] = 2
+    out["as_of"] = latest_closed_session()
+    atomic_json(a.out, out)
 
     hot = [x for x in items if x["hot"]]
     print(f"扫描 {len(pool)} 只（{time.time()-t0:.0f}s）："
@@ -112,4 +121,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

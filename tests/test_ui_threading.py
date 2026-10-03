@@ -444,3 +444,64 @@ class TestChanMarkPendingQueue:
         win._on_chan_worker_finished()
 
         assert len(mark_workers) == 1
+
+
+def _wait_for(qapp, condition):
+    import time
+    from PyQt5.QtTest import QTest
+    end = time.monotonic() + 3
+    while not condition() and time.monotonic() < end:
+        qapp.processEvents()
+        QTest.qWait(10)
+    assert condition()
+
+
+def test_initial_queue_waits_for_thread_finish_and_exit_keeps_owner(qapp, monkeypatch):
+    import threading
+    from PyQt5.QtCore import QThread, pyqtSignal
+    from PyQt5.QtWidgets import QMainWindow, QApplication
+    from ui.main_window import MainWindow
+    gates, created, done, quits = [], [], [], []
+    class Worker(QThread):
+        all_done = pyqtSignal(str)
+        error_occurred = pyqtSignal(str)
+        def __init__(self, code, parent):
+            super().__init__(parent)
+            self.code = code
+            self.gate = threading.Event()
+            gates.append(self.gate)
+            created.append(code)
+        def run(self):
+            self.all_done.emit(self.code)
+            self.gate.wait(3)
+    monkeypatch.setattr("ui.main_window.InitialFetchWorker", Worker)
+    win = MainWindow.__new__(MainWindow)
+    QMainWindow.__init__(win)
+    win._quitting, win._init_worker = False, None
+    win._init_fetch_queue, win._current_stock_code = ["A", "B"], ""
+    pending = set()
+    win.data_manager = types.SimpleNamespace(mark_pending=pending.add, unmark_pending=pending.discard)
+    win.status_bar = types.SimpleNamespace(showMessage=lambda *a: None)
+    win._on_new_stock_init_done = done.append
+    win._pump_init_fetch_queue()
+    try:
+        _wait_for(qapp, lambda: done == ["A"])
+        win._pump_init_fetch_queue()
+        assert created == ["A"] and win._init_worker.isRunning()
+        gates[0].set()
+        _wait_for(qapp, lambda: done == ["A", "B"])
+        assert created == ["A", "B"]
+        win._quitting = True
+        monkeypatch.setattr(QApplication, "instance", lambda: types.SimpleNamespace(quit=lambda: quits.append(True)))
+        win._finish_quit()
+        assert quits == []
+        gates[1].set()
+        _wait_for(qapp, lambda: bool(quits))
+        assert not pending
+    finally:
+        win._quitting = True
+        for gate in gates:
+            gate.set()
+        for worker in win.findChildren(QThread):
+            worker.wait(3000)
+        win.deleteLater()

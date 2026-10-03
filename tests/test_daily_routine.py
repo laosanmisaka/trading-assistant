@@ -102,14 +102,13 @@ def test_tiny_float_noise_not_shifted(dr):
     assert status == "appended"
 
 
-def test_suspended_gap_still_appends(dr):
-    """长期停牌：缓存末尾与新数据之间无重叠可比，新行直接追加"""
+def test_no_overlap_requires_verified_refetch(dr):
+    """停牌还是分段缺失无法单凭无重叠判断，禁止拼接未知复权基准。"""
     old = _df([("2026-09-10", 8.0), ("2026-09-11", 8.1)])
     new = _df([("2026-09-29", 8.1), ("2026-09-30", 8.3)])
     merged, status = dr.merge_incremental(old, new)
-    assert status == "appended"
-    assert list(merged["dt"]) == ["2026-09-10", "2026-09-11",
-                                  "2026-09-29", "2026-09-30"]
+    assert status == "unverified"
+    pd.testing.assert_frame_equal(merged, old)
 
 
 def test_5min_datetime_strings_compare_chronologically(dr):
@@ -171,3 +170,43 @@ def test_sync_empty_watchlist_clears_group(dr, temp_db):
     assert st == {"added": 0, "removed": 1, "total": 0}
     g = next(g for g in get_all_groups() if g.name == dr.WATCH_GROUP_NAME)
     assert get_stocks_by_group(g.id) == []
+
+
+def test_partial_fetch_preserves_verified_cache(dr, tmp_path, monkeypatch):
+    from data.cache_files import publish, metadata
+    path = tmp_path / "daily_sh600000.csv"
+    old = _df([("2026-09-30", 10)])
+    publish(path, old, source="baostock", adjustment="qfq", start="2016-01-01", end="2026-09-30")
+    before = path.read_bytes()
+    monkeypatch.setattr(dr, "_fetch_recent", lambda *a: _df([("2026-10-09", 9)]))
+    monkeypatch.setattr(dr.fetch_min, "fetch_baostock", lambda *a: (_df([("2026-10-09", 9)]), {"失败段": 1}))
+    with pytest.raises(RuntimeError, match="不完整"):
+        dr.update_one(None, "sh600000", "daily", tmp_path)
+    assert path.read_bytes() == before and metadata(path)
+    path.write_text(path.read_text() + "2026-10-10,1,1,1,1,1\n")
+    assert metadata(path) is None
+
+
+def test_scan_arguments_and_failure_stop_sync(dr, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    commands = []
+    args = SimpleNamespace(pool=tmp_path / "pool.txt", cache_dir=tmp_path / "custom", limit=2,
+                           watchlist=tmp_path / "new.json", skip_scan=False, skip_sync=False,
+                           skip_5min=False, sleep=0)
+    class Session:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    monkeypatch.setattr(dr.fetch_min, "BaostockSession", Session)
+    monkeypatch.setattr(dr.fetch_min, "load_pool", lambda *a: [("sh600000", "")])
+    monkeypatch.setattr(dr, "update_pool", lambda *a, **k: {"full": 1})
+    monkeypatch.setattr(dr.subprocess, "run", lambda cmd, **kw: (commands.append(cmd),
+                        SimpleNamespace(returncode=1, stdout="", stderr="failed"))[1])
+    monkeypatch.setattr(dr, "sync_watchlist_group", lambda *a: pytest.fail("stale watchlist used"))
+    with pytest.raises(RuntimeError, match="扫描失败"):
+        dr._run_daily(args, lambda *a: None)
+    command = commands[0]
+    assert command[command.index("--cache-dir") + 1] == str(args.cache_dir)
+    assert command[command.index("--out") + 1] == str(args.watchlist)
+    assert command[command.index("--limit") + 1] == "2"

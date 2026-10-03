@@ -2,7 +2,7 @@
 """回测报告图表 — K 线 + 买卖点标注 + 权益曲线（matplotlib，无头可跑）
 
 输出 `matplotlib.figure.Figure`，两条消费路径：
-  - 桌面端：`ui/backtest_tab.py` 把 Figure 嵌进 FigureCanvas 展示
+  - 嵌入调用：调用方可把 Figure 嵌进 FigureCanvas（当前无回测 GUI 页）
   - 落盘：  `save_report_chart()` 存 PNG（Agg canvas，不依赖显示环境）
 
 不 import pyplot、不碰后端 —— Figure 由调用方决定接到哪个 canvas 上。
@@ -87,7 +87,7 @@ def render_report_figure(report, daily: Sequence[KLineData],
         xs = list(range(min(len(curve), n)))
         ys = curve[:len(xs)]
         peak = []
-        p = 0.0
+        p = report.initial_capital
         for e in ys:
             p = max(p, e)
             peak.append(p)
@@ -96,7 +96,7 @@ def render_report_figure(report, daily: Sequence[KLineData],
                            label="回撤")
         ax_eq.axhline(report.initial_capital, color="#888", linewidth=0.8,
                       linestyle="--")
-        ax_eq.legend(loc="upper left", prop={"family": font}, fontsize=9)
+        ax_eq.legend(loc="upper left", prop={"family": [font]}, fontsize=9)
     ax_eq.set_ylabel("权益", fontfamily=font)
     ax_eq.grid(alpha=0.25, linewidth=0.5)
 

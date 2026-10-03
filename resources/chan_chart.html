@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>__TITLE__</title>
+<style>
+  html,body{margin:0;padding:0;background:#f4f5f7;color:#222;
+    font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;}
+  #wrap{max-width:1720px;margin:0 auto;padding:16px 20px 32px;}
+  h1{font-size:19px;margin:0 0 8px;font-weight:600;}
+  .meta{font-size:12px;color:#555;line-height:1.9;margin-bottom:10px;}
+  .meta b{color:#111;font-weight:600;}
+  .meta .box{display:inline-block;background:#fff;border:1px solid #e3e6ea;
+    border-radius:4px;padding:2px 8px;margin:0 6px 6px 0;}
+  .note{font-size:12px;color:#555;background:#fff;border:1px solid #e3e6ea;
+    border-left:3px solid #ff9800;border-radius:6px;padding:10px 14px;
+    margin-bottom:12px;line-height:1.85;}
+  .note ol{margin:6px 0 0 18px;padding:0;}
+  #chart{width:100%;height:940px;background:#fff;border:1px solid #e3e6ea;
+    border-radius:6px;contain:layout paint size;
+    user-select:none;-webkit-user-select:none;touch-action:none;}
+</style>
+</head>
+<body>
+<p style="padding:8px;color:#a33">历史几何与多周期诊断：笔端点和旧策略含未来信息，不是当前三买策略的实盘成交记录。当前策略请使用 GUI 三买标注或 eval_daily_5min.py 的可观察事件报告。</p>
+<div id="wrap">
+  <h1>__TITLE__</h1>
+  <div class="meta">__META__</div>
+  <div class="note">__NOTE__</div>
+  <div id="chart"></div>
+</div>
+<script>__ECHARTS__</script>
+<script>
+var CFG = __PAYLOAD__;
+var ST = CFG.style, dates = CFG.dates, bars = CFG.bars;
+
+// 紧凑数组列序
+var O = 0, C = 1, L = 2, H = 3, V = 4, MA5 = 5, MA10 = 6;
+
+function scatter(name, pts, color, size, rotate, offset, z) {
+  return {
+    name: name, type: 'scatter', xAxisIndex: 0, yAxisIndex: 0,
+    data: pts, symbol: 'triangle', symbolSize: size || 11,
+    symbolRotate: rotate || 0, symbolOffset: offset || [0, 0],
+    itemStyle: {color: color, borderColor: '#fff', borderWidth: 0.8},
+    z: z || 7, animation: false, emphasis: {scale: 1.6}
+  };
+}
+
+// ---- 各 bar 上的标记（tooltip 用），从 points 反查 ----
+var markAt = {};
+['daily', 'm30'].forEach(function (lv) {
+  var g = CFG.points[lv] || {};
+  Object.keys(g).forEach(function (k) {
+    g[k].forEach(function (p) {
+      var i = p[0];
+      var label = (lv === 'daily' ? '日线' : '30分') + k;
+      // 第三元素是一买/一卖的背驰标注（1=背驰确认 0=未背驰）
+      if (p.length > 2) { label += p[2] ? '（背驰）' : '（未背驰）'; }
+      (markAt[i] = markAt[i] || []).push(label);
+    });
+  });
+});
+
+// ---- 日线买卖点：主图层（大标记） ----
+var dailyBuy = [], dailySell = [];
+POINT_KEYS.forEach(function (k) {
+  var pts = (CFG.points.daily || {})[k] || [];
+  var isBuy = k.indexOf('买') >= 0;
+  if (!pts.length) { return; }
+  (isBuy ? dailyBuy : dailySell).push([k, pts]);
+});
+
+// ---- 区域标注：两级中枢（markArea，silent 不参与 hover） ----
+// 注意 xAxis 用类目值（日期字符串）而不是下标数字：category 轴上类目值
+// 是确定可匹配的，数字下标在不同 ECharts 版本里解释不一致。
+// （旧版这里还有「预热底纹」—— 那是给 czsc `cxt_*` 信号源画的前 init_n 根
+//  禁区。策略改几何源后没有预热截断，底纹已删除。）
+function boxes(src) {
+  return (src || []).map(function (z) {
+    return [{xAxis: dates[z[0]], yAxis: z[2]},
+            {xAxis: dates[z[1]], yAxis: z[3]}];
+  });
+}
+
+// 中枢分两层（日线级别 / 30 分钟笔中枢），各挂在一个「无数据的散点系列」上。
+// markArea 属于 series —— 挂到 K 线上就只能有一个开关，分不了层。
+function centerLayer(name, src, style) {
+  var data = boxes(src);
+  if (!data.length) { return null; }
+  return {
+    name: name, type: 'scatter', xAxisIndex: 0, yAxisIndex: 0,
+    data: [], z: 1, animation: false, silent: true,
+    markArea: {silent: true, animation: false, itemStyle: style, data: data}
+  };
+}
+// 日线中枢：主图层。区间大、数量少，用来一眼看出「哪一段是震荡区」
+var layerDaily = centerLayer('日线中枢', CFG.centers_daily, {
+  color: ST.center_daily_fill, borderColor: ST.center_daily_line,
+  borderWidth: 1.6, opacity: 1});
+// 30 分钟笔中枢：次图层，默认收起（一个中枢只跨几十根 bar，一年 20 多个框）
+var layerM30 = centerLayer('30分中枢', CFG.centers, {
+  color: ST.center_fill, borderColor: ST.center_line,
+  borderWidth: 1, borderType: [4, 3], opacity: 0.9});
+
+// ---- 策略日线条件「生效日」竖线（markLine，silent） ----
+var lineData = CFG.strategy.d1_days.map(function (i) {
+  return {xAxis: dates[i], lineStyle: {color: ST.d1_line, width: 2, opacity: 0.5}};
+}).concat(CFG.strategy.d2_days.map(function (i) {
+  return {xAxis: dates[i], lineStyle: {color: ST.d2_line, width: 2, opacity: 0.5}};
+}));
+
+var series = [
+  {
+    name: 'K线', type: 'candlestick', xAxisIndex: 0, yAxisIndex: 0, z: 5,
+    data: bars.map(function (b) { return [b[O], b[C], b[L], b[H]]; }),
+    itemStyle: {color: ST.up, color0: ST.down,
+      borderColor: ST.up, borderColor0: ST.down},
+    // 中枢用 markArea 挂在「无数据的散点系列」上（原实现用 custom 系列 +
+    // renderItem，dataZoom 每帧重跑 renderItem，是拖动卡顿的主因）。
+    markLine: lineData.length ? {
+      silent: true, symbol: 'none', animation: false, label: {show: false},
+      data: lineData
+    } : undefined
+  },
+  {
+    name: '笔', type: 'line', xAxisIndex: 0, yAxisIndex: 0, z: 2,
+    data: CFG.bi_points, showSymbol: false, symbol: 'none',
+    lineStyle: {color: ST.bi, width: 1.2},
+    itemStyle: {color: ST.bi}, smooth: false, animation: false
+  },
+  {
+    name: '日线MA5', type: 'line', xAxisIndex: 0, yAxisIndex: 0, z: 4,
+    data: bars.map(function (b, i) { return [i, b[MA5]]; }),
+    showSymbol: false, symbol: 'none', connectNulls: false, animation: false,
+    lineStyle: {color: ST.ma_short, width: 1.4}, itemStyle: {color: ST.ma_short}
+  },
+  {
+    name: '日线MA10', type: 'line', xAxisIndex: 0, yAxisIndex: 0, z: 4,
+    data: bars.map(function (b, i) { return [i, b[MA10]]; }),
+    showSymbol: false, symbol: 'none', connectNulls: false, animation: false,
+    lineStyle: {color: ST.ma_long, width: 1.4}, itemStyle: {color: ST.ma_long}
+  },
+  {
+    name: '顶分型', type: 'scatter', xAxisIndex: 0, yAxisIndex: 0, z: 6,
+    data: CFG.fractals.top, symbol: 'circle', symbolSize: 5.5, animation: false,
+    itemStyle: {color: ST.fx_top, borderColor: '#fff', borderWidth: 0.5}
+  },
+  {
+    name: '底分型', type: 'scatter', xAxisIndex: 0, yAxisIndex: 0, z: 6,
+    data: CFG.fractals.bottom, symbol: 'circle', symbolSize: 5.5, animation: false,
+    itemStyle: {color: ST.fx_bottom, borderColor: '#fff', borderWidth: 0.5}
+  }
+];
+
+// 日线买卖点：每类一个系列，买点在 low 下方、卖点在 high 上方
+dailyBuy.forEach(function (item) {
+  var k = item[0];
+  series.push(scatter('日线' + k, item[1], ST.daily[k], 15, 0, [0, 10], 9));
+});
+dailySell.forEach(function (item) {
+  var k = item[0];
+  series.push(scatter('日线' + k, item[1], ST.daily[k], 15, 180, [0, -10], 9));
+});
+
+// 30 分钟买卖点：次图层，默认关闭
+POINT_KEYS.forEach(function (k) {
+  var pts = (CFG.points.m30 || {})[k] || [];
+  if (!pts.length) { return; }
+  var isBuy = k.indexOf('买') >= 0;
+  series.push(scatter('30分' + k, pts, ST.m30[k], 9,
+    isBuy ? 0 : 180, isBuy ? [0, 7] : [0, -7], 8));
+});
+
+// 策略真正命中的 30 分钟二买 bar：蓝框高亮（把「策略为什么在这里买」钉出来）
+if (CFG.strategy.m30_hits.length) {
+  series.push({
+    name: '策略命中二买', type: 'scatter', xAxisIndex: 0, yAxisIndex: 0, z: 15,
+    data: CFG.strategy.m30_hits.map(function (i) {
+      return [i, bars[i] ? bars[i][L] : 0];
+    }),
+    symbol: 'rect', symbolSize: [16, 34], symbolOffset: [0, 24],
+    itemStyle: {color: 'transparent', borderColor: ST.strategy_hit,
+                borderWidth: 2, borderType: [3, 2]},
+    animation: false, silent: true
+  });
+}
+
+// 策略买卖点：大号圆点 + 白字「买 / 卖」
+function stratMarker(name, data, color, dy, text) {
+  return {
+    name: name, type: 'scatter', xAxisIndex: 0, yAxisIndex: 0, z: 20,
+    data: data, symbol: 'circle', symbolSize: 32, symbolOffset: [0, dy],
+    itemStyle: {color: color, borderColor: '#fff', borderWidth: 1.6,
+                shadowBlur: 4, shadowColor: 'rgba(0,0,0,0.25)'},
+    label: {show: true, position: 'inside', color: '#fff', fontSize: 14,
+            fontWeight: 'bold', formatter: text},
+    animation: false, emphasis: {scale: 1.15}
+  };
+}
+var sBuy = [], sSell = [];
+CFG.strategy.trades.forEach(function (t) {
+  sBuy.push([t.buy.idx, t.buy.price]);
+  if (t.sell && t.sell.idx >= 0) { sSell.push([t.sell.idx, t.sell.price]); }
+});
+if (sBuy.length) {
+  series.push(stratMarker('策略买点', sBuy, ST.strategy_buy, 30, '买'));
+}
+if (sSell.length) {
+  series.push(stratMarker('策略卖点', sSell, ST.strategy_sell, -30, '卖'));
+}
+
+// 成交量（副图）
+series.push({
+  name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, z: 2,
+  data: bars.map(function (b, i) {
+    return {value: [i, b[V] / 100],
+            itemStyle: {color: b[C] >= b[O] ? ST.up : ST.down, opacity: 0.75}};
+  }),
+  barWidth: '60%', animation: false
+});
+
+// 中枢图层插到最前面：z 序上压在 K 线之下，图例顺序交给 LEGEND_FIRST 管
+[layerDaily, layerM30].filter(Boolean).reverse().forEach(function (s) {
+  series.unshift(s);
+});
+
+var counts = CFG.meta.counts;
+
+// 图例顺序 = 判读优先级。条目近 20 个、一行放不下，ECharts 会折行；
+// 若按 series 原顺序排，「策略买点 / 策略卖点」会被挤到末尾一行，
+// 而它们恰恰是这张图最需要看的两个点，所以显式排序提到最前。
+var LEGEND_FIRST = ['策略买点', '策略卖点',
+                    '策略命中二买', '日线中枢',
+                    '日线一买', '日线二买', '日线三买',
+                    '日线一卖', '日线二卖', '日线三卖', '成交点'];
+var legendData = series.map(function (s) { return s.name; });
+legendData.sort(function (a, b) {
+  var ia = LEGEND_FIRST.indexOf(a), ib = LEGEND_FIRST.indexOf(b);
+  if (ia < 0) { ia = LEGEND_FIRST.length; }
+  if (ib < 0) { ib = LEGEND_FIRST.length; }
+  return ia - ib;
+});
+
+// 默认只开日线级别；30 分钟级别与分型收起（数量多，会盖住 K 线）
+var legendSelected = {'顶分型': false, '底分型': false, '30分中枢': false};
+POINT_KEYS.forEach(function (k) { legendSelected['30分' + k] = false; });
+
+var option = {
+  animation: false,
+  backgroundColor: '#ffffff',
+  title: {
+    text: '默认铺满全量　·　日线中枢 ' + counts['日线中枢'] + ' 个　日线买卖点 '
+          + counts['日线买卖点'] + ' 个　策略买点 ' + counts['策略买点']
+          + ' 次　（底部滑条 / 滚轮可缩放）',
+    left: 'center', top: 6,
+    textStyle: {fontSize: 13, fontWeight: 'normal', color: '#555'}
+  },
+  legend: {
+    // 不用 type:'scroll' —— 它会把放不下的条目折进「1/2」第二页，
+    // 点一次才看得到；改成限定宽度让它自动换行，全部条目常驻可见。
+    top: 26, left: 'center', width: '97%', data: legendData,
+    textStyle: {color: '#333', fontSize: 11}, itemWidth: 14, itemHeight: 9,
+    itemGap: 8, selected: legendSelected
+  },
+  tooltip: {
+    trigger: 'axis', transitionDuration: 0,
+    axisPointer: {type: 'line', lineStyle: {color: '#aaa'}},
+    backgroundColor: 'rgba(255,255,255,0.97)', borderColor: '#d0d4d9',
+    textStyle: {color: '#222', fontSize: 12},
+    formatter: function (ps) {
+      var idx = ps[0].dataIndex, b = bars[idx];
+      if (!b) { return ''; }
+      var s = '<div style="font-size:12px;line-height:1.7">';
+      s += '<b>' + dates[idx] + '</b><br/>';
+      s += '开 ' + b[O].toFixed(2) + '&nbsp;&nbsp;高 ' + b[H].toFixed(2) + '<br/>';
+      s += '低 ' + b[L].toFixed(2) + '&nbsp;&nbsp;收 ' +
+           '<b style="color:' + (b[C] >= b[O] ? ST.up : ST.down) + '">' +
+           b[C].toFixed(2) + '</b><br/>';
+      s += '量 ' + (b[V] / 100).toFixed(0) + ' 手<br/>';
+      if (b[MA5]) {
+        s += '<span style="color:' + ST.ma_short + '">日线MA5 ' +
+             b[MA5].toFixed(2) + '</span>&nbsp;&nbsp;';
+        s += '<span style="color:' + ST.ma_long + '">MA10 ' +
+             b[MA10].toFixed(2) + '</span><br/>';
+      }
+      var mk = markAt[idx];
+      if (mk && mk.length) {
+        s += '<span style="color:#c62828">缠论买卖点：' + mk.join('、') +
+             '</span><br/>';
+      }
+      CFG.strategy.trades.forEach(function (x) {
+        if (x.buy.idx === idx) {
+          s += '<div style="margin-top:4px;padding-top:4px;' +
+               'border-top:1px dashed #ccc">' +
+               '<b style="color:' + ST.strategy_buy + '">策略买点</b> @' +
+               x.buy.price + '<br/>日线一买 ' + x.buy.d1 + ' → 日线二买 ' +
+               x.buy.d2 + '（间隔 ' + x.buy.gap_1to2 + ' 日）<br/>' +
+               '→ 30 分钟二买 ' + x.buy.gap_2tom + ' 日内确认，' +
+               '信号 bar ' + x.buy.signal_dt + '</div>';
+        }
+        if (x.sell && x.sell.idx === idx) {
+          s += '<div style="margin-top:4px;padding-top:4px;' +
+               'border-top:1px dashed #ccc">' +
+               '<b style="color:' + ST.strategy_sell + '">策略卖点</b> @' +
+               x.sell.price + '<br/>' + x.sell.ma + ' 被跌破（确认日 ' +
+               x.sell.confirm_dt + '），持有 ' + x.sell.hold_days +
+               ' 交易日</div>';
+        }
+      });
+      s += '</div>';
+      return s;
+    }
+  },
+  grid: [
+    {left: 64, right: 26, top: 82, height: 610},
+    {left: 64, right: 26, top: 720, height: 150}
+  ],
+  xAxis: [
+    {type: 'category', gridIndex: 0, data: dates, boundaryGap: true,
+     axisLine: {lineStyle: {color: '#bbb'}}, axisTick: {show: false},
+     axisLabel: {show: false}, splitLine: {show: false},
+     axisPointer: {label: {show: false}}},
+    {type: 'category', gridIndex: 1, data: dates, boundaryGap: true,
+     axisLine: {lineStyle: {color: '#bbb'}}, axisTick: {show: false},
+     axisLabel: {color: '#666', fontSize: 10, formatter: function (v) {
+       return v.slice(0, 10); }},
+     splitLine: {show: false}}
+  ],
+  yAxis: [
+    {scale: true, gridIndex: 0, splitLine: {lineStyle: {color: '#f2f3f5'}},
+     axisLine: {lineStyle: {color: '#bbb'}}, axisTick: {show: false},
+     axisLabel: {color: '#555', fontSize: 11},
+     splitArea: {show: false}},
+    {gridIndex: 1, splitLine: {show: false},
+     axisLine: {lineStyle: {color: '#bbb'}}, axisTick: {show: false},
+     axisLabel: {color: '#888', fontSize: 10,
+       formatter: function (v) { return (v / 10000).toFixed(0) + '万手'; }}}
+  ],
+  dataZoom: [
+    {type: 'inside', xAxisIndex: [0, 1],
+     startValue: CFG.zoom.startValue, endValue: CFG.zoom.endValue,
+     zoomOnMouseWheel: true, moveOnMouseMove: true},
+    {type: 'slider', xAxisIndex: [0, 1], bottom: 14, height: 30,
+     startValue: CFG.zoom.startValue, endValue: CFG.zoom.endValue,
+     borderColor: '#ddd', fillerColor: 'rgba(100,150,220,0.15)',
+     handleStyle: {color: '#78909c'},
+     labelFormatter: function (v) { return dates[v] ? dates[v].slice(0, 10) : ''; }}
+  ],
+  series: series
+};
+
+// 脏矩形渲染：拖动 / 缩放时只重画变化的区域（ECharts 5 特性）。
+// 与 markArea / markLine 组合已实测截图无副作用；不要与 progressive
+// 同时用 —— 分帧渲染的后续帧会被脏矩形判定为「没变化」而跳过。
+var chart = echarts.init(document.getElementById('chart'), null,
+                         {renderer: 'canvas', useDirtyRect: true});
+chart.setOption(option);
+window.addEventListener('resize', function () { chart.resize(); });
+</script>
+</body>
+</html>

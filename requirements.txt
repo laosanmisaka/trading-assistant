@@ -1,21 +1,23 @@
-# 依赖清单（与 environment.yml 保持同步，改这里请同步改那边）
+# 唯一依赖清单；environment.yml 通过 -r requirements.txt 引用本文件
 #
 # 版本策略: 使用 >= 下限而非锁死，避免阻碍安全更新。
 #           akshare 历史上存在频繁的不兼容变更，升级后请先跑 tests/ 再提交。
 #           需要完全可复现的环境时，用 pip freeze > requirements-lock.txt 生成锁文件。
 #
-# 已验证可用的组合 (2026-09-17):
-#   PyQt5 5.15.11 / pandas 3.0.5 / numpy 2.5.3 / pytest 9.1.1
+# 已验证版本与平台见 docs/VALIDATION.md；最低依赖组合未单独验证。
 
 # ---- 运行依赖 ----
 PyQt5>=5.15.9
 akshare>=1.14.0
+requests>=2.31
 matplotlib>=3.7.0
-pandas>=2.0.0
-numpy>=1.24.0
+pandas>=2.2.0
+numpy>=1.26.4
 # 通达信行情接口，1min 数据主数据源（data/market_data.py）。
 # 原清单漏声明，干净环境会走 ImportError 回退路径并静默降级。
 mootdx>=0.11.0
+baostock>=0.9.4
+exchange_calendars>=4.13.1,<5
 
 # 缠论计算（core/chan.py）。1.0.1 起核心算法改为 Rust 实现，PyPI 提供
 # 预编译 wheel（cp310-abi3），因此无需 Rust 工具链；要求 Python >= 3.10。
@@ -30,8 +32,9 @@ czsc>=1.0.1,<2
 
 # ---- 开发/测试依赖 ----
 pytest>=8.0
+radon>=6,<7
 
 # ---- 随仓库的静态资源 ----
-# resources/echarts.min.js（ECharts 5.6.0，约 1.0MB）供 core/chan_viz.py 内联生成
+# resources/echarts.min.js（ECharts 5.5.1，约 1.0MB）供 core/chan_viz.py 内联生成
 # 离线可看的缠论标注图（python visualize_chan.py sh688981）。已入库，
 # 不需要通过包管理器安装；不依赖 CDN，断网也能打开生成结果。
