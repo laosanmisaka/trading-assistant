@@ -25,9 +25,14 @@ class AlertEngine:
 
     def __init__(self):
         self._states: dict[str, AlertState] = {}
+        self._position_keys: dict[str, object] = {}
 
     def get_state(self, code: str) -> AlertState:
-        """获取某股票的提醒状态（首次加载时从数据库恢复手动设置）"""
+        """新持仓轮次重置自动线与分型锁定；明确的手动设置从数据库恢复。"""
+        position_key = get_position_summary(code).get("position_key")
+        if code in self._position_keys and self._position_keys[code] != position_key:
+            self._states.pop(code, None)
+        self._position_keys[code] = position_key
         if code not in self._states:
             state = AlertState(stock_code=code)
             # 从数据库恢复手动设置
@@ -47,20 +52,20 @@ class AlertEngine:
 
     def set_manual_sl(self, code: str, price: float) -> None:
         """手动设置止损价"""
+        set_manual_alert(code, sl_active=True, sl_price=price)
         state = self.get_state(code)
         state.sl_manual = True
         state.sl_manual_value = price
         state.stop_loss_price = price
-        set_manual_alert(code, sl_active=True, sl_price=price)
         logger.info(f"{code} 手动止损设置为 {price:.2f}")
 
     def set_manual_tp(self, code: str, price: float) -> None:
         """手动设置止盈价"""
+        set_manual_alert(code, tp_active=True, tp_price=price)
         state = self.get_state(code)
         state.tp_manual = True
         state.tp_manual_value = price
         state.take_profit_price = price
-        set_manual_alert(code, tp_active=True, tp_price=price)
         logger.info(f"{code} 手动止盈设置为 {price:.2f}")
 
     def clear_manual(self, code: str, field: str = "all") -> None:
@@ -184,10 +189,10 @@ class AlertEngine:
         """
         计算止盈价（自动逻辑）
         规则:
-        - 默认: 买入价 × 1.10 (涨停价)
-        - 检测到30分钟级别缠论顶分型后: 切换为该顶分型的最高价，之后不再更新
+        - 默认: 当前持仓均价 × 1.10（固定提醒阈值，不是交易所涨停价）
+        - 检测到买入日之后的60分钟级别缠论顶分型后: 切换为该顶分型的最高价，之后不再更新
         - 如果存在手动设置，返回冲突信息而不自动更新
-        - 限流: 30min分型检测每分钟最多查一次 (避免高频调用重复拉API)
+        - 限流: 60min分型检测每分钟最多查一次 (避免高频调用重复拉API)
 
         返回: (当前止盈价, 冲突信息或None)
         """
@@ -201,18 +206,18 @@ class AlertEngine:
         # ---- 自动计算逻辑 ----
         new_tp = state.take_profit_price
 
-        # 首次设置: 用涨停价
+        # 首次设置: 用当前持仓成本的固定倍率
         if state.take_profit_price <= 0:
             summary = get_position_summary(code)
             if summary["avg_cost"] > 0:
                 new_tp = round(summary["avg_cost"] * TAKE_PROFIT_LIMITUP_RATIO, 2)
-                logger.info(f"{code} 初始止盈(涨停)={new_tp:.2f}")
+                logger.info(f"{code} 初始止盈(成本阈值)={new_tp:.2f}")
 
         # 如果已检测到顶分型，止盈线已锁定不再更新
         if state.top_fractal_detected:
             return state.take_profit_price, None
 
-        # 限流: 30min分型检测每分钟最多查一次
+        # 限流: 60min分型检测每分钟最多查一次
         import time as _time
         now_ts = _time.time()
         if not hasattr(state, '_last_fractal_check'):
@@ -221,9 +226,12 @@ class AlertEngine:
             return state.take_profit_price, None
         state._last_fractal_check = now_ts
 
-        # 检查是否有30分钟级别顶分型（从入库的 60min 数据读取）
+        # 检查是否有买入日之后的60分钟级别顶分型
         manager = get_data_manager()
         rows = manager.get_minute_klines_from_db(code, "60min")
+        first_buy = get_first_buy_date(code)
+        if first_buy:
+            rows = [r for r in rows if r["timestamp"][:10] > first_buy[:10]]
         if rows:
             klines_60min = [KLineData(
                 code=code, date=r["timestamp"][:10],
@@ -236,7 +244,7 @@ class AlertEngine:
                 state.top_fractal_detected = True
                 new_tp = round(top_high, 2)
                 logger.info(
-                    f"{code} 检测到30min顶分型(idx={idx})，"
+                    f"{code} 检测到60min顶分型(idx={idx})，"
                     f"止盈线锁定为顶分型最高价={top_high:.2f}"
                 )
 

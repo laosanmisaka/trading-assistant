@@ -167,7 +167,7 @@ def build_payload(code: str, cache_dir: Path, *, min_mode: str,
                        "itemStyle": {"color": "rgba(120,120,120,0.12)"}},
                       {"xAxis": dates[x1], "yAxis": round(float(z["high"]), 3)}])
     for r in res["明细"]:
-        x0, x1 = _x(r["窗口起"]), _x(r["日线确认"])
+        x0, x1 = _x(r["窗口起"]), _x(r["窗口关闭"])
         if x0 is None or x1 is None:
             continue
         areas.append([{"xAxis": dates[x0],
@@ -186,7 +186,7 @@ def build_payload(code: str, cache_dir: Path, *, min_mode: str,
         return out
 
     p3 = _points("三买点", lambda r, x: round(float(kd[x].low), 3))
-    p5 = _points("最早买点", lambda r, x: round(float(kd[x].low), 3))
+    p5 = _points("最早买点", lambda r, x: round(float(r["_entry5px"]), 3))
     pd_ = []
     for r in res["明细"]:
         i = r.get("_entry_d")
@@ -207,22 +207,22 @@ def build_payload(code: str, cache_dir: Path, *, min_mode: str,
 
 
 def render_html(payload: dict, code: str, min_mode: str, out: Path) -> Path:
-    s = payload["summary"]
-    title = f"{code}  日线+5min 三买策略（{min_mode}）"
-    meta = (f"日线三买 <b>{s['三买点']}</b> 个 / 5min 覆盖 <b>{s['5min覆盖']}</b> 个 / "
-            f"有候选 <b>{s['有候选']}</b> 个 / 提前中位 <b>{s['提前中位']}</b> 交易日 / "
-            f"价优中位 <b>{s['价优中位']}</b>%　　"
-            f"图例：红▲=日线三买点　橙★=5min最早买点　绿▼=日线确认入场　"
-            f"灰框=日线中枢　蓝影=回调窗口　　拖动平移 / 滚轮缩放")
-    html = (_HTML
-            .replace("__TITLE__", title)
-            .replace("__META__", meta)
-            .replace("__ECHARTS__", _ECHARTS.read_text(encoding="utf-8"))
-            .replace("__PAYLOAD__", json.dumps(payload, ensure_ascii=False))
-            .replace("__UP__", UP)
-            .replace("__DOWN__", DOWN))
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html, encoding="utf-8")
+    import html
+    import re
+    summary = payload["summary"]
+    title = f"{code} 日线可观察窗口 + 5min 一买 ({min_mode})"
+    meta = (f"观察窗口 {summary['三买点']} / 覆盖 {summary['5min覆盖']} / "
+            f"有入场 {summary['有候选']}。红▲为日线几何参考；橙★为实际观察确认的收盘价。"
+            "蓝影是可观察窗口；当前规则固定持有，旧绿▼图例不产生交易。")
+    encoded = json.dumps(payload, ensure_ascii=False)
+    for char in ("<", ">", "&", "\u2028", "\u2029"):
+        encoded = encoded.replace(char, "\\u%04x" % ord(char))
+    values = {"__TITLE__": html.escape(title), "__META__": html.escape(meta),
+              "__PAYLOAD__": encoded, "__ECHARTS__": _ECHARTS.read_text(encoding="utf-8"),
+              "__UP__": UP, "__DOWN__": DOWN}
+    text = re.sub("|".join(map(re.escape, values)), lambda match: values[match.group()], _HTML)
+    from utils.atomic import atomic_text
+    atomic_text(out, text)
     return out
 
 
@@ -232,8 +232,8 @@ def main(argv=None) -> int:
                     help="标的代码；不给则从缓存里随机抽 --n 只")
     ap.add_argument("--n", type=int, default=4)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--min-mode", default="any",
-                    choices=["any", "one", "one_div"])
+    ap.add_argument("--min-mode", default="one",
+                    choices=["one"])
     ap.add_argument("--zoom-bars", type=int, default=250,
                     help="默认视野显示最近多少根日线（全量可拖动查看）")
     ap.add_argument("--cache", type=Path, default=DEFAULT_CACHE)

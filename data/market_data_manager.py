@@ -74,6 +74,8 @@ class MarketDataManager:
         self._kline_cache_lock = threading.Lock()
 
         # 正在初始获取中的股票代码
+        self._history_checked = {}
+        self._hourly_checked = {}
         self._pending_codes: set[str] = set()
         self._pending_lock = threading.Lock()
 
@@ -229,11 +231,10 @@ class MarketDataManager:
         today_kline = _dict_to_kline(today)
         today_date = today["date"]
 
-        # 如果DB已有今日数据，用内存中的替换（盘中更新）
-        if klines and klines[-1].date == today_date:
-            klines[-1] = today_kline
-        else:
-            klines.append(today_kline)
+        by_date = {bar.date: bar for bar in klines}
+        if not klines or today_date >= klines[-1].date:
+            by_date[today_date] = today_kline
+        klines = [by_date[key] for key in sorted(by_date)]
 
         # 如果指定了 days，截断
         if days is not None and len(klines) > days:
@@ -260,157 +261,80 @@ class MarketDataManager:
         with self._pending_lock:
             self._pending_codes.discard(code)
 
+    def needs_history_refresh(self, code):
+        from core.trading_calendar import local_now
+        return self._history_checked.get(code) != local_now().date()
+
+    def _fetch_history(self, code):
+        from concurrent.futures import ThreadPoolExecutor
+        from data.history import aggregate_daily
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            daily_task = executor.submit(fetch_kline, code, "daily", 100000)
+            minute_task = executor.submit(fetch_1min_kline_history, code)
+            hourly_task = executor.submit(fetch_60min_kline_history, code)
+            daily, minute, hourly = daily_task.result(), minute_task.result(), hourly_task.result()
+        if not daily:
+            raise DataSourceError(f"{code} 无日线，不能完成历史补齐")
+        daily = sorted(daily, key=lambda bar: bar.date)
+        return {"daily": daily, "weekly": aggregate_daily(daily, "weekly"),
+                "monthly": aggregate_daily(daily, "monthly"), "1min": minute, "60min": hourly}
+
     def fetch_and_store_initial(self, code: str) -> dict:
-        """
-        新股初始获取：拉取半年日线 + 历史1min/60min数据，存DB，加载到内存
-        返回: {"daily": list[dict], "weekly": list[dict], "monthly": list[dict],
-                "1min": list[dict], "60min": list[dict]}
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        periods = ["daily", "weekly", "monthly"]
-        days_map = {"daily": 126, "weekly": 52, "monthly": 12}
-        results = {}
-
+        """Rebuild complete available snapshots on first access and each new day."""
+        from dataclasses import asdict
+        from data.database import replace_history_snapshot
+        from data.history import quote_from_history
+        from core.trading_calendar import local_now
         self.mark_pending(code)
-
         try:
-            # 第一阶段: 并行拉取日/周/月 + 1min + 60min
-            klines_by_period = {}
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {
-                    executor.submit(fetch_kline, code, p, days_map[p]): p
-                    for p in periods
-                }
-                # 同时拉取分钟级数据
-                future_1min = executor.submit(fetch_1min_kline_history, code)
-                future_60min = executor.submit(fetch_60min_kline_history, code)
-                futures[future_1min] = "1min"
-                futures[future_60min] = "60min"
-
-                for future in as_completed(futures):
-                    key = futures[future]
-                    try:
-                        result_data = future.result()
-                        klines_by_period[key] = result_data
-                    except DataSourceError as e:
-                        # 数据源故障 —— 与「该股确实无数据」区分开，必须报错
-                        logger.error(
-                            f"{code} {key} 数据源故障，本轮该周期无数据: {e}")
-                        klines_by_period[key] = []
-                    except Exception as e:
-                        logger.error(f"初始获取 {code} {key} 数据异常: {e}")
-                        klines_by_period[key] = []
-
-            # 第二阶段: 串行写 DB (避免并发写冲突)
-            all_dicts = []
-            daily_klines = klines_by_period.get("daily", [])
-            for period in periods:
-                klines = klines_by_period.get(period, [])
-                kline_dicts = [
-                    {
-                        "code": k.code, "date": k.date,
-                        "open": k.open, "high": k.high,
-                        "low": k.low, "close": k.close,
-                        "volume": k.volume, "period": k.period,
-                    }
-                    for k in klines
-                ]
-                results[period] = kline_dicts
-                all_dicts.extend(kline_dicts)
-
-            # 写入日/周/月
-            if all_dicts:
-                try:
-                    save_klines_batch(all_dicts)
-                    logger.info(f"已存储 {code} K线 {len(all_dicts)} 条 (日/周/月)")
-                except Exception as e:
-                    logger.error(f"存储 {code} K线到DB失败: {e}")
-
-            # 写入分钟级数据 (1min + 60min)
-            for min_period in ["1min", "60min"]:
-                minute_bars = klines_by_period.get(min_period, [])
-                if minute_bars:
-                    try:
-                        saved = save_klines_minute_batch(minute_bars)
-                        pct = len(minute_bars)
-                        logger.info(f"已存储 {code} {min_period} K线 {saved}/{pct} 条")
-                        results[min_period] = minute_bars
-                    except Exception as e:
-                        logger.error(f"存储 {code} {min_period} K线到DB失败: {e}")
-
-            # 用最新 1min 数据初始化现价缓存（比日线更精确）
-            minute_bars_1min = klines_by_period.get("1min", [])
-            if minute_bars_1min:
-                # 从 1min 数据计算当日 OHLC
-                prices = [b.get("close", b.get("price", 0)) for b in minute_bars_1min]
-                volumes = [b.get("volume", 0) for b in minute_bars_1min]
-                day_open = minute_bars_1min[0].get("open", prices[0])
-                day_high = max(b.get("high", p) for b, p in zip(minute_bars_1min, prices))
-                day_low = min(b.get("low", p) for b, p in zip(minute_bars_1min, prices))
-                price = prices[-1]
-                total_vol = sum(volumes)
-
-                # 前收盘：找日线中早于 1min 数据日期的最后一根
-                last_1min_date = minute_bars_1min[-1]["timestamp"][:10]
-                pre_close = price  # fallback
-                for k in reversed(daily_klines):
-                    if k.date < last_1min_date:
-                        pre_close = k.close
-                        break
-            elif daily_klines and len(daily_klines) >= 2:
-                # 1min 不可用时回退到日线：最新日线收盘作为现价
-                last = daily_klines[-1]
-                prev = daily_klines[-2]
-                price = last.close
-                pre_close = prev.close  # 日线价格对应昨天，前收是前天
-                day_open = last.open
-                day_high = last.high
-                day_low = last.low
-                total_vol = last.volume
-            else:
-                price, pre_close = 0.0, 0.0
-                day_open = day_high = day_low = 0.0
-                total_vol = 0
-
-            if price > 0:
-                change_pct = ((price - pre_close) / pre_close * 100) if pre_close > 0 else 0.0
-                quote = RealtimeQuote(
-                    code=code, name="",
-                    price=price,
-                    change_pct=round(change_pct, 2),
-                    change_amt=round(price - pre_close, 2),
-                    volume=total_vol,
-                    high=day_high, low=day_low,
-                    open=day_open,
-                    pre_close=round(pre_close, 2),
-                    timestamp=datetime.now().strftime("%H:%M:%S"),
-                )
-                with self._quotes_lock:
-                    self._quotes[code] = quote
-
-            # 清除缓存让下次读取走DB
+            fetched = self._fetch_history(code)
+            results = {period: ([asdict(bar) for bar in bars] if not period.endswith("min") else bars)
+                       for period, bars in fetched.items()}
+            replace_history_snapshot(code, results)
+            quote = quote_from_history(code, fetched["daily"], fetched["1min"])
+            if quote:
+                self.update_quotes({code: quote})
+            with self._today_bars_lock:
+                for period in ("daily", "weekly", "monthly"):
+                    self._today_bars.pop((code, period), None)
             self._invalidate_kline_cache(code)
-
+            if fetched["1min"] and fetched["60min"]:
+                self._history_checked[code] = local_now().date()
+            else:
+                logger.warning("%s 分钟历史为空，保留旧数据并等待后续补齐", code)
+            return results
         finally:
             self.unmark_pending(code)
 
-        return results
+    def refresh_history_if_needed(self, code):
+        from core.trading_calendar import local_now
+        from data.database import replace_history_snapshot
+        if self.needs_history_refresh(code):
+            self.fetch_and_store_initial(code)
+        hour = local_now().strftime("%Y-%m-%d %H")
+        if self._hourly_checked.get(code) != hour:
+            bars = fetch_60min_kline_history(code)
+            if bars:
+                replace_history_snapshot(code, {"60min": bars})
+                self._hourly_checked[code] = hour
 
-    # ================================================================
-    # 定期 flush 到 DB
-    # ================================================================
-
-    # ================================================================
-    # 分钟K线管理
-    # ================================================================
+    def _refresh_aggregated_periods(self, code):
+        from dataclasses import asdict
+        from data.history import aggregate_daily
+        from data.database import replace_history_snapshot
+        daily = self.get_klines(code, "daily", force_refresh=True)
+        derived = {period: [asdict(bar) for bar in aggregate_daily(daily, period)]
+                   for period in ("weekly", "monthly")}
+        replace_history_snapshot(code, derived)
+        self._invalidate_kline_cache(code)
 
     def refresh_minute_bars(self, code: str) -> int:
         """拉取今日 1min K线 (TDX)，同时更新日线 OHLCV 和现价
         一次 API 调用替代 refresh_quote + 分时两次调用
         返回写入 DB 的分钟线条数
         """
-        bars = fetch_today_1min_bars(code)
+        from data.history import latest_session
+        bars = latest_session(fetch_today_1min_bars(code))
         if not bars:
             return 0
 
@@ -430,6 +354,7 @@ class MarketDataManager:
             "period": "daily",
         }
         self.update_today_bar(code, "daily", today_bar)
+        self._refresh_aggregated_periods(code)
 
         # --- 更新现价缓存 ---
         daily = self.get_klines(code, "daily", days=3)

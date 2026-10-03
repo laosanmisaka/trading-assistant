@@ -213,8 +213,8 @@ def fetch_1min_kline_history(code: str) -> list[dict]:
                     break
 
             if result:
-                # 分页拉取得到的是从新到旧，反转为时间升序
-                result.reverse()
+                # 页内/页间顺序不作假设，按时间升序
+                result.sort(key=lambda bar: bar["timestamp"])
                 cache.set(cache_key, result, ttl=600.0)
                 dates = sorted(set(r["timestamp"][:10] for r in result))
                 logger.info(f"TDX获取 {code} 1min 历史K线 {len(result)} 条 "
@@ -248,7 +248,7 @@ def _fetch_1min_kline_em_fallback(code: str) -> list[dict]:
     for attempt in range(2):
         try:
             import akshare as ak
-            df = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="qfq")
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="")
             if df is None or df.empty:
                 return []          # 源正常应答，只是没有数据
 
@@ -304,7 +304,7 @@ def fetch_60min_kline_history(code: str) -> list[dict]:
             import akshare as ak
             logger.debug(f"获取历史60分钟K线: {code} (第{attempt+1}次)")
 
-            df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="")
             if df is None or df.empty:
                 return []          # 源正常应答，只是没有数据
 
@@ -392,7 +392,7 @@ def fetch_today_1min_bars(code: str) -> list[dict]:
                 })
 
             if result:
-                result.reverse()  # TDX 返回从新到旧，反转为时间升序
+                result.sort(key=lambda bar: bar["timestamp"])
                 cache.set(cache_key, result, ttl=30.0)
 
             return result
@@ -409,7 +409,7 @@ def fetch_today_1min_bars(code: str) -> list[dict]:
 
 
 def _fetch_today_1min_sina_fallback(code: str) -> list[dict]:
-    """Sina 分时数据回退 (只有 price+volume，无完整 OHLC)
+    """Sina 分时数据回退，保留接口真实 OHLCV
 
     注意：sina 1min 接口返回的是最近 ~1970 根（跨多个交易日），
     必须按当天日期过滤，否则多日 bar 会被错误聚合进「今日 OHLCV」。
@@ -420,9 +420,9 @@ def _fetch_today_1min_sina_fallback(code: str) -> list[dict]:
     return [{
         "code": code,
         "timestamp": b["time"],
-        "open": b["price"],
-        "high": b["price"],
-        "low": b["price"],
+        "open": b["open"],
+        "high": b["high"],
+        "low": b["low"],
         "close": b["price"],
         "volume": b.get("volume", 0),
         "period": "1min",
@@ -471,6 +471,9 @@ def fetch_intraday_data(code: str) -> list[dict]:
                 "time": time_str,
                 "date": time_str[:10],  # YYYY-MM-DD 用于分组
                 "price": price,
+                "open": _safe_float(row.get("open")),
+                "high": _safe_float(row.get("high")),
+                "low": _safe_float(row.get("low")),
                 "volume": vol,
                 "avg_price": round(avg_price, 2),
             })
@@ -683,7 +686,15 @@ class IncrementalRefreshWorker(QThread):
         if active_codes:
             try:
                 # 一次 TDX 1min 调用 = 日线 OHLCV + 现价 + 分钟线存储
-                manager.refresh_minute_bars_batch(active_codes)
+                for code in active_codes:
+                    if self.isInterruptionRequested():
+                        break
+                    try:
+                        manager.refresh_history_if_needed(code)
+                    except Exception:
+                        logger.exception("%s 历史补齐失败，将重试", code)
+                if not self.isInterruptionRequested():
+                    manager.refresh_minute_bars_batch(active_codes)
             except Exception:
                 from utils.logger import get_logger
                 get_logger(__name__).exception("增量刷新异常")
@@ -698,7 +709,7 @@ class IncrementalRefreshWorker(QThread):
 # ============================================================
 
 class InitialFetchWorker(QThread):
-    """新股全量数据获取 — 通过 MarketDataManager 获取半年日线/周线/月线，写DB
+    """新股数据获取 — 通过 MarketDataManager 获取源可用历史并派生周/月线，写DB
     完成后通过信号通知UI更新
     """
     kline_ready = pyqtSignal(str, str, list)  # (code, period, list[KLineData])
@@ -714,6 +725,8 @@ class InitialFetchWorker(QThread):
         manager = get_data_manager()
 
         try:
+            if self.isInterruptionRequested():
+                return
             results = manager.fetch_and_store_initial(self.code)
             # 从返回结果发各周期信号（测试用例使用）
             for key, data in results.items():

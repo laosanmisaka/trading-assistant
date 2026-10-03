@@ -162,6 +162,16 @@ class TestTradeCRUD:
         s = get_position_summary("000001")
         assert s["hold_qty"] == 500
         assert s["total_sell_qty"] == 500
+        assert s["avg_cost"] == 10.005
+        assert s["position_cost"] == 5002.5
+        add_trade(Trade(stock_code="000001", trade_type="sell", price=12.0,
+                        quantity=500, trade_date="2026-06-01"))
+        assert get_first_buy_date("000001") is None
+        add_trade(Trade(stock_code="000001", trade_type="buy", price=20.0,
+                        quantity=100, trade_date="2026-06-01"))
+        reopened = get_position_summary("000001")
+        assert reopened["avg_cost"] == 20.0
+        assert reopened["first_buy_date"] == "2026-06-01"
 
 
 class TestManualAlert:

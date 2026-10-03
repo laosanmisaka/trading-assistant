@@ -1,0 +1,85 @@
+{
+  "R01_confirmation": {
+    "first_buy_dt": "2024-01-04 13:45:00",
+    "claimed_conf": "2024-01-04 14:25:00",
+    "following_bi_present_at_conf": false,
+    "first_observed_following_bi": "2024-01-04 14:30:00"
+  },
+  "R04_rolling_identity": {
+    "old_index": 47,
+    "new_index": 38,
+    "same_endpoints": [
+      "2024-01-18 09:40:00",
+      "2024-01-18 11:15:00"
+    ]
+  },
+  "R03_intraday_filter": {
+    "keep_dates": [
+      "2026-09-28",
+      "2026-09-29"
+    ],
+    "visible_today": {}
+  },
+  "R05_revision": {
+    "latest_revision_price": 9.5,
+    "displayed_price": 10.0
+  },
+  "R06_manual_persistence": {
+    "sl_active": false,
+    "sl_price": 0.0,
+    "tp_active": true,
+    "tp_price": 12.0
+  },
+  "R08_position_cost": {
+    "expected_current_cost": 20,
+    "actual": {
+      "hold_qty": 100,
+      "avg_cost": 15.0,
+      "total_buy_amt": 3000.0,
+      "total_sell_amt": 1100.0,
+      "total_buy_qty": 200,
+      "total_sell_qty": 100
+    }
+  },
+  "R07_pnl": {
+    "expected": 0,
+    "display": "<span style='color:green'>-1,000.00 (+0.00%)</span>"
+  },
+  "R09_multiday_quote": {
+    "expected_open": 30,
+    "actual_open": 10,
+    "expected_volume": 100,
+    "actual_volume": 300
+  },
+  "R12_execution": {
+    "remaining_cash": -4.0,
+    "zero_weight_opened": true,
+    "expected_drawdown": 0.1,
+    "reported_drawdown": 0.0
+  },
+  "R13_unverified_adjustment": {
+    "overlap_rows": 0,
+    "status": "appended",
+    "mixed_closes": [
+      10,
+      10,
+      5
+    ]
+  },
+  "R15_invalid_bar": "ValueError escapes per-stock fetch",
+  "R16_weekend": "2026-10-03 Saturday 10:00 accepted",
+  "R17_font": "sans-serif fallback raises ValueError",
+  "R18_baseline_weights": {
+    "expected_paired_excess": 0,
+    "actual": {
+      "n": 10,
+      "n_stock": 2,
+      "pt_mean": 9.0,
+      "eqw": 5.0,
+      "base": 5.0,
+      "ex_pt": 4.0,
+      "ex_eqw": 0.0
+    }
+  },
+  "R19_html_embedding": "literal closing script tag preserved inside CFG payload"
+}

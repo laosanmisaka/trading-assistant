@@ -133,6 +133,6 @@ class TestDefaultNow:
     def test_uses_current_time_when_omitted(self, monkeypatch):
         frozen = _dt(2026, 9, 17, 10, 0)
         monkeypatch.setattr(
-            utils, "datetime", types.SimpleNamespace(now=lambda: frozen))
+            "core.trading_calendar.local_now", lambda: frozen)
 
         assert is_trading_time() is True

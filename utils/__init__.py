@@ -29,21 +29,14 @@ def trading_sessions() -> tuple:
 
 
 def is_trading_time(now: Optional[datetime] = None) -> bool:
-    """判断是否为 A 股交易时间 (周一至周五, 交易时段内)
-
-    判断依据:
-      1. 周一至周五 —— **不含节假日日历**，法定节假日需由调用方另行判断
-      2. 落在 config 定义的交易时段内:
-         TRADING_START_MORNING ~ TRADING_END_MORNING
-         或 TRADING_START_AFTERNOON ~ TRADING_END_AFTERNOON
-
-    此前时段是硬编码的 time(9, 30) / time(15, 0) 字面量，导致改 config
-    不生效 —— 已改为读配置（2026-09-17）。
-
-    now 参数仅供测试注入，默认取当前时间。
-    """
-    now = now or datetime.now()
-    if now.weekday() >= 5:      # 周六 / 周日
+    """交易所日历 + 配置时段；日历超范围时停止实时刷新并记录原因。"""
+    from core.trading_calendar import is_session, local_now, CalendarUnavailable
+    import logging
+    now = now or local_now()
+    try:
+        if not is_session(now.date()):
+            return False
+    except CalendarUnavailable as error:
+        logging.getLogger(__name__).error("%s", error)
         return False
-    t = now.time()
-    return any(start <= t <= end for start, end in trading_sessions())
+    return any(start <= now.time() <= end for start, end in trading_sessions())

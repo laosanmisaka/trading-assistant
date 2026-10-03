@@ -1,20 +1,8 @@
-# 依赖清单（与 requirements.txt 保持同步，改这里请同步改那边）
+# Run conda env create from the repository root; requirements.txt is authoritative.
 channels:
   - defaults
 dependencies:
   - python=3.12
   - pip
   - pip:
-      # ---- 运行依赖 ----
-      - PyQt5>=5.15.9
-      - akshare>=1.14.0
-      - matplotlib>=3.7.0
-      - pandas>=2.0.0
-      - numpy>=1.24.0
-      # 通达信行情接口，1min 数据主数据源；原清单漏声明
-      - mootdx>=0.11.0
-      # 缠论计算（core/chan.py）。1.0.1 为 Rust 核心 + PyPI 预编译 wheel，
-      # 无需 Rust 工具链；要求 Python >= 3.10。新增约 29 包 / 300MB。
-      - czsc>=1.0.1
-      # ---- 开发/测试依赖 ----
-      - pytest>=8.0
+      - -r requirements.txt

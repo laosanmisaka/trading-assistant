@@ -271,7 +271,7 @@ def get_trades(stock_code: str) -> list[Trade]:
     conn = _connect()
     rows = conn.execute(
         "SELECT id, stock_code, trade_type, price, quantity, fee, trade_date, notes "
-        "FROM trades WHERE stock_code=? ORDER BY trade_date",
+        "FROM trades WHERE stock_code=? ORDER BY trade_date, id",
         (stock_code,),
     ).fetchall()
     conn.close()
@@ -284,7 +284,7 @@ def get_all_trades() -> list[Trade]:
     conn = _connect()
     rows = conn.execute(
         "SELECT id, stock_code, trade_type, price, quantity, fee, trade_date, notes "
-        "FROM trades ORDER BY trade_date"
+        "FROM trades ORDER BY trade_date, id"
     ).fetchall()
     conn.close()
     return [Trade(id=r["id"], stock_code=r["stock_code"], trade_type=r["trade_type"],
@@ -326,30 +326,44 @@ def delete_trade(trade_id: int) -> None:
 
 
 def get_position_summary(stock_code: str) -> dict:
-    """计算某股票的持仓摘要: 持仓量, 持仓成本, 总买入额, 总卖出额"""
+    """移动平均结转剩余仓位成本；日期相同的交易按入库 id 排序。
+
+    累计收支保留全部历史，当前成本/买入日只属于未清仓的一轮。
+    非法的卖超记录仍可读取，但 valid=False，调用方不得生成自动提醒。
+    """
     trades = get_trades(stock_code)
     total_buy_qty = 0
     total_buy_amt = 0.0
     total_sell_qty = 0
     total_sell_amt = 0.0
-
+    hold_qty, cost = 0, 0.0
+    first_date, position_key = None, None
+    valid = True
     for t in trades:
         if t.trade_type == TradeType.BUY.value:
+            if hold_qty == 0:
+                first_date, position_key = t.trade_date, t.id
             total_buy_qty += t.quantity
             total_buy_amt += t.price * t.quantity + t.fee
+            hold_qty += t.quantity
+            cost += t.price * t.quantity + t.fee
         else:
             total_sell_qty += t.quantity
             total_sell_amt += t.price * t.quantity - t.fee
-
-    hold_qty = total_buy_qty - total_sell_qty
-    if total_buy_qty > 0:
-        avg_cost = total_buy_amt / total_buy_qty
-    else:
-        avg_cost = 0.0
-
+            if t.quantity > hold_qty:
+                valid = False
+            cost *= max(hold_qty - t.quantity, 0) / hold_qty if hold_qty > 0 else 0
+            hold_qty -= t.quantity
+            if hold_qty == 0:
+                cost, first_date, position_key = 0.0, None, None
+    avg_cost = cost / hold_qty if hold_qty > 0 else 0.0
     return {
         "hold_qty": hold_qty,
         "avg_cost": round(avg_cost, 3),
+        "position_cost": cost,
+        "first_buy_date": first_date,
+        "position_key": position_key,
+        "valid": valid,
         "total_buy_amt": round(total_buy_amt, 2),
         "total_sell_amt": round(total_sell_amt, 2),
         "total_buy_qty": total_buy_qty,
@@ -358,14 +372,8 @@ def get_position_summary(stock_code: str) -> dict:
 
 
 def get_first_buy_date(stock_code: str) -> Optional[str]:
-    """获取首次买入日期"""
-    conn = _connect()
-    row = conn.execute(
-        "SELECT MIN(trade_date) as first_date FROM trades WHERE stock_code=? AND trade_type='buy'",
-        (stock_code,),
-    ).fetchone()
-    conn.close()
-    return row["first_date"] if row else None
+    """获取当前未平仓轮次的首次买入日，已清仓返回 None。"""
+    return get_position_summary(stock_code)["first_buy_date"]
 
 
 # ============================================================
@@ -472,31 +480,37 @@ def get_manual_alert(code: str) -> dict:
         tp_active: bool, tp_price: float,
     }
     """
-    sl_active = get_setting(f"manual_sl_active_{code}", "0") == "1"
-    sl_price_str = get_setting(f"manual_sl_{code}", "0")
-    tp_active = get_setting(f"manual_tp_active_{code}", "0") == "1"
-    tp_price_str = get_setting(f"manual_tp_{code}", "0")
-
-    return {
-        "sl_active": sl_active,
-        "sl_price": float(sl_price_str) if sl_price_str else 0.0,
-        "tp_active": tp_active,
-        "tp_price": float(tp_price_str) if tp_price_str else 0.0,
-    }
+    fields = {"sl_active": f"manual_sl_active_{code}", "sl_price": f"manual_sl_{code}",
+              "tp_active": f"manual_tp_active_{code}", "tp_price": f"manual_tp_{code}"}
+    conn = _connect()
+    try:
+        rows = dict(conn.execute("SELECT key, value FROM settings WHERE key IN (?,?,?,?)",
+                                 tuple(fields.values())).fetchall())
+        return {field: (rows.get(key, "0") == "1" if field.endswith("active")
+                        else float(rows.get(key, "0") or "0"))
+                for field, key in fields.items()}
+    finally:
+        conn.close()
 
 
 def set_manual_alert(
     code: str,
-    sl_active: bool = False,
-    sl_price: float = 0.0,
-    tp_active: bool = False,
-    tp_price: float = 0.0,
+    sl_active: Optional[bool] = None,
+    sl_price: Optional[float] = None,
+    tp_active: Optional[bool] = None,
+    tp_price: Optional[float] = None,
 ) -> None:
-    """设置手动止盈止损（写入数据库，持久化）"""
-    set_setting(f"manual_sl_active_{code}", "1" if sl_active else "0")
-    set_setting(f"manual_sl_{code}", str(sl_price))
-    set_setting(f"manual_tp_active_{code}", "1" if tp_active else "0")
-    set_setting(f"manual_tp_{code}", str(tp_price))
+    """原子更新显式指定的字段；None 保留原值，False/0 明确关闭。"""
+    fields = {f"manual_sl_active_{code}": sl_active, f"manual_sl_{code}": sl_price,
+              f"manual_tp_active_{code}": tp_active, f"manual_tp_{code}": tp_price}
+    rows = [(key, str(int(value)) if isinstance(value, bool) else str(value))
+            for key, value in fields.items() if value is not None]
+    conn = _connect()
+    try:
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", rows)
+    finally:
+        conn.close()
 
 
 def clear_manual_alert(code: str, field: str = "all") -> None:
@@ -504,11 +518,14 @@ def clear_manual_alert(code: str, field: str = "all") -> None:
     field: 'sl' | 'tp' | 'all'
     """
     if field in ("sl", "all"):
-        set_setting(f"manual_sl_active_{code}", "0")
-        set_setting(f"manual_sl_{code}", "0")
+        sl_active, sl_price = False, 0.0
+    else:
+        sl_active, sl_price = None, None
     if field in ("tp", "all"):
-        set_setting(f"manual_tp_active_{code}", "0")
-        set_setting(f"manual_tp_{code}", "0")
+        tp_active, tp_price = False, 0.0
+    else:
+        tp_active, tp_price = None, None
+    set_manual_alert(code, sl_active, sl_price, tp_active, tp_price)
 
 
 # ============================================================
@@ -768,3 +785,23 @@ def delete_old_minute_klines(code: str, before_date: str) -> int:
     deleted = cur.rowcount
     conn.close()
     return deleted
+
+
+def replace_history_snapshot(code: str, periods: dict) -> None:
+    """Replace fetched periods together, avoiding old/new adjusted-price splicing.
+
+    These tables are rebuildable market caches; user trades are never affected.
+    Empty periods keep existing data and must be reported by the caller.
+    """
+    from contextlib import closing
+    with closing(_connect()) as conn, conn:
+        for period, bars in periods.items():
+            if not bars:
+                continue
+            minute = period.endswith("min")
+            table, time_key = ("klines_minute", "timestamp") if minute else ("klines", "date")
+            conn.execute(f"DELETE FROM {table} WHERE code=? AND period=?", (code, period))
+            conn.executemany(
+                f"INSERT INTO {table} (code,{time_key},open,high,low,close,volume,period) VALUES (?,?,?,?,?,?,?,?)",
+                [(code, bar[time_key], bar["open"], bar["high"], bar["low"], bar["close"],
+                  bar.get("volume", 0), period) for bar in bars])

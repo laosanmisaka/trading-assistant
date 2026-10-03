@@ -73,7 +73,7 @@ class TradeDialog(QDialog):
         s_layout.addRow("持仓成本:", self.lbl_avg_cost)
         s_layout.addRow("总买入金额:", self.lbl_total_buy)
         s_layout.addRow("总卖出金额:", self.lbl_total_sell)
-        s_layout.addRow("浮动盈亏:", self.lbl_pnl)
+        s_layout.addRow("累计总盈亏:", self.lbl_pnl)
         layout.addWidget(summary_group)
 
         # ---- 关闭 ----
@@ -124,25 +124,23 @@ class TradeDialog(QDialog):
         self.lbl_total_buy.setText(f"¥{s['total_buy_amt']:,.2f}")
         self.lbl_total_sell.setText(f"¥{s['total_sell_amt']:,.2f}")
 
-        # 浮动盈亏需要实时价格 (从主窗口获取)
+        # 总盈亏 = 累计卖出净收入 + 当前市值 - 累计买入支出。
+        if not s.get("valid", True):
+            self.lbl_pnl.setText("交易记录存在卖超，请核对")
+            return
         profit = s["total_sell_amt"] - s["total_buy_amt"]
         if s["hold_qty"] > 0:
             # 尝试获取实时价格
             main_win = self._get_main_window()
-            if main_win and main_win.data_manager.get_quote(self.stock_code):
-                current_price = main_win.data_manager.get_quote(self.stock_code).price
-                unrealized = (current_price - s["avg_cost"]) * s["hold_qty"]
-                profit += unrealized
-                pct = (current_price / s["avg_cost"] - 1) * 100 if s["avg_cost"] > 0 else 0
-                color = "red" if profit >= 0 else "green"
-                self.lbl_pnl.setText(
-                    f"<span style='color:{color}'>{profit:+,.2f} ({pct:+.2f}%)</span>")
-                self.lbl_pnl.setTextFormat(Qt.RichText)
+            quote = main_win.data_manager.get_quote(self.stock_code) if main_win else None
+            if quote is None or quote.price <= 0:
+                self.lbl_pnl.setText("待有效行情（含未平仓市值）")
                 return
-
+            profit += quote.price * s["hold_qty"]
+        pct = profit / s["total_buy_amt"] * 100 if s["total_buy_amt"] > 0 else 0
         color = "red" if profit >= 0 else "green"
         self.lbl_pnl.setText(
-            f"<span style='color:{color}'>{profit:+,.2f}</span>")
+            f"<span style='color:{color}'>{profit:+,.2f} ({pct:+.2f}% 累计买入额)</span>")
         self.lbl_pnl.setTextFormat(Qt.RichText)
 
     def _get_main_window(self):

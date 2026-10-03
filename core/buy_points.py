@@ -7,8 +7,8 @@
 其后的同窗口一买是「非首选」，不进分组。
 
 「前一天和当前」按 **conf（5min 确认 bar 的时刻，即买点出现时间）** 过滤，
-不是按报警时间 ts —— 补报的旧点不该混进今天的名单。交易日历从日线缓存
-末尾取（`recent_trading_days`），没有缓存时退化成「剔除周末」的近似。
+不是按报警时间 ts —— 补报的旧点不该混进今天的名单。交易日由有版本范围的 XSHG 日历提供，
+盘中即包含当日，不依赖滞后的日线缓存，不以工作日猜测假日。
 
 GUI 分组「策略买点」由 `sync_buy_points_group` **全量接管**：新买点补进来、
 滚出两日窗口的移出去。用户手动跟踪的票别放这个分组（次日会被清掉）。
@@ -38,31 +38,9 @@ def to_code6(code: str) -> str:
 def recent_trading_days(n: int = 2, *,
                         cache_dir: Path = DEFAULT_CACHE,
                         today: date | None = None) -> list[str]:
-    """最近 n 个交易日（升序，含今天如果今天已收盘进缓存）
-
-    从日线缓存末尾读真实交易日；缓存缺失时退化：从今天往前跳过周末取 n 天
-    （节假日会算错，只是兜底）。
-    """
-    today = today or date.today()
-    if cache_dir.exists():
-        f = cache_dir / "daily_sh600519.csv"
-        if not f.exists():
-            files = sorted(cache_dir.glob("daily_*.csv"))
-            f = files[-1] if files else f
-        if f.exists() and f.stat().st_size > 0:
-            try:
-                df = pd.read_csv(f, usecols=["dt"])
-                days = [str(x)[:10] for x in df["dt"].iloc[-n:]]
-                if days:
-                    return days
-            except Exception:
-                pass
-    days, d = [], today
-    while len(days) < n:
-        if d.weekday() < 5:
-            days.append(d.strftime("%Y-%m-%d"))
-        d -= timedelta(days=1)
-    return sorted(days)
+    """交易所日历近 n 日，盘中即包含当日；cache_dir 留作兼容旧调用。"""
+    from core.trading_calendar import recent_sessions
+    return recent_sessions(n, today)
 
 
 def recent_buy_points(signals_path: Path = DEFAULT_SIGNALS, *,
@@ -80,13 +58,10 @@ def recent_buy_points(signals_path: Path = DEFAULT_SIGNALS, *,
     p = Path(signals_path)
     if not p.exists():
         return out
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
+    from core.signal_journal import read_events
+    # Fold revisions/retractions first, then date and eligibility filters.
+    for ev in read_events(p).values():
+        if not ev.get("event_id") or not ev.get("active", True):
             continue
         if not ev.get("strategy_entry"):
             continue

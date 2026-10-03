@@ -1,54 +1,9 @@
 # -*- coding: utf-8 -*-
-"""三买**反向统计**：用「突破候选」当分母，消掉循环论证
+"""历史几何诊断：全历史结构倒选突破与回抽，含未来信息。
 
-    python scripts/eval_triple_prob.py --period daily
-    python scripts/eval_triple_prob.py --period daily --pool scripts/pool_liquid50.txt \
-        --holds 5,10,20 --out outputs/triple_prob_daily.md
-
-要解决的问题
-------------
-`eval_triple_buy.py` / `eval_daily_5min.py` 的分母是「**已知最终形成三买**的点」，
-分子是「这些点之后赚钱的比例」。这**不是交易者面对的问题**：实盘站在「价格刚
-突破中枢上沿」那一刻，你不知道后面会不会形成三买。条件里已经含了答案，
-所以那类胜率天然偏高（循环论证）。
-
-这里换成**前瞻口径**：
-
-- **候选**（分母）= 一根向上笔向上突破**已完成中枢**的上沿（``high > zg``，
-  且该中枢 ``edt <= 突破笔 edt``）。参照中枢取「突破笔终点之前最近的那个」；
-  **一个中枢只认第一次有效突破**（与 `buy_sell_points` 的三买口径一致），
-  否则趋势延续的后续向上笔会被重复数成新机会、把分母吹大。
-- **成败**（分子）= 突破后**第一根向下笔**的回抽低点是否**不回到中枢内**：
-  ``low > zg`` = **成三买**；``low <= zg`` = **失败**（被中枢拉回去）。
-- 候选时刻**当下可判**：突破笔终点即候选成立时刻，不需要等后续笔。
-  ⇒ 「形成率」= P(成三买 | 已突破)，才是交易者真正面对的概率。
-
-⚠️ 与 `chan_points.buy_sell_points()` 的口径差异：那边是 ``for z in centers``
-**逐中枢**扫描（同一根突破笔被多个中枢各判一次 ⇒ 重复产点，即 KI-010 同源）；
-这里按**突破笔**唯一化。所以本报告的「三买数」会**略少于**正向脚本的去重前数字。
-
-三种入场口径
-------------
-全部按「信号出现后的**第一根 bar 开盘价**」成交（A 股 T+1）：
-
-| 口径 | 入场时点 | 有无未来函数 | 位置 |
-| --- | --- | --- | --- |
-| ``cross`` | 中枢收口后第一根**收盘价 > 上沿**的 bar 之后 | **无**（收盘即知） | 高（买在突破瞬间） |
-| ``confirm`` | 回抽笔走完、确认未破中枢之后 | 有滞后（KI-009，等反向笔锁定） | 低（买在回调低点）|
-
-``cross`` 是这套打法里**唯一没有未来函数**的入场，代价是买得高；``confirm``
-就是现在拿去跑的「日线确认」口径。两者之差 = **确认的代价**。
-
-特征分档（回答「什么时候概率大」）
-----------------------------------
-候选时刻就能算出的量：突破幅度、中枢宽度、突破笔涨幅、突破力度比
-（突破笔 MACD 面积 ÷ 前一向上笔）、中枢笔数。按等频三分位分档看形成率。
-
-⚠️ 统计口径
-------------
-- 按**点**统计，不是资金曲线；同一标的候选可密集出现、持有期重叠。
-- 中枢由 `chan.centers()`（czsc）给出。中枢一旦收口，其 zg/zd 不再变化，
-  所以「用 z 的 zg 判 t > z.edt 之后的行情」**不是**未来函数。
+必须显式 --retrospective 才运行。这不是可交易回测，也不估计实盘前瞻概率。
+cross 也取决于事后中枢与突破候选，不能称为无未来函数。生产策略与因果
+回放入口为 core.triple_buy / scripts/eval_daily_5min.py。
 """
 from __future__ import annotations
 
@@ -73,7 +28,7 @@ from data.models import KLineData                       # noqa: E402
 from eval_triple_buy import load_pool, summarize        # noqa: E402
 
 DEFAULT_CACHE = ROOT / "outputs" / "cache_min"
-DEFAULT_POOL = ROOT / "scripts" / "pool_liquid50.txt"
+DEFAULT_POOL = ROOT / "scripts" / "pool_random500.txt"
 
 #: 级别 → 一个交易日多少根 bar（daily 单独算 1）
 BPD = {"daily": 1, "1min": 240, "5min": 48, "15min": 16, "30min": 8, "60min": 4}
@@ -141,13 +96,13 @@ def hold_ret(opens: list[float], closes: list[float],
     return (closes[j] / a - 1.0) * 100.0
 
 
-def baseline(closes: list[float], hold_bars: int) -> dict | None:
+def baseline(closes: list[float], hold_bars: int, opens=None) -> dict | None:
     """同池随机入场基准：每根 bar 进的持有收益（全体 bar，非抽样）"""
     n = len(closes)
     if hold_bars <= 0 or n <= hold_bars:
         return None
     vals = [(b / a - 1.0) * 100.0
-            for a, b in zip(closes[: n - hold_bars], closes[hold_bars:n])
+            for a, b in zip((opens if opens is not None else closes)[: n - hold_bars], closes[hold_bars:n])
             if a > 0 and b > 0]
     if not vals:
         return None
@@ -246,6 +201,25 @@ def eval_one(code: str, klines: list[KLineData], period: str, *,
     pos = {str(_ts(t)): i for i, t in enumerate(times)}
     bpd = BPD[period]
 
+    _historical_returns(cands, times, opens, closes, holds, bpd, pos)
+
+    n_ok = sum(1 for c in cands if c["状态"] == "成功")
+    n_bad = sum(1 for c in cands if c["状态"] == "失败")
+    n_und = sum(1 for c in cands if c["状态"] == "未定")
+    formed = n_ok + n_bad
+    rate = {"候选": len(cands), "成功": n_ok, "失败": n_bad, "未定": n_und,
+            "形成率": (n_ok / formed) if formed else None}
+
+    rets: dict[int, dict] = {}
+    for h in holds:
+        xs = [c[f"X{h}"] for c in cands if c.get(f"X{h}") is not None]
+        cs = [c[f"C{h}"] for c in cands if c.get(f"C{h}") is not None]
+        rets[h] = {"cross": summarize(xs), "confirm": summarize(cs)}
+    base = {h: baseline(closes, h * bpd, opens) for h in holds}
+    return cands, rate, rets, base
+
+
+def _historical_returns(cands, times, opens, closes, holds, bpd, pos):
     for c in cands:
         # ---- cross 入场：中枢收口之后第一根「收盘站上上沿」的 bar ----
         i0 = pos.get(str(c["中枢edt"]))
@@ -270,20 +244,6 @@ def eval_one(code: str, klines: list[KLineData], period: str, *,
             c[f"X{h}"] = hold_ret(opens, closes, e_x, nb)      # cross 口径
             c[f"C{h}"] = hold_ret(opens, closes, e_c, nb)      # confirm 口径
 
-    n_ok = sum(1 for c in cands if c["状态"] == "成功")
-    n_bad = sum(1 for c in cands if c["状态"] == "失败")
-    n_und = sum(1 for c in cands if c["状态"] == "未定")
-    formed = n_ok + n_bad
-    rate = {"候选": len(cands), "成功": n_ok, "失败": n_bad, "未定": n_und,
-            "形成率": (n_ok / formed) if formed else None}
-
-    rets: dict[int, dict] = {}
-    for h in holds:
-        xs = [c[f"X{h}"] for c in cands if c.get(f"X{h}") is not None]
-        cs = [c[f"C{h}"] for c in cands if c.get(f"C{h}") is not None]
-        rets[h] = {"cross": summarize(xs), "confirm": summarize(cs)}
-    base = {h: baseline(closes, h * bpd) for h in holds}
-    return cands, rate, rets, base
 
 
 # ======================================================================
@@ -341,115 +301,75 @@ def bucket_table(df: pd.DataFrame, feat: str, holds: list[int]) -> list[dict]:
     return rows
 
 
-def render_report(rows: list[dict], *, period: str, holds: list[int],
-                  pool_path: Path, started: datetime,
-                  skipped: list[tuple[str, str]], pool_size: int) -> str:
-    L: list[str] = []
-    add = L.append
-    add(f"# 三买**反向统计**（{period}）：突破之后，成三买的概率有多大")
-    add("")
-    add(f"- 生成时间：{started:%Y-%m-%d %H:%M}")
-    add(f"- 标的池：`{pool_path.name}`（{len(rows)} / {pool_size} 只有效）")
-    add(f"- 持有期（交易日）：{', '.join(str(h) for h in holds)}")
-    add("")
-    if skipped:
-        add(f"- ⚠️ 未纳入的 {len(skipped)} 只：" +
-            "；".join(f"`{c}`（{w}）" for c, w in skipped))
-        add("")
+def _returns_table(rows, holds):
+    from core.research_stats import metrics
+    lines = ["## 事后收益诊断（不可作实盘收益）", "",
+             "| 持有 | 口径 | n | 胜率 | 均值% | 中位% | 点权随机基准% | 配对超额% |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for hold in holds:
+        for label, prefix in (("事后 cross", "X"), ("成功条件 confirm", "C")):
+            base = {row["代码"]: row["基准"][hold]["mean"] for row in rows if row["基准"].get(hold)}
+            points = [{"code": row["代码"], "ret": point[f"{prefix}{hold}"]}
+                      for row in rows for point in row["候选明细"]
+                      if point.get(f"{prefix}{hold}") is not None and row["代码"] in base]
+            estimate = metrics(points, base)
+            if estimate:
+                summary = summarize([point["ret"] for point in points])
+                lines.append(f"| {hold} | {label} | {estimate['n']} | {summary['胜率']:.1%} | "
+                             f"{_fmt(estimate['pt_mean'])} | {_fmt(summary['中位'])} | "
+                             f"{_fmt(estimate['base'])} | {_fmt(estimate['ex_pt'])} |")
+    return lines + [""]
 
-    # ---- 汇总 ----
-    allc = [c for r in rows for c in r["候选明细"]]
-    df = pd.DataFrame(allc) if allc else pd.DataFrame()
-    n_cand = sum(r["形成率"]["候选"] for r in rows)
-    n_ok = sum(r["形成率"]["成功"] for r in rows)
-    n_bad = sum(r["形成率"]["失败"] for r in rows)
-    n_und = sum(r["形成率"]["未定"] for r in rows)
-    formed = n_ok + n_bad
 
-    add("## 1. 突破 → 三买 的形成率（无循环论证）")
-    add("")
-    add(f"- 候选（向上突破中枢上沿）：**{n_cand}** 次")
-    if formed:
-        add(f"- 其中 **{n_ok}** 次形成三买（回抽不回中枢）、**{n_bad}** 次失败（被拉回中枢）"
-            f" ⇒ **形成率 {n_ok/formed:.1%}**")
-    add(f"- 数据末尾尚未走完回抽笔、状态未定：{n_und} 次（不计入形成率）")
-    add("")
-    add("读法：这是**前瞻概率** —— 站在突破那一刻，后面成三买的机会有多大。"
-        "实盘要猜的就是它，分母里不再含答案。")
-    add("")
+def _feature_tables(rows, holds):
+    frame = pd.DataFrame([point for row in rows for point in row["候选明细"]])
+    lines = ["## 事后特征分档", ""]
+    if frame.empty:
+        return lines
+    for feature, description in FEATURES:
+        buckets = bucket_table(frame, feature, holds)
+        if not buckets:
+            continue
+        lines += [f"### {feature}", "", description, "",
+                  "| 档 | 区间 | 样本 | 事后形成率 | " + " | ".join(f"X{h}%" for h in holds) + " |",
+                  "| --- | --- | --- | --- | " + " | ".join("---" for _ in holds) + " |"]
+        for bucket in buckets:
+            rate = bucket["形成率"]
+            values = " | ".join(_fmt(bucket.get(f"X{h}")) for h in holds)
+            lines.append(f"| {bucket['档']} | {bucket['区间']} | {bucket['样本']} | "
+                         f"{_fmt(rate * 100) if rate is not None else '--'}% | {values} |")
+        lines.append("")
+    return lines
 
-    # ---- 特征分档 ----
-    add("## 2. 特征分档：什么条件下概率大")
-    add("")
-    if df.empty:
-        add("（无候选）")
-    else:
-        for feat, desc in FEATURES:
-            bt = bucket_table(df, feat, holds)
-            if not bt:
-                continue
-            add(f"### {feat}")
-            add("")
-            add(f"_{desc}_")
-            add("")
-            add("| 档 | 区间 | 样本 | 形成率 | " +
-                " | ".join(f"cross {h}日%" for h in holds) + " |")
-            add("| --- | --- | --- | --- | " + " | ".join("---" for _ in holds) + " |")
-            for r in bt:
-                add(f"| {r['档']} | {r['区间']} | {r['样本']} | {_fmt(r['形成率']*100, 1) if r['形成率'] is not None else '--'} | "
-                    + " | ".join(_fmt(r.get(f'X{h}')) for h in holds) + " |")
-            add("")
 
-    # ---- 收益对比 ----
-    add("## 3. 两种入场口径的收益（vs 同池随机入场）")
-    add("")
-    add("| 持有(交易日) | 口径 | 样本 | 胜率 | 平均% | 中位% | 随机基准% | 超额% |")
-    add("| --- | --- | --- | --- | --- | --- | --- | --- |")
-    for h in holds:
-        for side, key in (("cross（突破即买，无未来函数）", "cross"),
-                          ("confirm（回抽确认后买，滞后）", "confirm")):
-            agg = [r["汇总"][h][key] for r in rows
-                   if r["汇总"].get(h, {}).get(key, {}).get("n")]
-            if not agg:
-                continue
-            n = sum(s["n"] for s in agg)
-
-            def wavg(k):
-                pairs = [(s[k], s["n"]) for s in agg
-                         if s.get(k) is not None and not pd.isna(s[k])]
-                return (sum(v * w for v, w in pairs) / sum(w for _, w in pairs)) if pairs else None
-            bv = [r["基准"][h]["mean"] for r in rows
-                  if r.get("基准", {}).get(h, {}).get("mean") is not None]
-            bm = sum(bv) / len(bv) if bv else None
-            mv = wavg("平均")
-            ex = f"{mv - bm:+.2f}" if (mv is not None and bm is not None) else "--"
-            add(f"| {h} | {side} | {n} | {wavg('胜率'):.1%} | {_fmt(mv)} | {_fmt(wavg('中位'))} | "
-                f"{_fmt(bm)} | {ex} |")
-    add("")
-    add("- `cross`：中枢收口后**第一根收盘站上上沿**的 bar 之后开盘买入 —— 收盘即知，"
-        "**没有未来函数**，是这套打法唯一严格可交易的入场。")
-    add("- `confirm`：回抽笔走完、确认未破中枢之后买入 —— 位置更低，但要等反向笔锁定"
-        "（KI-009 的滞后），且**分母只含最终成功的候选**（失败的那些根本等不到这个信号）。")
-    add("")
-
-    # ---- 逐标的 ----
-    add("## 4. 逐标的")
-    add("")
-    add("| 代码 | 候选 | 成功 | 失败 | 未定 | 形成率 |")
-    add("| --- | --- | --- | --- | --- | --- |")
-    for r in rows:
-        s = r["形成率"]
-        add(f"| {r['代码']} | {s['候选']} | {s['成功']} | {s['失败']} | {s['未定']} | "
-            f"{_fmt(s['形成率']*100, 1) if s['形成率'] is not None else '--'} |")
-    add("")
-    add("---")
-    add(f"生成命令：`python scripts/eval_triple_prob.py {' '.join(sys.argv[1:])}`")
-    return "\n".join(L) + "\n"
+def render_report(rows, *, period, holds, pool_path, started, skipped, pool_size):
+    lines = [f"# 三买历史几何诊断（{period}）", "",
+             "**仅事后诊断：候选、中枢及笔均使用完整历史。cross 与 confirm 都含未来信息。**",
+             "形成率是事后结构样本的描述，不是突破当时可得的前瞻概率；禁止据此证明交易 alpha。", "",
+             f"生成：{started:%Y-%m-%d %H:%M}；池：{pool_path.name}；有效 {len(rows)}/{pool_size}；持有 {holds}", "",
+             "## 事后形成率", "", "| 代码 | 候选 | 成功 | 失败 | 未定 | 形成率 |",
+             "| --- | --- | --- | --- | --- | --- |"]
+    for row in rows:
+        counts = row["形成率"]
+        rate = counts["形成率"]
+        lines.append(f"| {row['代码']} | {counts['候选']} | {counts['成功']} | {counts['失败']} | "
+                     f"{counts['未定']} | {_fmt(rate * 100) if rate is not None else '--'}% |")
+    lines += ["", "失败/未纳入：" + str(skipped), ""]
+    lines += _returns_table(rows, holds) + _feature_tables(rows, holds)
+    lines += ["随机基准与各口径均用开盘入场、固定根数后收盘出场；先逐信号减该股基准再汇总。",
+              "confirm 的分母只有事后成功候选。两组统计均不具备可交易意义。", ""]
+    return "\n".join(lines)
 
 
 # ======================================================================
 # 入口
 # ======================================================================
+
+def _selected_pool(args):
+    if args.codes:
+        return [(normalize_code(code.strip()), "") for code in args.codes.split(",") if code.strip()]
+    return load_pool(args.pool)
+
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="三买反向统计（突破候选 → 形成率）",
@@ -461,13 +381,13 @@ def main(argv=None) -> int:
     p.add_argument("--holds", default="5,10,20")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--out", default="")
+    p.add_argument("--retrospective", action="store_true", help="确认只做含未来信息的历史几何诊断")
     a = p.parse_args(argv)
+    if not a.retrospective:
+        p.error("仅允许 --retrospective 历史诊断；可观察策略请用 eval_daily_5min.py")
 
     holds = [int(x) for x in a.holds.split(",") if x.strip()]
-    if a.codes:
-        pool = [(normalize_code(c), "") for c in (x.strip() for x in a.codes.split(",")) if c]
-    else:
-        pool = load_pool(a.pool)
+    pool = _selected_pool(a)
     if a.limit:
         pool = pool[: a.limit]
     if not pool:

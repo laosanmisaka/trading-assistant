@@ -333,7 +333,8 @@ def test_chan_adapter_end_to_end_with_engine():
 # 报告图表（core/backtest/viz.py）
 # ============================================================
 
-def test_report_figure_has_two_panels_and_marks():
+def test_report_figure_has_two_panels_and_marks(monkeypatch):
+    monkeypatch.setattr("core.backtest.viz._chinese_font", lambda: "sans-serif")
     from core.backtest.viz import render_report_figure
 
     daily = make_daily([10.0, 10.5, 11.0, 10.8, 11.5] * 4)
@@ -357,6 +358,21 @@ def test_report_figure_has_two_panels_and_marks():
     assert len(scatters) == 2
     # 权益曲线画在下面板
     assert len(fig.axes[1].lines) >= 1
+
+
+@pytest.mark.parametrize("cash,weight,closes,opened,drawdown", [
+    (1001, 1, [10], False, 0),
+    (1005, 0, [10], False, 0),
+    (1005, 1, [9, 9.5], True, (1005 - 900) / 1005),
+])
+def test_execution_budget_weight_and_initial_peak(cash, weight, closes, opened, drawdown):
+    daily = make_daily(closes)
+    signals = DummyStrategy([Signal(daily[0].date, Action.BUY, price=10, weight=weight)])
+    report = BacktestEngine(initial_capital=cash).run_on_data(signals, "TEST", daily)
+    assert report.open_position is opened
+    assert report.max_drawdown == pytest.approx(drawdown)
+    expected = [c * 100 for c in closes] if opened else [cash] * len(closes)
+    assert report.equity_curve == expected
 
 
 def test_save_report_chart_writes_png(tmp_path):

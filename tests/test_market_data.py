@@ -223,6 +223,7 @@ class TestIncrementalRefreshWorker:
             ]
         # 补丁 market_data_manager 中的引用（QThread 内会用到）
         monkeypatch.setattr("data.market_data_manager.fetch_today_1min_bars", _mock_today_bars)
+        monkeypatch.setattr("data.market_data_manager.MarketDataManager.refresh_history_if_needed", lambda self, code: None)
 
         results = {}
         loop = QEventLoop()
