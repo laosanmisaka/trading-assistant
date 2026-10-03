@@ -13,8 +13,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       QT_QPA_PLATFORM: offscreen
-      CZSC_HOME: ${{ runner.temp }}/czsc
-      MPLCONFIGDIR: ${{ runner.temp }}/mpl
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +27,9 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python -m pip check
       - run: python -m pytest -q --basetemp="${{ runner.temp }}/trading-assistant-pytest"
+        env:
+          CZSC_HOME: ${{ runner.temp }}/czsc
+          MPLCONFIGDIR: ${{ runner.temp }}/mpl
       # This is the accepted pre-remediation baseline; historical evidence is immutable.
       - run: python scripts/check_standards.py --base 7fbaba88af71ef6cb8a25dc93d0939212b306a73
       - run: python scripts/check_docs.py
