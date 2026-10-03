@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     files = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard'],
-                                    cwd=ROOT, text=True).splitlines()
+                                    cwd=ROOT, encoding='utf-8').splitlines()
     errors, count = [], 0
     for filename in sorted(set(files)):
         path = ROOT / filename

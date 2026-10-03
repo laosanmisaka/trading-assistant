@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def git(*args):
-    return subprocess.check_output(["git", *args], cwd=ROOT, text=True)
+    return subprocess.check_output(["git", *args], cwd=ROOT, encoding="utf-8")
 
 
 def functions(tree, prefix=""):
@@ -77,7 +77,7 @@ def check_python(path, base, check_all):
     if size > 1000:
         errors.append(f"file lines {size} > 1000")
     old = subprocess.run(["git", "show", f"{base}:{path}"], cwd=ROOT,
-                         text=True, capture_output=True)
+                         encoding="utf-8", capture_output=True)
     previous = functions(ast.parse(old.stdout)) if old.returncode == 0 else {}
     for name, node in functions(tree).items():
         prior = previous.get(name)
